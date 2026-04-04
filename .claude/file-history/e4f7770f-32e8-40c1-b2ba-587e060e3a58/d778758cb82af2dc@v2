@@ -1,0 +1,282 @@
+"""
+Test checkpoint against groundtruth audio files.
+
+Loads a wet (EQ-processed) audio file, runs the model to predict EQ parameters,
+and if a dry audio file is provided, applies the predicted EQ and compares
+spectral similarity.
+
+Usage:
+    python test_audio.py --wet test_output/wet.wav --dry test_output/dry.wav
+"""
+
+import argparse
+import sys
+from pathlib import Path
+
+import torch
+import torchaudio
+import numpy as np
+import yaml
+
+sys.path.append(str(Path(__file__).parent))
+
+from model_tcn import StreamingTCNModel
+from dsp_frontend import STFTFrontend
+from dataset import FILTER_NAMES
+
+
+def load_config(path="conf/config.yaml"):
+    with open(path, "r") as f:
+        return yaml.safe_load(f)
+
+
+def build_model(config, checkpoint_path, device="cpu"):
+    data_cfg = config["data"]
+    enc_cfg = config["model"]["encoder"]
+
+    # Infer num_filter_types from config
+    filter_types = data_cfg.get("filter_types", ["peaking"])
+    num_filter_types = len(filter_types)
+
+    model = StreamingTCNModel(
+        n_mels=data_cfg.get("n_mels", 128),
+        embedding_dim=enc_cfg.get("embedding_dim", 128),
+        num_bands=data_cfg.get("num_bands", 5),
+        channels=enc_cfg.get("channels", 128),
+        num_blocks=enc_cfg.get("num_blocks", 4),
+        num_stacks=enc_cfg.get("num_stacks", 2),
+        sample_rate=data_cfg.get("sample_rate", 44100),
+        n_fft=data_cfg.get("n_fft", 2048),
+        kernel_size=enc_cfg.get("kernel_size", 3),
+        use_full_spectrum=config["model"].get("use_full_spectrum", False),
+        num_filter_types=num_filter_types,
+    )
+
+    ckpt = torch.load(checkpoint_path, map_location=device, weights_only=False)
+
+    # Handle Lightning checkpoint with torch.compile prefix
+    if "state_dict" in ckpt:
+        state_dict = ckpt["state_dict"]
+        # Strip 'model._orig_mod.' prefix from torch.compile
+        cleaned = {}
+        for k, v in state_dict.items():
+            new_key = k
+            if k.startswith("model._orig_mod."):
+                new_key = k[len("model._orig_mod."):]
+            elif k.startswith("model."):
+                new_key = k[len("model."):]
+            cleaned[new_key] = v
+        state_dict = cleaned
+    else:
+        state_dict = ckpt.get("model_state_dict", ckpt)
+
+    missing, unexpected = model.load_state_dict(state_dict, strict=False)
+    if missing:
+        print(f"  Warning: missing keys: {missing[:5]}...")
+    if unexpected:
+        print(f"  Warning: unexpected keys: {unexpected[:5]}...")
+
+    model.to(device)
+    model.eval()
+
+    meta = {
+        "epoch": ckpt.get("epoch", "?"),
+        "global_step": ckpt.get("global_step", "?"),
+    }
+    return model, meta
+
+
+def load_audio(path, target_sr=44100):
+    audio, sr = torchaudio.load(path)
+    if sr != target_sr:
+        audio = torchaudio.transforms.Resample(sr, target_sr)(audio)
+    # Mono
+    if audio.shape[0] > 1:
+        audio = audio.mean(dim=0, keepdim=True)
+    return audio  # (1, samples)
+
+
+def make_frontend(config, device="cpu"):
+    data_cfg = config["data"]
+    return STFTFrontend(
+        n_fft=data_cfg.get("n_fft", 2048),
+        hop_length=data_cfg.get("hop_length", 256),
+        win_length=data_cfg.get("n_fft", 2048),
+        mel_bins=data_cfg.get("n_mels", 128),
+        sample_rate=data_cfg.get("sample_rate", 44100),
+        causal=True,
+    ).to(device)
+
+
+def compute_mel_spectrogram(audio, config, device="cpu"):
+    """Compute mel spectrogram matching the training pipeline."""
+    frontend = make_frontend(config, device)
+    # Returns (1, 1, n_mels, T) log-mel
+    mel = frontend.mel_spectrogram(audio)
+    # Remove channel dim -> (1, n_mels, T)
+    mel = mel.squeeze(1)
+    return mel
+
+
+def main():
+    parser = argparse.ArgumentParser(description="Test checkpoint on audio files")
+    parser.add_argument("--checkpoint", type=str, required=True)
+    parser.add_argument("--config", type=str, default="conf/config.yaml")
+    parser.add_argument("--wet", type=str, required=True, help="Wet (EQ-processed) audio")
+    parser.add_argument("--dry", type=str, default=None, help="Dry (original) audio for reconstruction")
+    parser.add_argument("--device", type=str, default="auto")
+    args = parser.parse_args()
+
+    config = load_config(args.config)
+
+    if args.device == "auto":
+        device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    else:
+        device = torch.device(args.device)
+
+    print(f"Device: {device}")
+    print(f"Checkpoint: {args.checkpoint}")
+
+    model, meta = build_model(config, args.checkpoint, device)
+    print(f"  Epoch: {meta['epoch']}, Step: {meta['global_step']}")
+    print(f"  Receptive field: {model.receptive_field_frames} frames")
+
+    # Warmup: initialize DSP cache on correct device
+    n_fft = config["data"].get("n_fft", 2048)
+    model.dsp_cascade.init_freq_grid(n_fft)
+    model.to(device)
+
+    # Load wet audio
+    sr = config["data"].get("sample_rate", 44100)
+    wet_audio = load_audio(args.wet, target_sr=sr).to(device)
+    print(f"\nWet audio: {wet_audio.shape[-1]} samples, {wet_audio.shape[-1]/sr:.2f}s")
+
+    # Compute mel spectrogram
+    mel = compute_mel_spectrogram(wet_audio, config, device)
+    print(f"Mel spectrogram: {mel.shape} (batch, n_mels, T)")
+
+    # Run model inference
+    with torch.no_grad():
+        output = model(mel)
+        pred_gain, pred_freq, pred_q = output["params"]
+        pred_ft = output["filter_type"]
+        H_mag = output["H_mag"]
+
+    # Print predicted EQ parameters
+    num_bands = pred_gain.shape[-1]
+    print(f"\n{'='*60}")
+    print(f"  Predicted EQ Parameters ({num_bands} bands)")
+    print(f"{'='*60}")
+    for b in range(num_bands):
+        ft_name = FILTER_NAMES[pred_ft[0, b].item()]
+        g = pred_gain[0, b].item()
+        f = pred_freq[0, b].item()
+        q = pred_q[0, b].item()
+        print(f"  Band {b}: type={ft_name:10s}  gain={g:+6.1f} dB  "
+              f"freq={f:8.0f} Hz  Q={q:.2f}")
+
+    # If dry audio provided, reconstruct and compare
+    if args.dry:
+        dry_audio = load_audio(args.dry, target_sr=sr).to(device)
+        print(f"\nDry audio: {dry_audio.shape[-1]} samples, {dry_audio.shape[-1]/sr:.2f}s")
+
+        # Apply predicted EQ to dry audio in frequency domain
+        n_fft = config["data"].get("n_fft", 2048)
+        hop_length = config["data"].get("hop_length", 256)
+        frontend = make_frontend(config, device)
+
+        dry_stft = frontend.stft(dry_audio)  # (1, F, T)
+        H = H_mag.unsqueeze(-1)  # (1, F, 1)
+        reconstructed_stft = torch.abs(dry_stft) * H * torch.exp(1j * torch.angle(dry_stft))
+        reconstructed_audio = frontend.istft(reconstructed_stft, length=dry_audio.shape[-1])
+
+        # Compute spectral distance metrics
+        wet_stft = frontend.stft(wet_audio)
+        recon_stft = frontend.stft(reconstructed_audio)
+
+        wet_mag = torch.abs(wet_stft)
+        recon_mag = torch.abs(recon_stft)
+
+        # L2 spectral distance
+        spec_l2 = torch.sqrt(((wet_mag - recon_mag) ** 2).mean()).item()
+
+        # Log-spectral distance
+        log_wet = torch.log(wet_mag + 1e-8)
+        log_recon = torch.log(recon_mag + 1e-8)
+        log_spec_dist = torch.sqrt(((log_wet - log_recon) ** 2).mean()).item()
+
+        # Cosine similarity of magnitude spectra
+        wet_flat = wet_mag.flatten()
+        recon_flat = recon_mag.flatten()
+        cos_sim = torch.nn.functional.cosine_similarity(
+            wet_flat.unsqueeze(0), recon_flat.unsqueeze(0)
+        ).item()
+
+        print(f"\n{'='*60}")
+        print(f"  Reconstruction Quality (Predicted EQ on Dry vs Wet)")
+        print(f"{'='*60}")
+        print(f"  Spectral L2 distance:     {spec_l2:.4f}")
+        print(f"  Log-spectral distance:     {log_spec_dist:.4f} dB")
+        print(f"  Magnitude cosine sim:      {cos_sim:.4f}")
+
+        # Save outputs
+        out_dir = Path("test_output")
+        out_dir.mkdir(exist_ok=True)
+
+        torchaudio.save(
+            str(out_dir / "predicted_reconstructed.wav"),
+            reconstructed_audio.cpu(),
+            sr,
+        )
+        print(f"\n  Saved reconstructed audio: {out_dir / 'predicted_reconstructed.wav'}")
+
+        # Also save the predicted frequency response as a plot if matplotlib available
+        try:
+            import matplotlib
+            matplotlib.use("Agg")
+            import matplotlib.pyplot as plt
+
+            freqs = torch.linspace(0, sr / 2, H_mag.shape[-1]).cpu().numpy()
+            H_db = 20 * torch.log10(H_mag[0].cpu().clamp(min=1e-8)).numpy()
+
+            fig, axes = plt.subplots(2, 1, figsize=(12, 8))
+
+            # Frequency response
+            axes[0].plot(freqs, H_db, linewidth=1.5, label="Predicted EQ")
+            axes[0].set_xlabel("Frequency (Hz)")
+            axes[0].set_ylabel("Magnitude (dB)")
+            axes[0].set_title("Predicted EQ Frequency Response")
+            axes[0].set_xscale("log")
+            axes[0].set_xlim([20, sr / 2])
+            axes[0].grid(True, alpha=0.3)
+            axes[0].legend()
+
+            # Spectral comparison
+            wet_mag_db = 20 * torch.log10(wet_mag[0].mean(dim=-1).cpu().clamp(min=1e-8)).numpy()
+            recon_mag_db = 20 * torch.log10(recon_mag[0].mean(dim=-1).cpu().clamp(min=1e-8)).numpy()
+            dry_mag_db = 20 * torch.log10(torch.abs(dry_stft[0]).mean(dim=-1).cpu().clamp(min=1e-8)).numpy()
+            freq_axis = torch.linspace(0, sr / 2, wet_mag.shape[1]).cpu().numpy()
+
+            axes[1].plot(freq_axis, dry_mag_db, alpha=0.5, label="Dry", linewidth=1)
+            axes[1].plot(freq_axis, wet_mag_db, alpha=0.7, label="Wet (target)", linewidth=1.5)
+            axes[1].plot(freq_axis, recon_mag_db, alpha=0.7, label="Reconstructed", linewidth=1.5, linestyle="--")
+            axes[1].set_xlabel("Frequency (Hz)")
+            axes[1].set_ylabel("Magnitude (dB)")
+            axes[1].set_title("Spectral Comparison")
+            axes[1].set_xscale("log")
+            axes[1].set_xlim([20, sr / 2])
+            axes[1].grid(True, alpha=0.3)
+            axes[1].legend()
+
+            plt.tight_layout()
+            plt.savefig(str(out_dir / "eq_prediction.png"), dpi=150)
+            print(f"  Saved plot: {out_dir / 'eq_prediction.png'}")
+
+        except ImportError:
+            print("  (matplotlib not available, skipping plot)")
+
+    print("\nDone.")
+
+
+if __name__ == "__main__":
+    main()

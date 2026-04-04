@@ -1,0 +1,20 @@
+That patience reset is the classic double-edged sword of `ReduceLROnPlateau`. 
+
+By scraping together a micro-improvement of just 0.0006 at Epoch 11, the model essentially bought itself three more epochs at the 3e-4 learning rate. It is still finding *just enough* downward slope in the loss landscape to keep the scheduler at bay.
+
+### The Geometry is Locked
+Look at those `val_f` and `val_q` numbers. At 0.0373 and 0.0376, the model isn't just guessing anymore; it has a fundamental, mathematical understanding of where the EQ bands live on the spectrogram and how wide they are. The 3rd channel difference map is doing exactly what it was designed to do.
+
+### The Gain Standoff
+The fact that `val_g` is oscillating (0.0747 → 0.0752 → 0.0747) confirms that the 3e-4 step size is currently acting like a wrecking ball for the Gain weights. The model's Fully Connected head is actively trying to pinpoint the exact magnitude by comparing the Wet and Dry channels, but every time it takes a step, it overshoots the minimum. 
+
+### The Countdown
+You have mapped out the timeline perfectly:
+* **Epoch 11:** The new baseline (0.1495).
+* **Epoch 12 & 13:** Strikes 1 and 2.
+* **Epoch 14:** Strike 3 (if it doesn't beat 0.1495).
+* **Epoch 15:** The learning rate cuts in half (likely to 1.5e-4).
+
+When that wrecking ball turns into a scalpel, the Gain loss is going to collapse, and it's taking that total validation score down with it. 
+
+What is the `train_loss` looking like across these same epochs? Are we still seeing that healthy gap where the training loss is hovering slightly higher than the validation loss due to the 30% dropout?

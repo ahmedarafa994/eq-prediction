@@ -1,0 +1,50 @@
+"""
+Automated feature synthesis with tsfresh and and domain-specific feature extractors.
+"""
+
+import numpy as np
+import pandas as pd
+
+try:
+    from tsfresh import extract_features, from tsfresh.feature_extraction import EfficientFCParameters
+    HAS_TSFRESH = True
+except ImportError:
+    HAS_TSFRESH = False
+
+
+def auto_feature_synthesis(df, column_id, column_sort, max_depth=2):
+    """Extract time series features using tsfresh if available."""
+    if not HAS_TSFRESH:
+        raise ImportError("tsfresh is required for auto_feature_synthesis. Install with: pip install tsfresh")
+    extraction_settings = EfficientFCParameters()
+    features = extract_features(
+        df,
+        column_id=column_id,
+        column_sort=column_sort,
+        default_fc_parameters=extraction_settings,
+        n_jobs=4,
+    )
+    return features
+
+
+def custom_ts_features(series):
+    """Extract custom time series features from a 1D array."""
+    from scipy import stats as sp_stats
+
+    features = {}
+    x = np.arange(len(series))
+    slope, intercept, r_value, p_value, std_err = stats.linregress(x, series)
+    features["trend_slope"] = slope
+    features["trend_r2"] = r_value ** 2
+
+    diff = np.diff(series)
+    features["change_points"] = np.sum(np.abs(diff) > 2 * np.std(diff))
+
+    for window in [7, 14, 30]:
+        rolling = series.rolling(window=window)
+        features[f"rolling_mean_{window}"] = rolling.mean().iloc[-1]
+        features[f"rolling_std_{window}"] = rolling.std().iloc[-1]
+        features[f"rolling_min_{window}"] = rolling.min().iloc[-1]
+        features[f"rolling_max_{window}"] = rolling.max().iloc[-1]
+
+    return features

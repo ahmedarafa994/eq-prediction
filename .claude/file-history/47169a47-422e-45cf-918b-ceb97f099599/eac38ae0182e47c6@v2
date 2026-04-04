@@ -1,0 +1,305 @@
+"""
+optimizer_setup.py
+
+AdamW + OneCycleLR with linear warmup for StreamingTCNModel.
+
+Replaces the ReduceLROnPlateau scheduler in train.py with a OneCycleLR policy
+(Smith & Topin, ICML Workshop 2019) preceded by a short linear warmup phase.
+For high-loss starting points (train_loss ~32), the 30% ascending LR phase
+covers more of the loss landscape quickly before the long descent to min_lr.
+
+Also provides build_adamw_with_warmup_cosine() as a lighter alternative that
+preserves the existing cosine annealing schedule but adds a proper warmup.
+
+References:
+  Smith & Topin (2019): "Super-Convergence: Very Fast Training of Neural
+      Networks Using Large Learning Rates". arXiv:1708.07120.
+  Loshchilov & Hutter (2019): "Decoupled Weight Decay Regularization". ICLR.
+  Pascanu, Mikolov & Bengio (2013): "On the difficulty of training recurrent
+      neural networks". ICML. (Gradient clipping rationale.)
+
+Usage in train.py (replace the optimizer/scheduler setup block):
+    from optimizer_setup import build_adamw_with_onecycle
+    optimizer, scheduler, sched_mode = build_adamw_with_onecycle(
+        model=self.model,
+        max_lr=model_cfg.get("learning_rate", 3e-4),
+        total_steps=self.max_epochs * steps_per_epoch,
+        warmup_fraction=trainer_cfg.get("warmup_fraction", 0.05),
+        weight_decay=model_cfg.get("weight_decay", 1e-4),
+    )
+    # sched_mode == "step" means call scheduler.step() every optimizer step
+"""
+
+from __future__ import annotations
+
+import math
+from typing import Literal
+
+import torch
+import torch.nn as nn
+from torch.optim import AdamW
+from torch.optim.lr_scheduler import (
+    CosineAnnealingLR,
+    LinearLR,
+    OneCycleLR,
+    SequentialLR,
+)
+
+
+def build_adamw_with_onecycle(
+    model: nn.Module,
+    *,
+    max_lr: float = 3e-4,
+    total_steps: int,
+    warmup_fraction: float = 0.05,
+    weight_decay: float = 1e-4,
+    div_factor: float = 10.0,
+    final_div_factor: float = 1e4,
+    pct_start: float = 0.3,
+    anneal_strategy: str = "cos",
+    no_decay_types: tuple[type, ...] = (nn.LayerNorm, nn.BatchNorm1d),
+) -> tuple[AdamW, SequentialLR, Literal["step"]]:
+    """
+    Build AdamW with linear warmup followed by OneCycleLR.
+
+    Weight decay is disabled for normalization layer parameters and biases
+    (Loshchilov & Hutter, 2019 §4: decoupled weight decay should not apply
+    to scale/shift parameters or biases).
+
+    Args:
+        model:            The StreamingTCNModel to optimize.
+        max_lr:           Peak learning rate during the one-cycle phase.
+                          Recommended: use LR range finder result; typically
+                          3e-4 to 1e-3 for audio TCNs.
+        total_steps:      Total optimizer steps across all training (= max_epochs
+                          × steps_per_epoch). The warmup uses warmup_fraction of
+                          this, the cycle uses the remainder.
+        warmup_fraction:  Fraction of total_steps for linear LR warmup.
+                          Default 0.05 matches the warmup_fraction in config.yaml.
+        weight_decay:     AdamW weight decay. 1e-4 is conservative; increase to
+                          1e-3 if val_loss stops improving while train_loss falls.
+        div_factor:       OneCycleLR: initial_lr = max_lr / div_factor.
+        final_div_factor: OneCycleLR: min_lr = initial_lr / final_div_factor.
+        pct_start:        Fraction of cycle in the ascending phase. Default 0.3.
+        anneal_strategy:  'cos' (default) or 'linear'.
+        no_decay_types:   Parameter types whose weight_decay is set to 0.
+
+    Returns:
+        (optimizer, scheduler, 'step')
+        The 'step' string signals the caller to call scheduler.step() once per
+        optimizer step, not once per epoch.
+
+    Raises:
+        ValueError: If max_lr <= 0 or total_steps <= 0.
+    """
+    if max_lr <= 0:
+        raise ValueError(f"max_lr must be positive, got {max_lr}")
+    if total_steps <= 0:
+        raise ValueError(f"total_steps must be positive, got {total_steps}")
+
+    warmup_steps = max(1, int(total_steps * warmup_fraction))
+    cycle_steps = max(1, total_steps - warmup_steps)
+
+    # --- Parameter groups: weight decay only on non-bias, non-norm parameters ---
+    decay_params: list[nn.Parameter] = []
+    no_decay_params: list[nn.Parameter] = []
+
+    for name, param in model.named_parameters():
+        if not param.requires_grad:
+            continue
+        is_bias = name.endswith(".bias")
+        parent = _get_parent_module(model, name)
+        is_norm = isinstance(parent, no_decay_types)
+        if is_bias or is_norm:
+            no_decay_params.append(param)
+        else:
+            decay_params.append(param)
+
+    base_lr = max_lr / div_factor
+    optimizer = AdamW(
+        [
+            {"params": decay_params, "weight_decay": weight_decay},
+            {"params": no_decay_params, "weight_decay": 0.0},
+        ],
+        lr=base_lr,
+        betas=(0.9, 0.999),
+        eps=1e-8,
+    )
+
+    # Linear warmup: ramp from base_lr/10 to base_lr over warmup_steps
+    warmup = LinearLR(
+        optimizer,
+        start_factor=0.1,
+        end_factor=1.0,
+        total_iters=warmup_steps,
+    )
+
+    # OneCycleLR: ascend to max_lr then descend to min_lr
+    onecycle = OneCycleLR(
+        optimizer,
+        max_lr=[max_lr, max_lr],  # one per param group
+        total_steps=cycle_steps,
+        pct_start=pct_start,
+        div_factor=div_factor,
+        final_div_factor=final_div_factor,
+        anneal_strategy=anneal_strategy,
+        cycle_momentum=False,
+    )
+
+    scheduler = SequentialLR(
+        optimizer,
+        schedulers=[warmup, onecycle],
+        milestones=[warmup_steps],
+    )
+
+    print(
+        f"[build_adamw_with_onecycle] "
+        f"decay_params={len(decay_params)}, no_decay_params={len(no_decay_params)}\n"
+        f"  warmup: {warmup_steps} steps, lr {base_lr/10:.2e} → {base_lr:.2e}\n"
+        f"  onecycle: {cycle_steps} steps, lr {base_lr:.2e} → {max_lr:.2e} "
+        f"→ {base_lr/final_div_factor:.2e}"
+    )
+
+    return optimizer, scheduler, "step"
+
+
+def build_adamw_with_warmup_cosine(
+    model: nn.Module,
+    *,
+    lr: float = 3e-4,
+    total_steps: int,
+    warmup_fraction: float = 0.05,
+    weight_decay: float = 1e-4,
+    eta_min: float = 1e-6,
+    no_decay_types: tuple[type, ...] = (nn.LayerNorm, nn.BatchNorm1d),
+) -> tuple[AdamW, SequentialLR, Literal["step"]]:
+    """
+    Lighter alternative: AdamW with linear warmup then cosine annealing.
+
+    Preserves the spirit of the existing cosine annealing schedule in config.yaml
+    (lr_schedule: plateau could be replaced with this) but adds a proper warmup.
+    Loshchilov & Hutter (2017) SGDR recommends warm restarts; this version uses
+    a single cycle without restarts for simplicity.
+
+    Args: same as build_adamw_with_onecycle except no div_factor/pct_start.
+          eta_min: minimum LR at end of cosine cycle. Default 1e-6.
+
+    Returns:
+        (optimizer, scheduler, 'step') — step scheduler once per optimizer step.
+    """
+    if lr <= 0:
+        raise ValueError(f"lr must be positive, got {lr}")
+    if total_steps <= 0:
+        raise ValueError(f"total_steps must be positive, got {total_steps}")
+
+    warmup_steps = max(1, int(total_steps * warmup_fraction))
+    cosine_steps = max(1, total_steps - warmup_steps)
+
+    decay_params, no_decay_params = _split_param_groups(model, no_decay_types)
+
+    optimizer = AdamW(
+        [
+            {"params": decay_params, "weight_decay": weight_decay},
+            {"params": no_decay_params, "weight_decay": 0.0},
+        ],
+        lr=lr,
+        betas=(0.9, 0.999),
+        eps=1e-8,
+    )
+
+    warmup = LinearLR(
+        optimizer,
+        start_factor=0.01,
+        end_factor=1.0,
+        total_iters=warmup_steps,
+    )
+    cosine = CosineAnnealingLR(optimizer, T_max=cosine_steps, eta_min=eta_min)
+
+    scheduler = SequentialLR(
+        optimizer,
+        schedulers=[warmup, cosine],
+        milestones=[warmup_steps],
+    )
+
+    return optimizer, scheduler, "step"
+
+
+def log_gradient_norms(
+    model: nn.Module,
+    global_step: int,
+    *,
+    log_every: int = 100,
+    explosion_threshold: float = 10.0,
+) -> float:
+    """
+    Compute and optionally log per-layer gradient norms.
+
+    Call after loss.backward() and before clip_grad_norm_. Returns the
+    total L2 norm (same value as clip_grad_norm_ would report).
+
+    Pascanu et al. (ICML 2013) recommend logging gradient norms to detect
+    explosion early — a persistently high norm (> clip threshold) means the
+    loss scale or LR is too large.
+
+    Args:
+        model:                The model (gradients must be populated).
+        global_step:          Current step (controls print frequency).
+        log_every:            Print every N steps.
+        explosion_threshold:  Print per-layer norms if total norm > this value.
+
+    Returns:
+        total_norm: L2 norm of all gradients (float).
+    """
+    grads = [p.grad.detach() for p in model.parameters() if p.grad is not None]
+    if not grads:
+        return 0.0
+
+    total_norm = torch.norm(
+        torch.stack([g.norm(2.0) for g in grads]), 2.0
+    ).item()
+
+    should_log = (global_step % log_every == 0) or not math.isfinite(total_norm)
+    if should_log:
+        print(f"  [grad_norm] step={global_step}: total={total_norm:.4f}")
+
+    if not math.isfinite(total_norm) or total_norm > explosion_threshold:
+        print(f"  [grad_norm] ALERT: norm={total_norm:.4f} > {explosion_threshold}")
+        # Print top offending layers
+        layer_norms = [
+            (name, p.grad.detach().norm().item())
+            for name, p in model.named_parameters()
+            if p.grad is not None
+        ]
+        layer_norms.sort(key=lambda x: x[1] if math.isfinite(x[1]) else 1e18, reverse=True)
+        for name, n in layer_norms[:8]:
+            print(f"    {name:60s} {n:.4f}")
+
+    return total_norm
+
+
+def _split_param_groups(
+    model: nn.Module,
+    no_decay_types: tuple[type, ...],
+) -> tuple[list[nn.Parameter], list[nn.Parameter]]:
+    """Split model parameters into (decay, no_decay) groups."""
+    decay, no_decay = [], []
+    for name, param in model.named_parameters():
+        if not param.requires_grad:
+            continue
+        parent = _get_parent_module(model, name)
+        if name.endswith(".bias") or isinstance(parent, no_decay_types):
+            no_decay.append(param)
+        else:
+            decay.append(param)
+    return decay, no_decay
+
+
+def _get_parent_module(model: nn.Module, param_name: str) -> nn.Module | None:
+    """Traverse model hierarchy to find the direct parent of a named parameter."""
+    parts = param_name.split(".")
+    module: nn.Module | None = model
+    for part in parts[:-1]:
+        module = getattr(module, part, None)
+        if module is None:
+            return None
+    return module

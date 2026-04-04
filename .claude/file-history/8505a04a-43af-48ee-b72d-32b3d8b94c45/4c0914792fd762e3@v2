@@ -1,0 +1,207 @@
+"""
+Test a trained checkpoint against a known ground-truth EQ.
+
+Generates a synthetic dry signal, applies a known multi-type EQ to create
+the wet signal, runs the model, then compares predicted vs ground-truth params.
+Also saves both wet and reconstructed audio as WAV files for listening.
+"""
+import torch
+import numpy as np
+import yaml
+from pathlib import Path
+from model_tcn import StreamingTCNModel
+from dsp_frontend import STFTFrontend
+from differentiable_eq import DifferentiableBiquadCascade
+from differentiable_eq import (
+    FILTER_PEAKING, FILTER_LOWSHELF, FILTER_HIGHSHELF,
+    FILTER_HIGHPASS, FILTER_LOWPASS,
+)
+FILTER_NAMES = ["peaking", "lowshelf", "highshelf", "highpass", "lowpass"]
+
+
+def load_model(checkpoint_path, config_path="conf/config.yaml"):
+    cfg = yaml.safe_load(open(config_path))
+    data_cfg = cfg["data"]
+    model_cfg = cfg["model"]
+    enc_cfg = model_cfg.get("encoder", {})
+
+    model = StreamingTCNModel(
+        n_mels=data_cfg.get("n_mels", 128),
+        embedding_dim=enc_cfg.get("embedding_dim", 128),
+        num_bands=data_cfg["num_bands"],
+        channels=enc_cfg.get("channels", 128),
+        num_blocks=enc_cfg.get("num_blocks", 4),
+        num_stacks=enc_cfg.get("num_stacks", 2),
+        sample_rate=data_cfg["sample_rate"],
+        n_fft=data_cfg.get("n_fft", 2048),
+    )
+
+    ckpt = torch.load(checkpoint_path, map_location="cpu", weights_only=True)
+    model.load_state_dict(ckpt["model_state_dict"])
+    model.eval()
+    print(f"Loaded checkpoint from {checkpoint_path}")
+    epoch = ckpt.get("epoch", "N/A")
+    val_loss = ckpt.get("val_loss", "N/A")
+    print(f"  Epoch: {epoch}, Val loss: {val_loss}")
+    return model, cfg
+
+
+def generate_test_signal(duration=3.0, sr=44100):
+    N = int(duration * sr)
+    t = np.linspace(0, duration, N, endpoint=False)
+    audio = np.zeros(N, dtype=np.float32)
+    fundamental = 220.0
+    for h in range(1, 8):
+        audio += (0.15 / h) * np.sin(2 * np.pi * fundamental * h * t)
+    audio += 0.05 * np.random.randn(N).astype(np.float32)
+    peak = np.max(np.abs(audio)) + 1e-8
+    audio /= peak
+    return audio
+
+
+def apply_ground_truth_eq(dry, eq_params, n_fft=2048, sr=44100):
+    dsp = DifferentiableBiquadCascade(num_bands=len(eq_params), sample_rate=44100)
+    dry_tensor = torch.from_numpy(dry).unsqueeze(0).float()
+    hop_length = 512
+    window = torch.hann_window(n_fft)
+    stft = torch.stft(
+        dry_tensor, n_fft, hop_length, n_fft,
+        window=window, return_complex=True,
+    )
+    mag = torch.abs(stft).squeeze(0)
+    phase = torch.angle(stft)
+
+    gain_db = torch.tensor([p["gain"] for p in eq_params]).unsqueeze(0)
+    freq = torch.tensor([p["freq"] for p in eq_params]).unsqueeze(0)
+    q = torch.tensor([p["q"] for p in eq_params]).unsqueeze(0)
+    filter_type = torch.tensor([p["type"] for p in eq_params]).unsqueeze(0).long()
+
+    wet_mag = dsp.apply_to_spectrum(
+        mag.unsqueeze(0), gain_db, freq, q, filter_type=filter_type
+    )
+    wet_stft = wet_mag * torch.exp(1j * phase)
+    wet_audio = torch.istft(
+        wet_stft, n_fft, hop_length, n_fft,
+        window=window, length=dry.shape[0],
+    )
+    return wet_audio.squeeze(0).numpy()
+
+
+def save_wav(audio, path, sr):
+    try:
+        import soundfile as sf
+        data = audio.numpy() if isinstance(audio, torch.Tensor) else np.float32(audio)
+        if data.ndim == 2:
+            data = data.squeeze(0)
+        sf.write(str(path), data, sr)
+    except ImportError:
+        raise RuntimeError("Install soundfile: pip install soundfile")
+
+
+def main():
+    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    print(f"Device: {device}")
+    if device.type == "cuda":
+        print(f"GPU: {torch.cuda.get_device_name(0)}")
+
+    checkpoint = "checkpoints/best.pt"
+    model, cfg = load_model(checkpoint)
+    frontend = STFTFrontend(
+        n_fft=cfg["data"].get("n_fft", 2048),
+        hop_length=cfg["data"].get("hop_length", 256),
+        win_length=cfg["data"].get("n_fft", 2048),
+        mel_bins=cfg["data"].get("n_mels", 128),
+        sample_rate=cfg["data"]["sample_rate"],
+    )
+    sr = cfg["data"]["sample_rate"]
+    n_fft = cfg["data"].get("n_fft", 2048)
+    num_bands = cfg["data"]["num_bands"]
+    print(f"Config: sr={sr}, n_fft={n_fft}, hop=256, bands={num_bands}")
+
+    output_dir = Path("test_output")
+    output_dir.mkdir(exist_ok=True)
+
+    # Ground-truth EQ: 5-band parametric EQ
+    gt_params = [
+        {"type": FILTER_PEAKING, "gain": 6.0, "freq": 1000.0, "q": 1.0},
+        {"type": FILTER_LOWSHELF, "gain": -4.0, "freq": 300.0, "q": 0.7},
+        {"type": FILTER_HIGHSHELF, "gain": 3.0, "freq": 6000.0, "q": 1.0},
+        {"type": FILTER_HIGHPASS, "gain": 0.0, "freq": 100.0, "q": 0.5},
+        {"type": FILTER_LOWPASS, "gain": 0.0, "freq": 4000.0, "q": 0.5},
+    ]
+    print(f"\nGround-truth EQ ({num_bands} bands):")
+    for i in range(num_bands):
+        p = gt_params[i]
+        print(f"  Band {i+1}: {FILTER_NAMES[p['type']]:<12} {p['gain']:+6.1f} dB at {p['freq']:>8.0f} Hz, Q={p['q']:.2f}")
+
+    # Generate dry signal
+    dry = generate_test_signal(duration=3.0, sr=sr)
+    wet = apply_ground_truth_eq(dry, gt_params, n_fft=n_fft, sr=sr)
+    print("Applied ground-truth EQ")
+    save_wav(dry, output_dir / "dry.wav", sr)
+    save_wav(wet, output_dir / "wet.wav", sr)
+
+    # Run model
+    wet_tensor = torch.from_numpy(wet).unsqueeze(0).float()
+    mel_spec = frontend.mel_spectrogram(wet_tensor)
+    print(f"Mel spectrogram shape: {mel_spec.shape}")
+
+    # mel_spec is (Batch, 1, n_mels, T) -> model expects (Batch, n_mels, T)
+    mel_input = mel_spec.squeeze(1)  # drop channel dim
+    print(f"Model input: {mel_input.shape}")
+
+    with torch.no_grad():
+        output = model(mel_input)
+
+    pred_gain, pred_freq, pred_q = output["params"]
+    pred_type = output["filter_type"]
+
+    print(f"\nPredicted EQ parameters ({num_bands} bands):")
+    for i in range(num_bands):
+        gt = gt_params[i]
+        pg = pred_gain[0, i].item()
+        pf = pred_freq[0, i].item()
+        pq = pred_q[0, i].item()
+        pt = pred_type[0, i].item()
+        type_ok = "OK" if pt == gt["type"] else "WRONG"
+        gain_err = abs(pg - gt["gain"])
+        freq_err_oct = abs(np.log2(pf / max(gt["freq"], 1.0)))
+        q_err_dec = abs(np.log10(pq / max(gt["q"], 1e-6)))
+        print(f"  Band {i+1}:")
+        print(f"    GT:   {FILTER_NAMES[gt['type']]:<12} {gt['gain']:+6.1f} dB | {gt['freq']:>8.0f} Hz | Q={gt['q']:.2f}")
+        print(f"    Pred: {FILTER_NAMES[pt]:<12} {pg:+6.2f} dB | {pf:.1f} Hz | Q={pq:.3f}")
+        print(f"    Err:  {type_ok:<12} {gain_err:>8.2f} dB | {freq_err_oct:.3f} oct | {q_err_dec:.3f}")
+
+    # Reconstruct from predicted params
+    pred_params = []
+    for i in range(num_bands):
+        pred_params.append({
+            "type": pred_type[0, i].item(),
+            "gain": pred_gain[0, i].item(),
+            "freq": pred_freq[0, i].item(),
+            "q": pred_q[0, i].item(),
+        })
+    recon = apply_ground_truth_eq(dry, pred_params, n_fft=n_fft, sr=sr)
+    save_wav(recon, output_dir / "reconstructed.wav", sr)
+
+    # Frequency response comparison
+    gt_gain_t = torch.tensor([p["gain"] for p in gt_params]).unsqueeze(0)
+    gt_freq_t = torch.tensor([p["freq"] for p in gt_params]).unsqueeze(0)
+    gt_q_t = torch.tensor([p["q"] for p in gt_params]).unsqueeze(0)
+    gt_ft_t = torch.tensor([p["type"] for p in gt_params]).unsqueeze(0).long()
+
+    dsp = DifferentiableBiquadCascade(num_bands=num_bands, sample_rate=44100)
+    H_gt = dsp(gt_gain_t, gt_freq_t, gt_q_t, n_fft=n_fft, filter_type=gt_ft_t)
+    H_pred = dsp(pred_gain, pred_freq, pred_q, n_fft=n_fft, filter_type=pred_type)
+    freq_axis = torch.linspace(0, sr / 2, H_gt.shape[-1])
+    hmag_err = (H_gt - H_pred).abs().mean().item()
+
+    print(f"\nFreq response L1 error: {hmag_err:.4f}")
+    print(f"\nAudio files saved to {output_dir}/")
+    print(f"  dry.wav           - original dry signal")
+    print(f"  wet.wav           - dry + ground-truth EQ")
+    print(f"  reconstructed.wav - dry + predicted EQ")
+
+
+if __name__ == "__main__":
+    main()

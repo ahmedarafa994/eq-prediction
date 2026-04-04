@@ -1,0 +1,10 @@
+{
+  "permissions": {
+    "allow": [
+      "Bash(python test_eq.py)",
+      "Bash(python test_param_head_fix.py)",
+      "Bash(python test_multitype_eq.py)",
+      "Bash(python test_encoder_freq.py)"
+    ]
+  }
+}

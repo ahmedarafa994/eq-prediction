@@ -1,0 +1,299 @@
+"""
+gumbel_annealing.py
+
+Epoch-level Gumbel-Softmax temperature annealing for MultiTypeEQParameterHead.
+
+The existing codebase sets gumbel_temperature per curriculum stage but the
+hardcoded min_tau=0.5 floor in MultiTypeEQParameterHead.forward() prevents
+the later curriculum stages (0.15, 0.1, 0.05) from taking effect.
+
+The min_tau fix (0.5 → 0.05) in differentiable_eq.py resolves the immediate
+issue. This module provides finer intra-stage annealing — smoothly decreasing
+τ over the epochs within a curriculum stage, rather than the existing step-wise
+override that jumps to the stage's target temperature at the start of the stage.
+
+References:
+  Jang, Gu & Poole (2017): "Categorical Reparameterization with Gumbel-Softmax".
+      ICLR 2017. (Recommends exponential temperature annealing.)
+  Maddison, Mnih & Teh (2017): "The Concrete Distribution: A Continuous
+      Relaxation of Discrete Random Variables". ICLR 2017.
+
+Usage in Trainer.train_one_epoch():
+    # Near top of the method, before the batch loop:
+    if hasattr(self.model, 'param_head') and hasattr(self.model.param_head, 'gumbel'):
+        new_tau = self.model.param_head.gumbel.anneal(local_epoch_within_stage)
+        if self.global_step % self.log_every == 0:
+            print(f"  Gumbel τ = {new_tau:.4f}")
+
+Standalone usage (temperature preview):
+    python gumbel_annealing.py
+"""
+
+from __future__ import annotations
+
+import math
+from typing import Literal
+
+import torch
+import torch.nn as nn
+import torch.nn.functional as F
+
+
+ScheduleType = Literal["exponential", "linear", "cosine"]
+
+
+class TemperatureScheduler:
+    """
+    Computes Gumbel-Softmax temperature τ for a given epoch using one of
+    three monotonically decreasing schedules, clamped to [min_temp, start_temp].
+
+    Schedules:
+        exponential (Jang et al., 2017):
+            τ(t) = max(min_temp, start_temp × exp(−rate × t))
+            where rate = −log(end_temp / start_temp) / total_epochs
+
+        linear:
+            τ(t) = max(min_temp, start_temp − (start_temp − end_temp) × t / T)
+
+        cosine:
+            τ(t) = min_temp + 0.5 × (start_temp − min_temp) × (1 + cos(π × t / T))
+
+    Args:
+        start_temp:   Temperature at epoch 0. High τ → diffuse type probs.
+        end_temp:     Target temperature at epoch = total_epochs.
+        total_epochs: Length of this annealing phase (number of epochs).
+        schedule:     'exponential' (default, Jang et al. recommendation),
+                      'linear', or 'cosine'.
+        min_temp:     Hard lower bound. Must be > 0 to avoid numerical issues
+                      (gradient through softmax vanishes as τ → 0).
+                      Typical: 0.05–0.1.
+    """
+
+    def __init__(
+        self,
+        start_temp: float = 1.0,
+        end_temp: float = 0.1,
+        total_epochs: int = 50,
+        schedule: ScheduleType = "exponential",
+        min_temp: float = 0.05,
+    ) -> None:
+        if start_temp <= 0:
+            raise ValueError(f"start_temp must be > 0, got {start_temp}")
+        if end_temp <= 0:
+            raise ValueError(f"end_temp must be > 0, got {end_temp}")
+        if end_temp >= start_temp:
+            raise ValueError(
+                f"end_temp ({end_temp}) must be < start_temp ({start_temp})"
+            )
+        if total_epochs <= 0:
+            raise ValueError(f"total_epochs must be > 0, got {total_epochs}")
+        if min_temp <= 0:
+            raise ValueError(f"min_temp must be > 0, got {min_temp}")
+        if schedule not in ("exponential", "linear", "cosine"):
+            raise ValueError(
+                f"schedule must be 'exponential', 'linear', or 'cosine', got '{schedule}'"
+            )
+
+        self.start_temp = start_temp
+        self.end_temp = end_temp
+        self.total_epochs = total_epochs
+        self.schedule = schedule
+        self.min_temp = min_temp
+        # Derive exponential rate so τ(total_epochs) ≈ end_temp
+        self._rate = -math.log(end_temp / start_temp) / max(total_epochs, 1)
+
+    def __call__(self, epoch: int) -> float:
+        """
+        Return temperature for the given 0-indexed epoch.
+
+        Args:
+            epoch: Current epoch index within this annealing phase (0-indexed).
+
+        Returns:
+            Temperature τ clamped to [min_temp, start_temp].
+        """
+        t = float(epoch)
+        T = float(self.total_epochs)
+
+        if self.schedule == "exponential":
+            tau = self.start_temp * math.exp(-self._rate * t)
+        elif self.schedule == "linear":
+            tau = self.start_temp - (self.start_temp - self.end_temp) * (t / max(T, 1))
+        else:  # cosine
+            tau = self.end_temp + 0.5 * (self.start_temp - self.end_temp) * (
+                1.0 + math.cos(math.pi * t / max(T, 1))
+            )
+
+        return max(self.min_temp, min(self.start_temp, tau))
+
+    def __repr__(self) -> str:
+        return (
+            f"TemperatureScheduler(start={self.start_temp}, end={self.end_temp}, "
+            f"T={self.total_epochs}, schedule='{self.schedule}', min={self.min_temp})"
+        )
+
+
+class GumbelSoftmaxWithAnnealing(nn.Module):
+    """
+    Gumbel-Softmax layer with epoch-level temperature annealing.
+
+    Drop-in supplement for the Gumbel-Softmax block in
+    MultiTypeEQParameterHead.forward(). Does NOT replace the existing
+    min_tau logic — it works alongside the fixed min_tau=0.05 to provide
+    smooth intra-stage temperature decay.
+
+    Key differences from the existing implementation:
+      1. Temperature is annealed per epoch within a stage via anneal(epoch).
+      2. Temperature serializes as a buffer — survives checkpoint save/load.
+      3. Hard argmax at model.eval() (deterministic inference).
+
+    Args:
+        num_classes:  Number of filter types (5 for this model).
+        scheduler:    TemperatureScheduler instance. If None, uses fixed τ=1.0.
+
+    Usage:
+        # Instantiate (e.g. in MultiTypeEQParameterHead.__init__):
+        self.gumbel = GumbelSoftmaxWithAnnealing(
+            num_classes=num_filter_types,
+            scheduler=TemperatureScheduler(1.0, 0.05, total_epochs=stage_epochs),
+        )
+
+        # Once per epoch, before the batch loop (e.g. in train_one_epoch):
+        new_tau = self.model.param_head.gumbel.anneal(local_epoch)
+
+        # In the parameter head forward():
+        type_probs = self.gumbel(type_logits)  # replaces the manual Gumbel block
+    """
+
+    def __init__(
+        self,
+        num_classes: int = 5,
+        scheduler: TemperatureScheduler | None = None,
+    ) -> None:
+        super().__init__()
+        if num_classes < 2:
+            raise ValueError(f"num_classes must be >= 2, got {num_classes}")
+        self.num_classes = num_classes
+        self.scheduler = scheduler
+
+        init_tau = scheduler.start_temp if scheduler is not None else 1.0
+        # Buffer: moves with .to(device) and saves with state_dict()
+        self.register_buffer("temperature", torch.tensor(float(init_tau)))
+
+    def anneal(self, epoch: int) -> float:
+        """
+        Update temperature for the given epoch index within the current stage.
+
+        Call once per epoch before the batch loop. All batches in an epoch
+        share the same temperature, consistent with the existing per-stage
+        temperature override behavior.
+
+        Args:
+            epoch: 0-indexed epoch within the current curriculum stage.
+
+        Returns:
+            New temperature value (for logging).
+        """
+        if self.scheduler is None:
+            return self.temperature.item()
+        new_tau = self.scheduler(epoch)
+        self.temperature.fill_(new_tau)
+        return new_tau
+
+    def forward(self, logits: torch.Tensor) -> torch.Tensor:
+        """
+        Apply Gumbel-Softmax (training) or plain softmax (eval).
+
+        Matches the existing codebase's behavior:
+          - Training: Gumbel noise + temperature scaling, clamped noise to [-10, 10]
+            (P(|Gumbel| > 10) < 1e-23, so clamping is lossless).
+          - Eval: F.softmax(logits) — deterministic, no noise.
+
+        Args:
+            logits: (..., num_classes) — raw classification logits.
+
+        Returns:
+            type_probs: (..., num_classes) — soft probabilities.
+
+        Raises:
+            ValueError: If logits.shape[-1] != num_classes.
+        """
+        if logits.shape[-1] != self.num_classes:
+            raise ValueError(
+                f"logits last dim {logits.shape[-1]} != num_classes={self.num_classes}"
+            )
+
+        if not self.training:
+            return F.softmax(logits, dim=-1)
+
+        # Gumbel noise — clamp matches existing implementation in differentiable_eq.py
+        gumbels = -torch.empty_like(logits).exponential_().log()
+        gumbels = gumbels.clamp(-10.0, 10.0)
+
+        tau = max(self.temperature.item(), 0.01)  # absolute floor for numerical safety
+        return ((logits + gumbels) / tau).softmax(dim=-1)
+
+    @property
+    def current_temperature(self) -> float:
+        """Current temperature (for logging)."""
+        return self.temperature.item()
+
+    def extra_repr(self) -> str:
+        return f"num_classes={self.num_classes}, tau={self.current_temperature:.4f}"
+
+
+def print_schedule_preview(
+    start: float = 1.0,
+    end: float = 0.05,
+    epochs: int = 50,
+) -> None:
+    """
+    Print temperature trajectories for all three schedule types.
+
+    Run: python gumbel_annealing.py
+    to preview how each schedule decays τ across epochs before deploying.
+    """
+    schedules: list[ScheduleType] = ["exponential", "linear", "cosine"]
+    checkpoints = [0, 5, 10, 20, 30, 40, epochs - 1]
+
+    print(f"\nTemperature schedules: start={start}, end={end}, epochs={epochs}")
+    print(f"{'Epoch':>6}  " + "  ".join(f"{s:>14}" for s in schedules))
+    print("-" * 52)
+
+    schedulers = {
+        s: TemperatureScheduler(start, end, epochs, schedule=s, min_temp=end)
+        for s in schedules
+    }
+    for ep in checkpoints:
+        row = f"{ep:>6}  "
+        row += "  ".join(f"{schedulers[s](ep):>14.4f}" for s in schedules)
+        print(row)
+
+    print("\nCross-entropy from uniform logits = {:.4f} nats (constant w.r.t. τ)".format(
+        math.log(5)
+    ))
+    print("τ affects the GRADIENT through the soft DSP path, not the CE term directly.")
+    print("Lower τ → sharper type_probs → more specific soft frequency-response blend.")
+
+
+if __name__ == "__main__":
+    # Preview all three schedule types across the full_multitype stage (50 epochs)
+    print_schedule_preview(start=1.0, end=0.05, epochs=50)
+
+    # Also show the curriculum transition points
+    print("\nCurriculum gumbel temperatures (config.yaml) with new min_tau=0.05:")
+    curriculum = [
+        ("easy_peaking",     1.0,  20),
+        ("medium_peaking",   0.5,  20),
+        ("frequency_spread", 0.3,  15),
+        ("shelf_types",      0.15, 20),
+        ("full_multitype",   0.1,  50),
+        ("full_difficulty",  0.05, 40),
+    ]
+    print(f"{'Stage':20s}  {'τ_target':>10}  {'τ_actual (new)':>14}  {'Was floored?':>12}")
+    old_min, new_min = 0.5, 0.05
+    for name, target, _ in curriculum:
+        actual_old = max(target, old_min)
+        actual_new = max(target, new_min)
+        floored = "YES (bug)" if actual_old != target else "no"
+        print(f"{name:20s}  {target:>10.2f}  {actual_new:>14.4f}  {floored:>12}")

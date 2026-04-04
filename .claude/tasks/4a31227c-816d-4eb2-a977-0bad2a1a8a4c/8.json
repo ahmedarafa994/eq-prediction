@@ -1,0 +1,9 @@
+{
+  "id": "8",
+  "subject": "Fix mel_profile train/test mismatch (use wet-only)",
+  "description": "Change train.py to use wet-only mel_profile instead of wet-dry difference. This matches inference conditions where only the wet signal is available. Change in both train_one_epoch and validate.",
+  "activeForm": "Fixing mel_profile train/test mismatch",
+  "status": "completed",
+  "blocks": [],
+  "blockedBy": []
+}

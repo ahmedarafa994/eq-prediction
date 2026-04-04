@@ -1,0 +1,9 @@
+{
+  "id": "11",
+  "subject": "Phase 3a: Frequency prior in parameter head",
+  "description": "Add learnable per-band frequency bias in MultiTypeEQParameterHead, initialized to uniform log-spacing. Learnable scale parameter.",
+  "activeForm": "Adding frequency prior to parameter head",
+  "status": "completed",
+  "blocks": [],
+  "blockedBy": []
+}

@@ -1,0 +1,50 @@
+ File "/teamspace/studios/this_studio/insight/train.py", line 1161, in <module>
+    trainer.fit()
+  File "/teamspace/studios/this_studio/insight/train.py", line 982, in fit
+    train_loss = self.train_one_epoch(global_epoch)
+                 ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/teamspace/studios/this_studio/insight/train.py", line 568, in train_one_epoch
+    mel_frames, dry_mel = self._prepare_both_mels(batch)
+                          ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/teamspace/studios/this_studio/insight/train.py", line 557, in _prepare_both_mels
+    mel = self.frontend.mel_spectrogram(stacked).squeeze(1)  # (2B, n_mels, T)
+          ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/teamspace/studios/this_studio/insight/dsp_frontend.py", line 112, in mel_spectrogram
+    complex_spec = self.stft(audio)
+                   ^^^^^^^^^^^^^^^^
+  File "/teamspace/studios/this_studio/insight/dsp_frontend.py", line 82, in stft
+    return torch.stft(
+           ^^^^^^^^^^^
+  File "/home/zeus/miniconda3/envs/cloudspace/lib/python3.12/site-packages/torch/functional.py", line 730, in stft
+    return _VF.stft(  # type: ignore[attr-defined]
+           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+torch.OutOfMemoryError: CUDA out of memory. Tried to allocate 32.31 GiB. GPU 0 has a total capacity of 94.97 GiB of which 17.42 GiB is free. Including non-PyTorch memory, this process has 77.49 GiB memory in use. Of the allocated memory 76.84 GiB is allocated by PyTorch, and 23.58 MiB is reserved by PyTorch but unallocated. If reserved but unallocated memory is large try setting PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True to avoid fragmentation.  See documentation for Memory Management  (https://pytorch.org/docs/stable/notes/cuda.html#environment-variables)
+Exception in thread Thread-2 (_pin_memory_loop):
+Traceback (most recent call last):
+  File "/home/zeus/miniconda3/envs/cloudspace/lib/python3.12/threading.py", line 1075, in _bootstrap_inner
+    self.run()
+  File "/home/zeus/miniconda3/envs/cloudspace/lib/python3.12/threading.py", line 1012, in run
+    self._target(*self._args, **self._kwargs)
+  File "/home/zeus/miniconda3/envs/cloudspace/lib/python3.12/site-packages/torch/utils/data/_utils/pin_memory.py", line 61, in _pin_memory_loop
+    do_one_step()
+  File "/home/zeus/miniconda3/envs/cloudspace/lib/python3.12/site-packages/torch/utils/data/_utils/pin_memory.py", line 37, in do_one_step
+    r = in_queue.get(timeout=MP_STATUS_CHECK_INTERVAL)
+        ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/home/zeus/miniconda3/envs/cloudspace/lib/python3.12/multiprocessing/queues.py", line 122, in get
+    return _ForkingPickler.loads(res)
+           ^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/home/zeus/miniconda3/envs/cloudspace/lib/python3.12/site-packages/torch/multiprocessing/reductions.py", line 541, in rebuild_storage_fd
+    fd = df.detach()
+         ^^^^^^^^^^^
+  File "/home/zeus/miniconda3/envs/cloudspace/lib/python3.12/multiprocessing/resource_sharer.py", line 57, in detach
+    with _resource_sharer.get_connection(self._id) as conn:
+         ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/home/zeus/miniconda3/envs/cloudspace/lib/python3.12/multiprocessing/resource_sharer.py", line 86, in get_connection
+    c = Client(address, authkey=process.current_process().authkey)
+        ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/home/zeus/miniconda3/envs/cloudspace/lib/python3.12/multiprocessing/connection.py", line 519, in Client
+    c = SocketClient(address)
+        ^^^^^^^^^^^^^^^^^^^^^
+  File "/home/zeus/miniconda3/envs/cloudspace/lib/python3.12/multiprocessing/connection.py", line 647, in SocketClient
+    s.connect(address)
+ConnectionRefusedError: [Errno 111] Connection refused

@@ -1,0 +1,189 @@
+experiment_name: idsp-eq-v3-improved
+seed: 42
+data:
+  num_bands: 3
+  sample_rate: 44100
+  audio_duration: 1.5
+  n_fft: 2048
+  hop_length: 256
+  n_mels: 512
+  gain_bounds:
+  - -24.0
+  - 24.0
+  freq_bounds:
+  - 20.0
+  - 20000.0
+  q_bounds:
+  - 0.1
+  - 10.0
+  filter_types:
+  - peaking
+  - lowshelf
+  - highshelf
+  - highpass
+  - lowpass
+  type_weights:
+  - 0.5
+  - 0.15
+  - 0.15
+  - 0.1
+  - 0.1
+  train_split: 0.8
+  val_split: 0.1
+  test_split: 0.1
+  batch_size: 2048
+  num_workers: 0
+  dataset_size: 50000
+  musdb_enabled: true
+  musdb_size: 50000
+  musdb_root: /teamspace/studios/this_studio/insight/data/musdb18_hq
+model:
+  encoder:
+    type: tcn
+    n_mels: 512
+    embedding_dim: 128
+    channels: 128
+    num_blocks: 6
+    num_stacks: 2
+    kernel_size: 5
+  num_bands: 3
+  learning_rate: 0.0001
+  weight_decay: 0.0001
+  use_full_spectrum: false
+loss:
+  lambda_param: 1.0
+  lambda_type: 2.0
+  lambda_spectral: 1.0
+  lambda_hmag: 2.0
+  lambda_activity: 0.1
+  lambda_spread: 0.05
+  lambda_coverage: 0.3
+  lambda_freq_anchor: 5.0
+  lambda_attn_entropy: 0.05
+  lambda_freq_match: 1.0
+  lambda_q_match: 0.5
+  lambda_recon: 0.5
+trainer:
+  max_epochs: 150
+  accelerator: gpu
+  devices: 1
+  precision: bf16-mixed
+  log_every_n_steps: 10
+  check_val_every_n_epoch: 3
+  accumulate_grad_batches: 2
+  fast_dev_run: false
+  num_sanity_val_steps: 1
+  cudnn_benchmark: true
+  cudnn_deterministic: false
+  torch_compile: true
+  early_stopping_patience: 25
+  lr_schedule: plateau
+  lr_patience: 5
+  lr_factor: 0.5
+  lr_min: 1.0e-06
+  ema_decay: 0.999
+  warmup_fraction: 0.05
+curriculum:
+  stages:
+  - name: easy_peaking
+    epochs: 20
+    filter_types:
+    - peaking
+    param_ranges:
+      gain:
+      - -12.0
+      - 12.0
+      q:
+      - 0.3
+      - 5.0
+    min_gain_db: 6.0
+    lambda_type: 3.0
+    lambda_freq_anchor: 5.0
+    gumbel_temperature: 1.0
+  - name: medium_peaking
+    epochs: 20
+    filter_types:
+    - peaking
+    param_ranges:
+      gain:
+      - -18.0
+      - 18.0
+      q:
+      - 0.2
+      - 8.0
+    min_gain_db: 3.0
+    lambda_type: 2.0
+    lambda_freq_anchor: 5.0
+    gumbel_temperature: 0.5
+  - name: frequency_spread
+    epochs: 15
+    filter_types:
+    - peaking
+    param_ranges:
+      gain:
+      - -18.0
+      - 18.0
+      q:
+      - 0.2
+      - 8.0
+    min_gain_db: 1.0
+    lambda_type: 2.0
+    lambda_spread: 0.2
+    lambda_coverage: 0.3
+    lambda_freq_anchor: 5.0
+    gumbel_temperature: 0.3
+  - name: shelf_types
+    epochs: 15
+    filter_types:
+    - peaking
+    - lowshelf
+    - highshelf
+    param_ranges:
+      gain:
+      - -20.0
+      - 20.0
+      q:
+      - 0.2
+      - 8.0
+    min_gain_db: 1.0
+    lambda_type: 2.5
+    lambda_freq_anchor: 5.0
+    gumbel_temperature: 0.15
+  - name: full_multitype
+    epochs: 30
+    filter_types:
+    - peaking
+    - lowshelf
+    - highshelf
+    - highpass
+    - lowpass
+    param_ranges:
+      gain:
+      - -24.0
+      - 24.0
+      q:
+      - 0.1
+      - 10.0
+    min_gain_db: 0.5
+    lambda_type: 2.0
+    lambda_freq_anchor: 5.0
+    gumbel_temperature: 0.1
+  - name: full_difficulty
+    epochs: 25
+    filter_types:
+    - peaking
+    - lowshelf
+    - highshelf
+    - highpass
+    - lowpass
+    param_ranges:
+      gain:
+      - -24.0
+      - 24.0
+      q:
+      - 0.1
+      - 10.0
+    min_gain_db: 0.0
+    lambda_type: 2.0
+    lambda_freq_anchor: 5.0
+    gumbel_temperature: 0.05

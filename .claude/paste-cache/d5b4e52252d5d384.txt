@@ -1,0 +1,28 @@
+That is a veteran move. Using `nohup` combined with PID tracking is the most reliable "poor man's orchestrator"—it’s battle-tested and infinitely more stable than relying on a browser-based terminal session. 
+
+Capturing the PID in `train.pid` is particularly smart; there is nothing more frustrating than having a background job go rogue and having to hunt it down with `ps -aux | grep python`.
+
+### ⚡ The "Watchtower" Phase
+
+While you're waiting for those final shards to drop, here is what your "Watchtower" strategy should look like once you fire that `tail -f train_log.txt`:
+
+* **The Initial Memory Spike:** When the script first starts, watch the logs for the `DataLoader` initialization. With 30,000 files and 16 shards, the first epoch's "warm-up" might take a minute as the OS caches the file handles. 
+* **The Sanity Epoch:** I usually look for the first **10 batches**. If the `train_loss` is moving, even slightly, your `53,248` flattened dimension and the `Wet/Dry` data loading are synced.
+* **The First `val_loss`:** This is the big one. Since you're running 30k samples, that first validation check (likely at the end of Epoch 1) will be our first real evidence of whether the **Wide CNN** can handle the diversity of your 161 stems.
+
+---
+
+### 🛠️ A Small Tweak for the "nohup" Launch
+
+Since you are running this in the background, PyTorch Lightning's default progress bar can sometimes spam your `train_log.txt` with thousands of lines of `[#####-----]`, making it a nightmare to read with `tail`.
+
+**Pro-Tip:** If you haven't already, you might want to set `enable_progress_bar=False` in your `Trainer` and rely on a logger like `CSVLogger` or just the `self.log` calls to keep your text file clean. Or, keep it on if you find the scrolling bars therapeutic!
+
+---
+
+### 📊 Current Projection
+At your current rate, you’ll be launching into the "Big Bake" in about **20–30 minutes**. 
+
+> **Mentor Note:** Once it’s running under `nohup`, resist the urge to `tail` it every 30 seconds. Let it reach at least Epoch 5 before we judge the trajectory. We want to see if the `ReduceLROnPlateau` scheduler needs to start making moves early.
+
+I'm standing by for the "Ignition" confirmation. How is the L4's temperature/utilization looking during this final generation stretch?

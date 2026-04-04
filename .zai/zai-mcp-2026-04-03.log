@@ -1,0 +1,24 @@
+[2026-04-03T10:15:27.361Z] INFO: MCP Server Application initialized
+[2026-04-03T10:15:27.361Z] INFO: Starting MCP server...
+[2026-04-03T10:15:27.362Z] INFO: UI to Artifact tool registered successfully
+[2026-04-03T10:15:27.362Z] INFO: Text Extraction tool registered successfully
+[2026-04-03T10:15:27.362Z] INFO: Error Diagnosis tool registered successfully
+[2026-04-03T10:15:27.362Z] INFO: Diagram Analysis tool registered successfully
+[2026-04-03T10:15:27.362Z] INFO: Data Visualization Analysis tool registered successfully
+[2026-04-03T10:15:27.362Z] INFO: UI Diff Check tool registered successfully
+[2026-04-03T10:15:27.362Z] INFO: General Image Analysis tool registered successfully
+[2026-04-03T10:15:27.363Z] INFO: Video analysis tool registered successfully
+[2026-04-03T10:15:27.363Z] INFO: Successfully registered all tools
+[2026-04-03T10:15:27.363Z] INFO: MCP Server started successfully [{"mode":"ZHIPU","name":"zai-mcp-server","version":"0.1.2"}]
+[2026-04-03T14:17:25.349Z] INFO: MCP Server Application initialized
+[2026-04-03T14:17:25.350Z] INFO: Starting MCP server...
+[2026-04-03T14:17:25.350Z] INFO: UI to Artifact tool registered successfully
+[2026-04-03T14:17:25.351Z] INFO: Text Extraction tool registered successfully
+[2026-04-03T14:17:25.351Z] INFO: Error Diagnosis tool registered successfully
+[2026-04-03T14:17:25.351Z] INFO: Diagram Analysis tool registered successfully
+[2026-04-03T14:17:25.351Z] INFO: Data Visualization Analysis tool registered successfully
+[2026-04-03T14:17:25.351Z] INFO: UI Diff Check tool registered successfully
+[2026-04-03T14:17:25.351Z] INFO: General Image Analysis tool registered successfully
+[2026-04-03T14:17:25.351Z] INFO: Video analysis tool registered successfully
+[2026-04-03T14:17:25.351Z] INFO: Successfully registered all tools
+[2026-04-03T14:17:25.352Z] INFO: MCP Server started successfully [{"mode":"ZHIPU","name":"zai-mcp-server","version":"0.1.2"}]

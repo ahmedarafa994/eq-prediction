@@ -1,0 +1,362 @@
+"""
+Lightning module for multi-type blind EQ parameter estimation.
+
+Uses the streaming TCN model with multi-type DSP and permutation-invariant loss.
+Follows Lightning best practices: separate train/val/test steps, proper logging,
+configure_optimizers with lr_scheduler monitor, and save_hyperparameters.
+"""
+
+import sys
+import math
+from pathlib import Path
+
+import torch
+import torch.nn.functional as F
+import lightning as L
+
+sys.path.append(str(Path(__file__).parent.parent))
+
+from model_tcn import StreamingTCNModel
+from dsp_frontend import STFTFrontend
+from loss_multitype import MultiTypeEQLoss, HungarianBandMatcher
+
+FILTER_NAMES = ["peaking", "lowshelf", "highshelf", "highpass", "lowpass"]
+FILTER_TYPE_TO_IDX = {name: idx for idx, name in enumerate(FILTER_NAMES)}
+
+
+class EQEstimatorLightning(L.LightningModule):
+    """
+    Lightning Module for training the IDSP multi-type EQ parameter estimator.
+
+    Handles both precomputed mel/spectrum data and raw audio input.
+    Uses mixed-precision-safe DSP computation (FP32 for biquad coefficients).
+    """
+
+    def __init__(self, config):
+        super().__init__()
+        self.save_hyperparameters({"config": config})
+        self.config = config
+
+        data_cfg = config["data"]
+        model_cfg = config["model"]
+        loss_cfg = config["loss"]
+
+        self.num_bands = data_cfg.get("num_bands", 3)
+        self.sample_rate = data_cfg.get("sample_rate", 44100)
+        self.n_fft = data_cfg.get("n_fft", 2048)
+
+        num_filter_types = len(
+            data_cfg.get(
+                "filter_types",
+                ["peaking", "lowshelf", "highshelf", "highpass", "lowpass"],
+            )
+        )
+
+        use_full_spectrum = model_cfg.get("use_full_spectrum", False)
+        self.use_full_spectrum = use_full_spectrum
+
+        input_bins = (
+            (self.n_fft // 2 + 1) if use_full_spectrum else data_cfg.get("n_mels", 128)
+        )
+
+        self.model = StreamingTCNModel(
+            n_mels=input_bins,
+            embedding_dim=model_cfg["encoder"].get("embedding_dim", 128),
+            num_bands=self.num_bands,
+            channels=model_cfg["encoder"].get("channels", 128),
+            num_blocks=model_cfg["encoder"].get("num_blocks", 4),
+            num_stacks=model_cfg["encoder"].get("num_stacks", 2),
+            sample_rate=self.sample_rate,
+            n_fft=self.n_fft,
+            num_filter_types=num_filter_types,
+            kernel_size=model_cfg["encoder"].get("kernel_size", 3),
+            use_full_spectrum=use_full_spectrum,
+        )
+
+        self.frontend = STFTFrontend(
+            n_fft=self.n_fft,
+            hop_length=data_cfg.get("hop_length", 256),
+            win_length=self.n_fft,
+            mel_bins=data_cfg.get("n_mels", 128),
+            sample_rate=self.sample_rate,
+        )
+
+        self.criterion = MultiTypeEQLoss(
+            n_fft=self.n_fft,
+            sample_rate=self.sample_rate,
+            lambda_param=loss_cfg.get("lambda_param", 1.0),
+            lambda_type=loss_cfg.get("lambda_type", 2.0),
+            lambda_spectral=loss_cfg.get("lambda_spectral", 1.0),
+            lambda_hmag=loss_cfg.get("lambda_hmag", 0.3),
+            lambda_activity=loss_cfg.get("lambda_activity", 0.1),
+            lambda_spread=loss_cfg.get("lambda_spread", 0.05),
+            lambda_coverage=loss_cfg.get("lambda_coverage", 0.0),
+            lambda_freq_anchor=loss_cfg.get("lambda_freq_anchor", 0.0),
+            lambda_freq_match=loss_cfg.get("lambda_freq_match", 1.0),
+            lambda_q_match=loss_cfg.get("lambda_q_match", 0.5),
+        )
+
+        self.val_matcher = HungarianBandMatcher(
+            lambda_freq=loss_cfg.get("lambda_freq_match", 1.0),
+            lambda_q=loss_cfg.get("lambda_q_match", 0.5),
+        )
+
+        self._validation_step_outputs = []
+
+    def forward(self, mel_frames):
+        return self.model(mel_frames)
+
+    def _prepare_input(self, batch):
+        """Extract spectral input from batch, computing on-the-fly if needed."""
+        if "wet_mel" in batch and not self.use_full_spectrum:
+            return batch["wet_mel"]
+        if "wet_spectrum" in batch and self.use_full_spectrum:
+            return batch["wet_spectrum"]
+        if "wet_audio" in batch:
+            wet_audio = batch["wet_audio"]
+            if self.use_full_spectrum:
+                spec = self.frontend.magnitude_spectrum(wet_audio)
+            else:
+                spec = self.frontend.mel_spectrogram(wet_audio)
+            return spec.squeeze(1)
+        raise KeyError("Batch must contain 'wet_mel', 'wet_spectrum', or 'wet_audio'")
+
+    def training_step(self, batch, batch_idx):
+        mel_frames = self._prepare_input(batch)
+        target_gain = batch["gain"]
+        target_freq = batch["freq"]
+        target_q = batch["q"]
+        target_ft = batch["filter_type"]
+
+        mel_profile = mel_frames.mean(dim=-1)
+
+        with torch.amp.autocast("cuda", enabled=False):
+            mel_frames_f = mel_frames.float()
+            mel_profile_f = mel_profile.float()
+
+            embedding, skip_sum = self.model.encoder(mel_frames_f)
+            output = self.model._predict_from_embedding(
+                embedding, mel_profile=mel_profile_f
+            )
+
+            target_H_mag = self.model.dsp_cascade(
+                target_gain.float(),
+                target_freq.float(),
+                target_q.float(),
+                n_fft=self.n_fft,
+                filter_type=target_ft,
+            ).clamp(min=1e-4, max=1e4)
+
+            total_loss, components = self.criterion(
+                output["params"][0],
+                output["params"][1],
+                output["params"][2],
+                output["type_logits"].float(),
+                output["H_mag"].float(),
+                target_gain,
+                target_freq,
+                target_q,
+                target_ft,
+                target_H_mag,
+            )
+
+        if not torch.isfinite(total_loss):
+            self.log(
+                "train/nan_skipped", 1.0, prog_bar=False, on_step=True, on_epoch=False
+            )
+            return torch.tensor(0.0, requires_grad=True, device=total_loss.device)
+
+        self.log(
+            "train/loss",
+            total_loss,
+            on_step=True,
+            on_epoch=True,
+            prog_bar=True,
+            sync_dist=True,
+        )
+        for k, v in components.items():
+            self.log(f"train/{k}", v, on_step=True, on_epoch=True, sync_dist=False)
+
+        return total_loss
+
+    def validation_step(self, batch, batch_idx):
+        mel_frames = self._prepare_input(batch)
+        target_gain = batch["gain"]
+        target_freq = batch["freq"]
+        target_q = batch["q"]
+        target_ft = batch["filter_type"]
+
+        output = self.model(mel_frames)
+        pred_gain, pred_freq, pred_q = output["params"]
+
+        target_H_mag = self.model.dsp_cascade(
+            target_gain,
+            target_freq,
+            target_q,
+            n_fft=self.n_fft,
+            filter_type=target_ft,
+        )
+
+        total_loss, components = self.criterion(
+            pred_gain,
+            pred_freq,
+            pred_q,
+            output["type_logits"],
+            output["H_mag"],
+            target_gain,
+            target_freq,
+            target_q,
+            target_ft,
+            target_H_mag,
+        )
+
+        self.log(
+            "val/loss",
+            total_loss,
+            on_step=False,
+            on_epoch=True,
+            prog_bar=True,
+            sync_dist=True,
+        )
+        for k, v in components.items():
+            self.log(f"val/{k}", v, on_step=False, on_epoch=True, sync_dist=False)
+
+        matched = self.val_matcher(
+            pred_gain.cpu(),
+            pred_freq.cpu(),
+            pred_q.cpu(),
+            target_gain.cpu(),
+            target_freq.cpu(),
+            target_q.cpu(),
+            output["type_logits"].cpu(),
+            target_ft.cpu(),
+        )
+        if len(matched) == 4:
+            m_gain, m_freq, m_q, m_ft = matched
+        else:
+            m_gain, m_freq, m_q = matched
+            m_ft = target_ft.cpu()
+
+        gain_mae = (pred_gain.cpu() - m_gain).abs().mean()
+        freq_oct = torch.clamp(
+            (torch.log2(pred_freq.cpu() / m_freq.clamp(min=1e-3))).abs(), max=4.0
+        ).mean()
+        q_dec = (torch.log10(pred_q.cpu() / m_q.clamp(min=1e-3))).abs().mean()
+        type_acc = (output["filter_type"].cpu() == m_ft).float().mean()
+
+        sorted_pf, _ = torch.sort(pred_freq.cpu(), dim=-1)
+        pred_span = torch.log2(
+            sorted_pf[:, -1] / sorted_pf[:, 0].clamp(min=1e-5)
+        ).mean()
+
+        # Per-region frequency error: low (<500Hz), mid (500-4000Hz), high (>4000Hz)
+        log_err = (torch.log2(pred_freq.cpu() / m_freq.clamp(min=1e-5))).abs()
+        log_mf = torch.log2(m_freq.clamp(min=1e-5))
+        low_mask = log_mf < math.log2(500)
+        mid_mask = (log_mf >= math.log2(500)) & (log_mf < math.log2(4000))
+        high_mask = log_mf >= math.log2(4000)
+
+        freq_err_low = log_err[low_mask].mean() if low_mask.any() else torch.tensor(0.0)
+        freq_err_mid = log_err[mid_mask].mean() if mid_mask.any() else torch.tensor(0.0)
+        freq_err_high = log_err[high_mask].mean() if high_mask.any() else torch.tensor(0.0)
+
+        self._validation_step_outputs.append(
+            {
+                "gain_mae": gain_mae,
+                "freq_oct": freq_oct,
+                "q_dec": q_dec,
+                "type_acc": type_acc,
+                "freq_span": pred_span,
+                "freq_err_low": freq_err_low,
+                "freq_err_mid": freq_err_mid,
+                "freq_err_high": freq_err_high,
+            }
+        )
+
+        return total_loss
+
+    def on_validation_epoch_end(self):
+        if not self._validation_step_outputs:
+            return
+
+        n = len(self._validation_step_outputs)
+        avg_gain = sum(o["gain_mae"] for o in self._validation_step_outputs) / n
+        avg_freq = sum(o["freq_oct"] for o in self._validation_step_outputs) / n
+        avg_q = sum(o["q_dec"] for o in self._validation_step_outputs) / n
+        avg_type = sum(o["type_acc"] for o in self._validation_step_outputs) / n
+        avg_span = sum(o["freq_span"] for o in self._validation_step_outputs) / n
+
+        self.log("val/gain_mae_db", avg_gain, on_epoch=True, prog_bar=True)
+        self.log("val/freq_mae_oct", avg_freq, on_epoch=True, prog_bar=True)
+        self.log("val/q_mae_dec", avg_q, on_epoch=True, prog_bar=True)
+        self.log("val/type_acc", avg_type, on_epoch=True, prog_bar=True)
+        self.log("val/freq_span", avg_span, on_epoch=True)
+
+        # Per-region frequency errors
+        avg_low = sum(o["freq_err_low"] for o in self._validation_step_outputs) / n
+        avg_mid = sum(o["freq_err_mid"] for o in self._validation_step_outputs) / n
+        avg_high = sum(o["freq_err_high"] for o in self._validation_step_outputs) / n
+        self.log("val/freq_err_low", avg_low, on_epoch=True)
+        self.log("val/freq_err_mid", avg_mid, on_epoch=True)
+        self.log("val/freq_err_high", avg_high, on_epoch=True)
+
+        self._validation_step_outputs.clear()
+
+    def test_step(self, batch, batch_idx):
+        return self.validation_step(batch, batch_idx)
+
+    def on_test_epoch_end(self):
+        return self.on_validation_epoch_end()
+
+    def on_before_optimizer_step(self, optimizer):
+        """Check for NaN gradients before optimizer step. Skip if detected."""
+        has_nan_grad = any(
+            p.grad is not None and not torch.isfinite(p.grad).all()
+            for p in self.parameters()
+        )
+        if has_nan_grad:
+            optimizer.zero_grad(set_to_none=True)
+            self.log(
+                "train/nan_gradients",
+                1.0,
+                on_step=True,
+                on_epoch=False,
+                prog_bar=False,
+            )
+
+    def on_train_batch_end(self, outputs, batch, batch_idx):
+        """Periodic model health check for early NaN detection."""
+        if self.global_step > 0 and self.global_step % 100 == 0:
+            self._check_model_health()
+
+    def _check_model_health(self):
+        """Check model parameters for NaN/Inf and warn if detected."""
+        for name, param in self.model.named_parameters():
+            if not torch.isfinite(param).all():
+                self.log(
+                    f"model/nan_param_{name.replace('.', '_')}",
+                    1.0,
+                    on_step=True,
+                    on_epoch=False,
+                )
+
+    def configure_optimizers(self):
+        optimizer = torch.optim.AdamW(
+            self.parameters(),
+            lr=self.config["model"]["learning_rate"],
+            weight_decay=self.config["model"]["weight_decay"],
+        )
+        scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(
+            optimizer,
+            T_max=self.config["trainer"]["max_epochs"],
+            eta_min=self.config["model"]["learning_rate"] * 0.01,
+        )
+        return {
+            "optimizer": optimizer,
+            "lr_scheduler": {
+                "scheduler": scheduler,
+                "monitor": "val/loss",
+                "interval": "epoch",
+                "frequency": 1,
+            },
+        }

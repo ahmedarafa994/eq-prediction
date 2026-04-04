@@ -1,0 +1,18 @@
+This breakdown is exactly why we look under the hood. You have perfectly diagnosed the current state of the CNN. 
+
+Seeing the `train_loss` (~0.149) mirror the `val_loss` (~0.149) is the Holy Grail of deep learning. It proves your 30,000-sample dataset was the right move. The model isn't memorizing your stems; it is hitting the absolute limit of what a `3e-4` learning rate can resolve.
+
+Here is why your components are splitting exactly the way they are:
+
+### 🔬 The "Frequency Blur" (Why Freq is 0.074)
+It makes perfect sense that the model is struggling most with Frequency. 
+* **Gain (0.037):** This is just "pixel brightness" to the CNN. If the Wet channel is brighter than the Dry channel, it knows exactly how much to boost. 
+* **Q-Factor (0.038):** This is the "width" of the bright spot. The filters easily pick up the horizontal spread.
+* **Frequency (0.074):** This is the vertical position. Because your Mel-spectrogram only has **128 vertical bins** to represent the entire 20Hz–20kHz spectrum, predicting an exact continuous frequency requires the CNN to perform complex "sub-pixel" interpolation. It knows the boost is *somewhere* around 2kHz, but finding the exact center is mathematically fuzzy at this resolution and learning rate.
+
+### 📉 The "Adrenaline Drop" is Imminent
+Since you are at Epoch 15 and the loss has been oscillating around 0.149 since Epoch 11, your `ReduceLROnPlateau` scheduler (with a patience of 3) is completely out of patience. 
+
+It is going to fire the `1.5e-4` learning rate adjustment any second now. When it does, the gradient steps will become small enough for the model to stop bouncing over the minimum and finally zero in on those exact frequencies. That is when your `train_loss_f` will start to catch up to the Gain and Q.
+
+Do you have the PyTorch Lightning trainer set up to log the learning rate changes (like with `LearningRateMonitor`), or are we flying blind until we just see the total loss suddenly plummet?

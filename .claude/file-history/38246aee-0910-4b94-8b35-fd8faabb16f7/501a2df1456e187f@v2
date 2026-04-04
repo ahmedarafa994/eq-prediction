@@ -1,0 +1,211 @@
+"""
+generate_massive_dataset.py
+Linux-native dataset generator for EQ parameter prediction.
+Uses pedalboard.PeakFilter (JUCE-based) instead of FabFilter Pro-Q 4.
+
+Output: .npz files with shape [2, samples] (axis-0: wet, axis-1: dry)
+Labels: 24 parameters (8 bands x [freq_norm, gain_norm, q_norm])
+        - freq_norm : log-scaled, mapped to [0, 1]
+        - gain_norm : linear, mapped to [0, 1]  (raw dB / range + 0.5)
+        - q_norm    : log-scaled, mapped to [0, 1]
+"""
+
+import os
+import random
+import argparse
+import numpy as np
+import soundfile as sf
+from pathlib import Path
+from pedalboard import Pedalboard, PeakFilter
+from concurrent.futures import ProcessPoolExecutor, as_completed
+from tqdm import tqdm
+
+# ── Constants ──────────────────────────────────────────────────────────────────
+
+SAMPLE_RATE      = 44100
+NUM_BANDS        = 8
+GAIN_RANGE_DB    = (-12.0, 12.0)   # must stay within ±12 dB to keep Sigmoid valid
+Q_RANGE          = (0.3, 10.0)
+FREQ_RANGE_HZ    = (20.0, 20000.0)
+CLIP_THRESHOLD   = 0.99            # reject samples that clip
+
+# Log-scale helpers
+LOG_FREQ_MIN = np.log10(FREQ_RANGE_HZ[0])
+LOG_FREQ_MAX = np.log10(FREQ_RANGE_HZ[1])
+LOG_Q_MIN    = np.log10(Q_RANGE[0])
+LOG_Q_MAX    = np.log10(Q_RANGE[1])
+
+# ── Normalisation / Denormalisation ────────────────────────────────────────────
+
+def freq_to_norm(hz: float) -> float:
+    """Log-scale frequency → [0, 1]"""
+    return (np.log10(hz) - LOG_FREQ_MIN) / (LOG_FREQ_MAX - LOG_FREQ_MIN)
+
+def norm_to_freq(n: float) -> float:
+    return 10 ** (n * (LOG_FREQ_MAX - LOG_FREQ_MIN) + LOG_FREQ_MIN)
+
+def gain_to_norm(db: float) -> float:
+    """Linear gain dB → [0, 1]  (0.5 == no boost/cut)"""
+    lo, hi = GAIN_RANGE_DB
+    return (db - lo) / (hi - lo)
+
+def norm_to_gain(n: float) -> float:
+    lo, hi = GAIN_RANGE_DB
+    return n * (hi - lo) + lo
+
+def q_to_norm(q: float) -> float:
+    """Log-scale Q → [0, 1]"""
+    return (np.log10(q) - LOG_Q_MIN) / (LOG_Q_MAX - LOG_Q_MIN)
+
+def norm_to_q(n: float) -> float:
+    return 10 ** (n * (LOG_Q_MAX - LOG_Q_MIN) + LOG_Q_MIN)
+
+# ── Random parameter sampler ───────────────────────────────────────────────────
+
+def sample_band_params() -> dict:
+    """Return raw (un-normalised) params for one EQ band."""
+    freq = 10 ** random.uniform(LOG_FREQ_MIN, LOG_FREQ_MAX)
+    gain = random.uniform(*GAIN_RANGE_DB)
+    q    = 10 ** random.uniform(LOG_Q_MIN, LOG_Q_MAX)
+    return {"freq": freq, "gain": gain, "q": q}
+
+def build_label_vector(bands: list[dict]) -> np.ndarray:
+    """
+    Flatten 8 bands into a 24-element normalised label vector.
+    Layout: [f0, g0, q0,  f1, g1, q1, ...,  f7, g7, q7]
+    All values in [0, 1].
+    """
+    vec = []
+    for b in bands:
+        vec.append(freq_to_norm(b["freq"]))
+        vec.append(gain_to_norm(b["gain"]))
+        vec.append(q_to_norm(b["q"]))
+    return np.array(vec, dtype=np.float32)
+
+# ── Audio processing ───────────────────────────────────────────────────────────
+
+def apply_eq(audio: np.ndarray, bands: list[dict], sr: int) -> np.ndarray:
+    """
+    Apply 8 PeakFilters in series using pedalboard.
+    audio: mono float32, shape [samples]
+    Returns: processed mono float32, shape [samples]
+    """
+    plugins = [
+        PeakFilter(
+            cutoff_frequency_hz=b["freq"],
+            gain_db=b["gain"],
+            q=b["q"],
+        )
+        for b in bands
+    ]
+    board = Pedalboard(plugins)
+    # pedalboard expects shape [channels, samples]
+    processed = board(audio[np.newaxis, :], sr)[0]
+    return processed.astype(np.float32)
+
+# ── Single-sample generator ────────────────────────────────────────────────────
+
+def generate_one(dry_path: str, out_path: str, sr: int = SAMPLE_RATE) -> bool:
+    """
+    Load a dry wav, apply random EQ, save [wet, dry] .npz.
+    Returns True on success, False if sample was skipped (clip / mismatch).
+    """
+    try:
+        audio, file_sr = sf.read(dry_path, dtype="float32", always_2d=False)
+
+        # Mix to mono if stereo
+        if audio.ndim == 2:
+            audio = audio.mean(axis=1)
+
+        # Resample if needed (simple skip — resample externally for accuracy)
+        if file_sr != sr:
+            return False
+
+        bands  = [sample_band_params() for _ in range(NUM_BANDS)]
+        wet    = apply_eq(audio, bands, sr)
+
+        # Reject clipped outputs
+        if np.max(np.abs(wet)) >= CLIP_THRESHOLD:
+            return False
+
+        label  = build_label_vector(bands)
+        stack  = np.stack([wet, audio], axis=0)   # shape: [2, samples]
+
+        np.savez_compressed(out_path, audio=stack, label=label)
+        return True
+
+    except Exception:
+        return False
+
+# ── Worker (used by ProcessPoolExecutor) ──────────────────────────────────────
+
+def _worker(args):
+    dry_path, out_path, sr = args
+    return generate_one(dry_path, out_path, sr)
+
+# ── Main ───────────────────────────────────────────────────────────────────────
+
+def main():
+    parser = argparse.ArgumentParser(description="Generate EQ dataset (.npz)")
+    parser.add_argument("--dry_dir",    type=str, default="dry_audio",
+                        help="Directory containing dry .wav files")
+    parser.add_argument("--out_dir",    type=str, default="dataset",
+                        help="Output directory for .npz files")
+    parser.add_argument("--n_samples",  type=int, default=10_000,
+                        help="Target number of training samples")
+    parser.add_argument("--sr",         type=int, default=SAMPLE_RATE)
+    parser.add_argument("--workers",    type=int, default=os.cpu_count(),
+                        help="Parallel workers (default: all CPUs)")
+    parser.add_argument("--seed",       type=int, default=42)
+    args = parser.parse_args()
+
+    random.seed(args.seed)
+    np.random.seed(args.seed)
+
+    dry_dir = Path(args.dry_dir)
+    out_dir = Path(args.out_dir)
+    out_dir.mkdir(parents=True, exist_ok=True)
+
+    wav_files = sorted(dry_dir.glob("**/*.wav"))
+    if not wav_files:
+        raise FileNotFoundError(f"No .wav files found in {dry_dir}")
+
+    print(f"Found {len(wav_files)} dry audio files.")
+    print(f"Generating {args.n_samples} samples → {out_dir}  (workers={args.workers})")
+
+    # Build task list: cycle through wav files as many times as needed
+    tasks = []
+    for i in range(args.n_samples):
+        src = str(wav_files[i % len(wav_files)])
+        dst = str(out_dir / f"sample_{i:06d}.npz")
+        tasks.append((src, dst, args.sr))
+
+    generated = 0
+    skipped   = 0
+
+    with ProcessPoolExecutor(max_workers=args.workers) as pool:
+        futures = {pool.submit(_worker, t): t for t in tasks}
+        with tqdm(total=len(tasks), unit="sample") as pbar:
+            for fut in as_completed(futures):
+                ok = fut.result()
+                if ok:
+                    generated += 1
+                else:
+                    skipped += 1
+                pbar.update(1)
+                pbar.set_postfix(ok=generated, skip=skipped)
+
+    print(f"\nDone.  Generated: {generated}  Skipped (clip/error): {skipped}")
+    print(f"Dataset saved to: {out_dir.resolve()}")
+
+    # Quick sanity-check on one file
+    sample_files = list(out_dir.glob("sample_000000.npz"))
+    if sample_files:
+        data = np.load(sample_files[0])
+        print("\nSanity check on sample_000000.npz:")
+        print(f"  audio shape : {data['audio'].shape}   (expected [2, N])")
+        print(f"  label shape : {data['label'].shape}   (expected [24])")
+        print(f"  label range : [{data['label'].min():.4f}, {data['label'].max():.4f}]  (expected [0,1])")
+
+if __name__ == "__main__":
+    main()

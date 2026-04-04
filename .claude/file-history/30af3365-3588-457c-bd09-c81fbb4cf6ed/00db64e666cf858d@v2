@@ -1,0 +1,65 @@
+# Plan: Improve ML Optimization Framework
+
+## Context
+
+The compiled ML framework document (`ml_optimization_framework.md`, 9,526 lines) was assembled from 5 independently-written section files. This resulted in several structural, formatting, and code quality issues that need cleanup. The goal is to make the document polished, correct, and consistent.
+
+## Issues Found
+
+### 1. Code Bug — `fn * fn` instead of `fn * cost_fn` (Line 8164)
+The `cost_optimal_threshold` function has `fn * fn` which squares the false negative count instead of multiplying by `cost_fn`. This is in the Phase 5 threshold optimization section.
+
+**Fix:** Change `fn * fn` to `fn * cost_fn` on line 8164.
+
+### 2. Duplicate Phase Headers (5 locations)
+Each phase has two consecutive `#`-level headers — the phase label and the section title:
+- Lines 73–75: `# Phase 1: ...` then `# Data Quality & Preprocessing`
+- Lines 2520–2522: `# Phase 2: ...` then `# Feature Engineering & Selection`
+- Lines 4475–4477: `# Phase 3: ...` then `# 3. Model Architecture & Hyperparameter Tuning`
+- Lines 6123–6125: `# Phase 4: ...` then `# 4. Validation, Ensembles & Regularization`
+- Lines 7687–7689: `# Phase 5: ...` then `# Section 5: Post-Processing, Decision Framework & Pitfalls`
+
+**Fix:** Merge into a single `#` header per phase. Remove the second duplicate line.
+
+### 3. Extra Separator (Lines 70–71)
+Double `---` between the Impact matrix and Phase 1.
+
+**Fix:** Remove the extra `---`.
+
+### 4. Redundant Encoding Coverage (Phase 1 Section 7 vs Phase 2 Section 3)
+Phase 1 Section 7 ("Encoding Categorical Variables") and Phase 2 Section 3 ("Encoding Strategies") both cover target encoding, entity embeddings, frequency encoding. Phase 1 is more practical (pipeline-ready), Phase 2 is more theoretical.
+
+**Fix:** Add a cross-reference note at the top of Phase 2 Section 3 pointing readers to Phase 1 Section 7 for production-ready implementations. Keep both (Phase 1 focuses on preprocessing decisions, Phase 2 on feature engineering patterns) but reduce the Phase 2 duplication of code already shown in Phase 1.
+
+### 5. Missing Import in Phase 5 Threshold Code
+The `cost_optimal_threshold` and `profit_maximizing_threshold` functions use `confusion_matrix` without importing it. These appear inline in code blocks without surrounding context.
+
+**Fix:** Add `from sklearn.metrics import confusion_matrix` at the top of each relevant code block.
+
+### 6. Inconsistent Phase Numbering
+Phase 3 is titled "Model Architecture & Hyperparameter Tuning" but its internal header says "3. Model Architecture & Hyperparameter Tuning". Phase 4 says "4. Validation..." and Phase 5 says "Section 5:...". Inconsistent.
+
+**Fix:** Remove the redundant number prefix from the merged headers (the Phase N prefix already provides numbering).
+
+## Implementation Steps
+
+1. Fix the `fn * fn` bug on line 8164
+2. Remove duplicate phase headers at all 5 phase boundaries
+3. Remove extra `---` separator
+4. Add missing `confusion_matrix` import in Phase 5 threshold code blocks
+5. Add cross-reference note in Phase 2 Section 3 to avoid confusion with Phase 1 Section 7
+6. Normalize merged header titles for consistency
+
+## Files to Modify
+
+- `/teamspace/studios/this_studio/ml_optimization_framework.md` (the compiled document)
+
+Note: The individual section files in `sections/` are source files and don't need changes (they were correct individually; issues arose during compilation).
+
+## Verification
+
+- Grep for `fn * fn` to confirm the bug fix
+- Grep for `^# Phase` and `^# [0-9]` to confirm no duplicate headers
+- Grep for `^---$` at lines 69–71 to confirm single separator
+- Visually check the TOC anchors still work after header changes
+- Run `wc -l` to confirm document size is similar (slightly smaller from removing duplicates)

@@ -1,0 +1,9 @@
+{
+  "id": "5",
+  "subject": "Write and commit design doc",
+  "description": "Write the validated design to docs/superpowers/specs/ and commit.",
+  "activeForm": "Writing design doc",
+  "status": "pending",
+  "blocks": [],
+  "blockedBy": []
+}

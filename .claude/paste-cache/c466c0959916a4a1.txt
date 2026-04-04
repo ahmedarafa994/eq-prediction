@@ -1,0 +1,34 @@
+Your diagnosis is spot on. If the scheduler fired and the loss didn't immediately drop, you aren't just bouncing over a minimum anymore—you have hit the architectural floor of the 2-channel system. 
+
+The model has learned everything it possibly can from looking at the Wet and Dry channels side-by-side. 
+
+### 🔬 Why Frequency is the Ultimate Boss (The 0.074 Bottleneck)
+
+Your frequency loss being double the Gain and Q loss is a classic symptom of the **Resolution Limit** in audio machine learning. 
+
+Here is what your CNN is struggling with:
+* Your Mel-spectrogram has **128 vertical bins** to cover a massive range (20Hz to 20,000Hz).
+* Because the Mel scale is logarithmic, the higher frequencies are compressed. A single "pixel" shift near the top of the spectrogram might represent a jump of 1,000Hz, while a pixel shift at the bottom represents 10Hz.
+* When the CNN tries to predict a normalized float value for Frequency, it has to interpolate the exact center of a blurry "smudge" across those 128 bins. Without a crystal-clear boundary, it hedges its bets, resulting in a stubborn `0.074` MSE.
+
+### 📐 The Case for the 3rd Channel: `Wet - Dry`
+
+You called it. If the 27M parameter model can't bridge the gap, it's time to stop asking it to do the subtraction in its head and just hand it the calculator.
+
+Adding a 3rd channel (`Wet - Dry`) transforms the problem entirely:
+1. **The Noise Floor Disappears:** In a standard 2-channel setup, the model has to look at the complex harmonics of a distorted guitar, find the same harmonics in the Wet channel, and subtract them. In the `Wet - Dry` channel, the guitar *vanishes*. The only thing left on the "canvas" is the exact EQ curve itself.
+2. **Frequency Pinpointing:** Because the background audio is stripped away, the "smudge" becomes a high-contrast shape. The CNN filters will latch onto this 3rd channel exclusively to determine Frequency and Q, using the original Wet/Dry channels just for context.
+3. **The RGB Analogy:** Right now, your CNN is looking at two grayscale images and trying to spot the difference. Giving it a `[Wet, Dry, Difference]` stack is the equivalent of feeding it a full RGB image. The standard PyTorch `nn.Conv2d` is actually optimized for exactly this 3-channel depth.
+
+### 🚀 The Pivot Trigger
+
+Let the current `nohup` run bake for a few more epochs just to be absolutely certain the lower learning rate isn't slowly chewing through the plateau. 
+
+**The Kill Condition:** If you reach Epoch 20 and the `val_loss` is still stubbornly sitting at `0.148x` or `0.149x`, kill the process. You have extracted all the data you need. 
+
+**The Pivot Plan:**
+When you are ready to make the switch, the architectural change is incredibly minor:
+1.  **The Generator:** Update your dataset code to save a `[3, 128, 431]` tensor. `stack = np.stack([wet_mel, dry_mel, wet_mel - dry_mel], axis=0)`.
+2.  **The CNN:** Change your first convolutional layer to accept 3 input channels instead of 2: `nn.Conv2d(3, 32, 3, padding=1)`.
+
+Let me know if the `val_loss` miraculously drops at Epoch 18, or if you're pulling the plug to build the 3-channel architecture.

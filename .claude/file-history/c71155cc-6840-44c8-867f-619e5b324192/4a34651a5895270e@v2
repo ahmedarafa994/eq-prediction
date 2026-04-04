@@ -1,0 +1,215 @@
+# Diagnostic & Intervention Plan: EQ Parameter Regression Collapse at Epoch 50
+
+## Context
+
+The `idsp-eq-multitype-blind-estimator/best.pt` checkpoint (epoch 50, stage 2 "shelf_introduction", val_loss=7.58) shows complete regression collapse across all parameter dimensions. Testing on MUSDB18 real audio with known EQ applied reveals:
+- **Gain**: MAE 3.5-5.8 dB, predictions clustered at [-1.3, +0.1] dB (ground truth: -10 to +8 dB)
+- **Frequency**: MAE 1.5-2.3 octaves, predictions collapsed to 500-2800 Hz regardless of true band placement
+- **Q**: MAE 0.17-0.30 decades, predictions tightly clustered at 0.7-0.9 (ground truth: 0.7-4.0)
+- **Type**: 33% accuracy (random chance) for mixed-type presets; only peaking-only presets achieve 100%
+
+The model has learned nothing beyond initialization defaults. This plan diagnoses root causes and specifies interventions.
+
+---
+
+## Root Cause Analysis
+
+### Cause 1: `freq_blend_weight` initialization contradicts its own comment (PRIMARY)
+
+**File**: `differentiable_eq.py:760`
+
+The comment says `"starts at 0.0 (sigmoid(0)=0.5 → equal weight)"` but the code sets `torch.tensor(-6.0)`. `sigmoid(-6.0) = 0.0025`, giving the direct regression path **0.25%** weight while the attention mechanism dominates at 99.75%. When trunk outputs are small (xavier gain=0.5 init), attention produces near-uniform softmax → weighted mean of log-frequency linspace → geometric mean ≈ 630 Hz. The direct path — which provides a clean sigmoid gradient for frequency — is starved of gradient signal entirely.
+
+### Cause 2: Conservative trunk initialization + aggressive gain compression
+
+**File**: `differentiable_eq.py:762,784`
+
+- `trunk` initialized with `xavier_uniform_(gain=0.5)` → outputs with ~0.25x normal variance
+- `gain_db = tanh(raw/3.0) * 24.0` → at raw=0: tanh(0)=0 → gain=0 dB
+- At raw=1.0: tanh(0.33)*24 = 7.6 dB — already past the steepest gradient region
+- The combination means gains start at exactly 0 and the gradient signal to move away is weak
+
+### Cause 3: Loss gradient budget dominated by frequency
+
+At epoch 50 (stage 2), effective gradient allocation:
+- Frequency-related: `lambda_param*lambda_freq_internal*freq_loss + lambda_freq_anchor*anchor = 1.0*3.0 + 5.0 = 8.0` → **87% of gradient budget**
+- Gain + Q: `lambda_param * (gain_loss + q_loss) = 1.0` → **11%**
+- Type + spectral: remaining **2%**
+
+The optimizer focuses exclusively on frequency accuracy while gain/Q/type receive negligible gradient.
+
+### Cause 4: Huber delta=0.25 too small for frequency
+
+**File**: `loss_multitype.py:314`
+
+All frequency errors at epoch 50 exceed 1 octave (well above delta=0.25). Huber loss is in its linear regime → constant-magnitude gradient regardless of error size. The optimizer receives no "how wrong am I?" signal — a 2-octave error and a 5-octave error produce identical gradients.
+
+### Cause 5: Anti-collapse regularizations disabled
+
+`lambda_coverage=0.0`, `lambda_spread=0.0`, `lambda_attn_entropy=0.0` — no penalty for:
+- All bands predicting identical frequencies (coverage)
+- Bands clustering within 0.5 octaves (spread)
+- Attention spreading uniformly over all mel bins (entropy)
+
+### Cause 6: Q collapse is purely initialization
+
+`q = exp(sigmoid(0) * (log10-log0.1) + log0.1) = exp(0.5*6.9 - 2.3) = exp(1.15) ≈ 0.7`
+
+With trunk outputs near zero, the sigmoid input is ~0 → sigmoid(0)=0.5 → Q ≈ 0.7. The model hasn't learned to modulate Q at all; it's still at initialization default.
+
+---
+
+## Intervention Plan
+
+### TIER 1: Critical Fixes (apply together, restart training)
+
+These are ordered by impact. All require modifying source files and restarting from scratch (or from an early checkpoint).
+
+#### 1.1 Fix `freq_blend_weight` initialization — `differentiable_eq.py:760`
+
+```python
+# BEFORE:
+self.freq_blend_weight = nn.Parameter(torch.tensor(-6.0))
+# AFTER:
+self.freq_blend_weight = nn.Parameter(torch.tensor(0.0))
+```
+
+**Rationale**: sigmoid(0)=0.5 gives equal weight to attention and direct regression paths. The direct path provides strong, clean sigmoid gradients that bypass the diffuse attention mechanism. This is the single most impactful change.
+
+#### 1.2 Increase trunk initialization gain — `differentiable_eq.py:762`
+
+```python
+# BEFORE:
+nn.init.xavier_uniform_(self.trunk.weight, gain=0.5)
+# AFTER:
+nn.init.xavier_uniform_(self.trunk.weight, gain=1.0)
+```
+
+**Rationale**: gain=0.5 produces outputs with 0.25x normal variance. After ReLU (zeros half), trunk_out values are too small to drive gainq_head and query_proj meaningfully. gain=1.0 produces unit-variance outputs.
+
+#### 1.3 Reduce gain tanh compression — `differentiable_eq.py:784`
+
+```python
+# BEFORE:
+gain_db = torch.tanh(gainq[:, :, 0] / 3.0) * 24.0
+# AFTER:
+gain_db = torch.tanh(gainq[:, :, 0] / 2.0) * 24.0
+```
+
+**Rationale**: /3.0 means raw=1.0 → only 7.6 dB (tanh is already flattening). /2.0 gives raw=1.0 → 11.1 dB with steeper gradient. Prevents gain from getting stuck in the near-zero flat region of tanh.
+
+#### 1.4 Increase Huber delta for frequency — `loss_multitype.py:314`
+
+```python
+# BEFORE:
+self.huber_freq = nn.HuberLoss(delta=0.25, reduction="none")
+# AFTER:
+self.huber_freq = nn.HuberLoss(delta=0.75, reduction="none")
+```
+
+**Rationale**: Errors of 0.25-0.75 octaves get quadratic (distance-dependent) gradients instead of flat constant gradients. Critical for providing convergence signal once predictions start moving away from collapse.
+
+### TIER 2: Loss Rebalancing (config.yaml)
+
+#### 2.1 Reduce `lambda_freq_anchor` from 5.0 to 1.5 (all stages)
+
+**File**: `conf/config.yaml` — every stage's `loss_weights.lambda_freq_anchor`
+
+The 5.0 weight makes freq_anchor dominate 87% of gradient budget. Reducing to 1.5 gives frequency ~42% of budget, allowing gain/Q/type to receive meaningful gradients.
+
+#### 2.2 Reduce `lambda_freq_internal` from 3.0 to 1.5 (stage configs)
+
+**File**: `conf/config.yaml` — add `lambda_freq_internal: 1.5` to each stage's `loss_weights`
+
+This parameter (in `PermutationInvariantParamLoss`) internally upweights the frequency component of param_loss by 3x. Combined with freq_anchor=5.0, frequency gets 8x the gradient of gain. Reducing both creates a balanced optimization landscape.
+
+#### 2.3 Enable anti-collapse regularizations (stages 2+)
+
+```yaml
+# In each stage's loss_weights (stages 2-5):
+lambda_spread: 0.05       # was 0.0
+lambda_coverage: 0.02     # was 0.0
+lambda_attn_entropy: 0.05 # was 0.0
+```
+
+These directly penalize the observed failure modes: frequency clustering, insufficient range coverage, and diffuse attention.
+
+#### 2.4 New balanced stage 2 loss weights
+
+```yaml
+# shelf_introduction stage:
+loss_weights:
+  lambda_param: 1.0
+  lambda_type: 1.0
+  lambda_freq_anchor: 1.5       # was 5.0
+  lambda_hmag: 0.5
+  lambda_activity: 0.05
+  lambda_spread: 0.05            # was 0.0
+  lambda_coverage: 0.02          # was 0.0
+  lambda_recon: 0.1              # was 0.05
+  lambda_attn_entropy: 0.05      # NEW
+lambda_freq_internal: 1.5        # was 3.0 (implicit from class default)
+```
+
+Apply proportionally similar rebalancing to stages 3-5.
+
+### TIER 3: Training Strategy Improvements
+
+#### 3.1 Higher attention temperature for early stages — `conf/config.yaml`
+
+```yaml
+# Stage 1: attn_temperature: 0.3  (was 0.1)
+# Stage 2: attn_temperature: 0.2  (was 0.08)
+# Stage 3+: keep current values (0.06, 0.05)
+```
+
+**Rationale**: With temperature 0.08 and small trunk outputs, attention logits divided by 0.08 produce very large values. Softmax in bf16 can degenerate. Higher temperature lets content features influence attention before position bias dominates.
+
+#### 3.2 Separate learning rate for parameter head — `train.py` optimizer setup
+
+```python
+param_head_params = [p for n, p in self.model.named_parameters() if 'param_head' in n]
+other_params = [p for n, p in self.model.named_parameters() if 'param_head' not in n]
+self.optimizer = torch.optim.AdamW([
+    {'params': other_params, 'lr': model_cfg["learning_rate"]},
+    {'params': param_head_params, 'lr': model_cfg["learning_rate"] * 2.0},
+], weight_decay=model_cfg["weight_decay"])
+```
+
+**Rationale**: The param_head (~25K params) needs to escape a bad initialization state faster than the encoder (~1.5M params) needs to refine features. A 2x LR for the head accelerates escape without destabilizing the encoder.
+
+---
+
+## What NOT to Change
+
+- **bf16-mixed precision**: Critical paths (attention softmax, DSP cascade, param head) are already cast to float32. Not a contributor.
+- **Encoder capacity**: The 128ch/4block/2stack config is borderline sufficient for 3-band estimation. The bottleneck is the param head, not the encoder. The 256ch config in config.yaml would help but is not the root cause.
+- **Dataset frequency distribution**: Log-uniform sampling is correct (equal probability per octave). The midrange bias comes from the model, not the data.
+- **Hungarian matching**: Working correctly; not a source of the collapse.
+
+---
+
+## Verification Plan
+
+After applying all Tier 1+2 changes and restarting training:
+
+1. **Early sanity check (epoch 5-10)**: Run `test_real_audio.py` with bass_boost preset. Expected: gains should show some spread (not all near 0), frequencies should span a wider range. If still collapsed, the init fixes (1.1-1.3) didn't take effect.
+
+2. **Stage 1 completion (epoch 32)**: Peaking-only test should show gain MAE < 3 dB, freq MAE < 1 octave, Q MAE < 0.2 decades. Type accuracy should be irrelevant (peaking-only).
+
+3. **Stage 2 mid-point (epoch 45)**: Run all 5 presets. Expected: type accuracy > 50% for mixed presets, gain MAE < 4 dB.
+
+4. **Final (epoch 165)**: Target metrics: gain MAE < 2 dB, freq MAE < 0.5 octaves, Q MAE < 0.15 decades, type accuracy > 80%.
+
+5. **Gradient monitoring**: Add logging of per-component loss values and gradient norms for param_head.trunk and param_head.gainq_head to verify balanced gradient flow.
+
+---
+
+## Critical Files
+
+| File | Changes |
+|------|---------|
+| `insight/differentiable_eq.py` | freq_blend_weight init (line 760), trunk gain (line 762), gain tanh divisor (line 784) |
+| `insight/loss_multitype.py` | Huber freq delta (line 314) |
+| `insight/conf/config.yaml` | All stage loss_weights: reduce freq_anchor, enable coverage/spread/entropy, reduce freq_internal |
+| `insight/train.py` | Separate param_head LR in optimizer setup |

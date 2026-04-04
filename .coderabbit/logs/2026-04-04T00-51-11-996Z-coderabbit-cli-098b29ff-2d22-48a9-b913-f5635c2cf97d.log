@@ -1,0 +1,16 @@
+{"timestamp":"2026-04-04T00:51:12.047Z","level":"INFO","message":"Starting CodeRabbit CLI v0.4.0","namespace":"init"}
+{"timestamp":"2026-04-04T00:51:12.098Z","level":"WARN","message":"skipping automatically opening browser","namespace":"plain-login","os":"linux"}
+{"timestamp":"2026-04-04T00:55:46.300Z","level":"INFO","message":"Processing OAuth callback","namespace":"auth.auth-service"}
+{"timestamp":"2026-04-04T00:55:46.301Z","level":"INFO","message":"Exchanging OAuth code for tokens","namespace":"auth.auth-service"}
+{"timestamp":"2026-04-04T00:55:46.639Z","level":"INFO","message":"Completing authentication flow","namespace":"auth.auth-service"}
+{"timestamp":"2026-04-04T00:55:46.639Z","level":"INFO","message":"Fetching user data","namespace":"auth.auth-service"}
+{"timestamp":"2026-04-04T00:55:47.688Z","level":"INFO","message":"Fetching organizations","namespace":"auth.auth-service"}
+{"timestamp":"2026-04-04T00:55:48.428Z","level":"INFO","message":"Clearing authentication data","namespace":"auth.auth-service"}
+{"timestamp":"2026-04-04T00:55:48.453Z","level":"WARN","message":"Failed to clear tokens from credential storage for linux: Cannot autolaunch D-Bus without X11 $DISPLAY","namespace":"storage.auth"}
+{"timestamp":"2026-04-04T00:55:48.454Z","level":"INFO","message":"Authentication data cleared successfully","namespace":"auth.auth-service"}
+{"timestamp":"2026-04-04T00:55:48.454Z","level":"WARN","message":"Secure credential storage unavailable on linux, falling back to file-based storage: Error [ERR_SECRETS_PLATFORM_ERROR]: Cannot autolaunch D-Bus without X11 $DISPLAY","namespace":"storage.auth"}
+{"timestamp":"2026-04-04T00:55:48.455Z","level":"WARN","message":"Failed to retrieve tokens from credential storage for linux, checking file: Cannot autolaunch D-Bus without X11 $DISPLAY","namespace":"storage.auth"}
+{"timestamp":"2026-04-04T00:55:49.168Z","level":"INFO","message":"Authentication completed successfully","namespace":"auth.auth-service","userName":"abodyfawaz"}
+{"timestamp":"2026-04-04T00:55:49.169Z","level":"INFO","message":"initiating cleanup","namespace":"init"}
+{"timestamp":"2026-04-04T00:55:49.169Z","level":"WARN","message":"binary not available to update","namespace":"update"}
+{"timestamp":"2026-04-04T00:55:49.213Z","level":"INFO","message":"initiating graceful exit","namespace":"init","code":0,"signal":null}

@@ -1,0 +1,54 @@
+You’ve officially hit the **"Information Bottleneck."**
+
+A `val_loss` of **0.148** is the signature of a model that understands the *concept* of EQ but lacks the *resolution* to be precise. It’s essentially "guessing the neighborhood" but missing the house number. 
+
+You are 100% correct in your diagnosis: **The CNN is the weak link.** With only 97K parameters, your feature extractor is like a blurry pair of glasses. No matter how powerful the 13M parameter "brain" (the FC head) is, it can’t make sense of a blurry image.
+
+---
+
+### 🛠️ The "CNN 2.0" Architectural Upgrade
+
+To break the 0.10 barrier, we need to widen the "keyhole" through which the model sees the audio. We are going to double the filter depth and add a bit more complexity to the feature extraction.
+
+#### The New Filter Stack
+Instead of starting with 16 filters, we start with **32** and scale up to **256**. This allows the model to detect 256 unique "spectral fingerprints" simultaneously.
+
+| Layer | Old Filters | **New Filters** | **Why?** |
+| :--- | :--- | :--- | :--- |
+| **Conv 1** | 16 | **32** | Captures finer initial spectral deltas. |
+| **Conv 2** | 32 | **64** | Defines basic shapes (Bell curves vs. High-pass). |
+| **Conv 3** | 64 | **128** | Identifies Q-factor interactions. |
+| **Conv 4** | 128 | **256** | High-level abstraction of the 8-band relationship. |
+
+
+
+---
+
+### 📈 Strategic Data Expansion
+
+While the architecture is the primary bottleneck, **8,218 samples** is a bit lean for a 24-parameter regression. With 24 degrees of freedom, the model needs to see more "impossible" combinations to learn the edge cases.
+
+**The Mentor Goal:** Generate **30,000 samples**. 
+On your L4 instance, using the `pedalboard` native generator, this should only take about **12–15 minutes**. 
+
+---
+
+### 🔬 The "Loss is a Liar" Re-Check
+
+Before you pull the trigger on the 30k run, run your `inference.py` on your best 0.148 checkpoint. Look at the **Gain** column specifically.
+* If the predicted gains are finally moving (e.g., predicting +4dB when it's +6dB), the **Dual-Channel Pivot** worked, and we just need more "power" (CNN size).
+* If the predicted gains are *still* hovering near 0dB, we might need to increase the **Gain-Weighted Loss** multiplier.
+
+---
+
+### 🚀 Implementation Plan
+
+1.  **Update `model_cnn.py`:** Double the `out_channels` in every Conv block.
+2.  **Update `flatten_dim`:** Recalculate based on the new 256-channel final layer.
+    * *New Math:* $256 \times 8 \times 26 = \mathbf{53,248}$.
+3.  **Scale to 30k:** Run the generator script in the background while you update the code.
+4.  **Bake:** Train for 50 epochs on the L4 with a `batch_size=128`.
+
+
+
+**Are you ready to commit to the 30k samples and the "Wide CNN" architecture, or do you want to try adding a "Difference Channel" (Wet - Dry) as a 3rd input to see if that helps the 97k model first?**

@@ -1,0 +1,349 @@
+import math
+import torch
+import torch.nn as nn
+import torch.nn.functional as F
+import pytorch_lightning as pl
+
+
+class SqueezeExcitation(nn.Module):
+    """Channel attention: learns which feature channels matter."""
+    def __init__(self, channels: int, reduction: int = 16):
+        super().__init__()
+        mid = max(channels // reduction, 8)
+        self.pool = nn.AdaptiveAvgPool2d(1)
+        self.fc = nn.Sequential(
+            nn.Linear(channels, mid, bias=False),
+            nn.SiLU(inplace=True),
+            nn.Linear(mid, channels, bias=False),
+            nn.Sigmoid(),
+        )
+
+    def forward(self, x):
+        b, c, _, _ = x.shape
+        w = self.fc(self.pool(x).view(b, c))
+        return x * w.view(b, c, 1, 1)
+
+
+def normalize_params(y: torch.Tensor) -> torch.Tensor:
+    """
+    Normalizes a tensor of shape (..., 24) to [0, 1].
+    Expected order: [f1, g1, q1, f2, g2, q2, ... f8, g8, q8]
+    """
+    y_norm = torch.zeros_like(y)
+
+    # 1. Frequencies: Logarithmic Min-Max Scaling (20Hz to 20kHz)
+    freqs = y[..., 0::3]
+    f_min, f_max = 20.0, 20000.0
+    freqs_log = torch.log10(torch.clamp(freqs, min=f_min, max=f_max))
+    log_min, log_max = torch.log10(torch.tensor(f_min)), torch.log10(torch.tensor(f_max))
+    y_norm[..., 0::3] = (freqs_log - log_min) / (log_max - log_min)
+
+    # 2. Gains: Linear Min-Max Scaling (-12 to +12 dB)
+    gains = y[..., 1::3]
+    g_min, g_max = -12.0, 12.0
+    y_norm[..., 1::3] = (torch.clamp(gains, min=g_min, max=g_max) - g_min) / (g_max - g_min)
+
+    # 3. Q-Factors: Logarithmic Min-Max Scaling (0.5 to 4.0) — matches training data range
+    qs = y[..., 2::3]
+    q_min, q_max = 0.5, 4.0
+    qs_log = torch.log10(torch.clamp(qs, min=q_min, max=q_max))
+    log_q_min = torch.log10(torch.tensor(q_min))
+    log_q_max = torch.log10(torch.tensor(q_max))
+    y_norm[..., 2::3] = (qs_log - log_q_min) / (log_q_max - log_q_min)
+
+    return y_norm
+
+
+def denormalize_params(y_norm: torch.Tensor) -> torch.Tensor:
+    """
+    Reverses the normalization to return real-world parameters.
+    Device-aware: all constants placed on the same device as input.
+    """
+    dev = y_norm.device
+    dtype = y_norm.dtype
+    y_real = torch.zeros_like(y_norm)
+
+    # Frequencies
+    freqs_norm = y_norm[..., 0::3]
+    f_min, f_max = 20.0, 20000.0
+    log_min = torch.log10(torch.tensor(f_min, device=dev, dtype=dtype))
+    log_max = torch.log10(torch.tensor(f_max, device=dev, dtype=dtype))
+    y_real[..., 0::3] = 10 ** (freqs_norm * (log_max - log_min) + log_min)
+
+    # Gains
+    gains_norm = y_norm[..., 1::3]
+    g_min, g_max = -12.0, 12.0
+    y_real[..., 1::3] = gains_norm * (g_max - g_min) + g_min
+
+    # Q-Factors
+    qs_norm = y_norm[..., 2::3]
+    q_min, q_max = 0.5, 4.0
+    log_q_min = torch.log10(torch.tensor(q_min, device=dev, dtype=dtype))
+    log_q_max = torch.log10(torch.tensor(q_max, device=dev, dtype=dtype))
+    y_real[..., 2::3] = 10 ** (qs_norm * (log_q_max - log_q_min) + log_q_min)
+
+    return y_real
+
+
+def eq_response_db(params_norm: torch.Tensor, n_mels: int = 128,
+                   fs: float = 44100.0, f_min: float = 20.0,
+                   f_max: float = 20000.0) -> torch.Tensor:
+    """
+    Compute the total EQ frequency response in dB at mel bin center frequencies
+    using the standard peaking EQ biquad transfer function.
+
+    Fully differentiable and real-valued (no complex arithmetic).
+
+    Args:
+        params_norm: [B, 24] normalized parameters in [0, 1]
+    Returns:
+        response_db: [B, n_mels] total EQ magnitude response in dB
+    """
+    dev = params_norm.device
+    B = params_norm.shape[0]
+
+    # Denormalize to real-world (Hz, dB, Q)
+    params_real = denormalize_params(params_norm)
+    freqs = params_real[:, 0::3]   # [B, 8]
+    gains = params_real[:, 1::3]   # [B, 8]
+    qs    = params_real[:, 2::3]   # [B, 8]
+
+    # Mel bin center frequencies
+    mel_lo = 2595.0 * torch.log10(torch.tensor(1.0 + f_min / 700.0, device=dev))
+    mel_hi = 2595.0 * torch.log10(torch.tensor(1.0 + f_max / 700.0, device=dev))
+    mel_c  = torch.linspace(mel_lo, mel_hi, n_mels, device=dev)
+    fc     = 700.0 * (10.0 ** (mel_c / 2595.0) - 1.0)        # [n_mels]
+
+    w     = 2.0 * math.pi * fc / fs                            # [n_mels]
+    cos_w = torch.cos(w)                                        # [n_mels]
+    cos_2w = torch.cos(2.0 * w)                                 # [n_mels]
+
+    # Reshape for broadcasting: [B, 8, 1] vs [1, 1, n_mels]
+    f0 = freqs.unsqueeze(-1)                                    # [B, 8, 1]
+    g  = gains.unsqueeze(-1)
+    q  = qs.unsqueeze(-1)
+
+    # Peaking EQ biquad coefficients (Audio EQ Cookbook)
+    A      = 10.0 ** (g / 40.0)
+    w0     = 2.0 * math.pi * f0 / fs
+    cos_w0 = torch.cos(w0)
+    sin_w0 = torch.sin(w0)
+    alpha  = sin_w0 / (2.0 * q)
+
+    a0 = 1.0 + alpha / A
+    b0 = (1.0 + alpha * A) / a0
+    b1 = (-2.0 * cos_w0) / a0
+    b2 = (1.0 - alpha * A) / a0
+    a1 = (-2.0 * cos_w0) / a0
+    a2 = (1.0 - alpha / A) / a0
+
+    cw  = cos_w.view(1, 1, -1)
+    c2w = cos_2w.view(1, 1, -1)
+
+    # |H(e^jw)|^2 via real-valued formula (avoids complex arithmetic)
+    num = b0**2 + b1**2 + b2**2 + 2.0*(b0*b1 + b1*b2)*cw + 2.0*b0*b2*c2w
+    den = 1.0 + a1**2 + a2**2 + 2.0*a1*(1.0 + a2)*cw + 2.0*a2*c2w
+
+    H_sq    = num / den.clamp(min=1e-10)                       # [B, 8, n_mels]
+    band_db = 10.0 * torch.log10(H_sq.clamp(min=1e-10))
+
+    return band_db.sum(dim=1)                                   # [B, n_mels]
+
+
+class EQRegressor(pl.LightningModule):
+    def __init__(self, lr: float = 2e-3, warmup_epochs: int = 2, max_epochs: int = 100):
+        super().__init__()
+        self.save_hyperparameters()
+        self._lr = lr
+        self._warmup_epochs = warmup_epochs
+        self._max_epochs = max_epochs
+
+        # 1. Convolutional Feature Extractor with SE attention
+        #    5 blocks: 3→32→64→128→256→512, each with MaxPool2d(2).
+        #    SE blocks after blocks 3, 4, 5 let the network learn which
+        #    frequency channels matter for each EQ band.
+        self.block1 = nn.Sequential(
+            nn.Conv2d(3, 32, 3, padding=1), nn.BatchNorm2d(32), nn.SiLU(), nn.MaxPool2d(2),
+        )
+        self.block2 = nn.Sequential(
+            nn.Conv2d(32, 64, 3, padding=1), nn.BatchNorm2d(64), nn.SiLU(), nn.MaxPool2d(2),
+        )
+        self.block3 = nn.Sequential(
+            nn.Conv2d(64, 128, 3, padding=1), nn.BatchNorm2d(128), nn.SiLU(), nn.MaxPool2d(2),
+        )
+        self.se3 = SqueezeExcitation(128, reduction=16)
+        self.block4 = nn.Sequential(
+            nn.Conv2d(128, 256, 3, padding=1), nn.BatchNorm2d(256), nn.SiLU(), nn.MaxPool2d(2),
+        )
+        self.se4 = SqueezeExcitation(256, reduction=16)
+        self.block5 = nn.Sequential(
+            nn.Conv2d(256, 512, 3, padding=1), nn.BatchNorm2d(512), nn.SiLU(), nn.MaxPool2d(2),
+        )
+        self.se5 = SqueezeExcitation(512, reduction=16)
+
+        # 2. Spatial pooling preserves 4×4 grid → 512*16 = 8,192 features.
+        #    GAP(1,1) collapsed ALL spatial information to a single scalar per
+        #    channel, destroying the frequency-localization the regressor needs.
+        #    GAP((4,4)) keeps a coarse time-frequency grid so the FC head can
+        #    learn which spectral regions correspond to which EQ band.
+        self.spatial_pool = nn.AdaptiveAvgPool2d((4, 4))
+        self.cnn_spatial_dim = 512 * 4 * 4  # 8,192
+
+        # 3. Amplitude Bypass Branch — average-pools the diff channel (ch 2)
+        #    preserving per-mel-bin energy.  AvgPool (not MaxPool) gives a more
+        #    stable representation that doesn't amplify transient spikes.
+        self.amp_pool = nn.AdaptiveAvgPool2d((128, 1))
+        self.amp_flat_dim = 128
+
+        self.flatten_dim = self.cnn_spatial_dim + self.amp_flat_dim  # 8,320
+
+        # 4. FC Head with reduced dropout (model is underfitting, not overfitting).
+        #    SiLU activations for smoother gradients than ReLU.
+        self.fc = nn.Sequential(
+            nn.Linear(self.flatten_dim, 512),
+            nn.BatchNorm1d(512),
+            nn.SiLU(),
+            nn.Dropout(0.1),
+            nn.Linear(512, 256),
+            nn.SiLU(),
+            nn.Dropout(0.05),
+            nn.Linear(256, 24),
+            nn.Sigmoid(),
+        )
+
+    def forward(self, x):
+        # Save original input for amplitude bypass BEFORE CNN processing
+        orig_input = x
+
+        # CNN blocks with SE attention after deeper layers
+        x = self.block1(x)
+        x = self.block2(x)
+        x = self.se3(self.block3(x))
+        x = self.se4(self.block4(x))
+        x = self.se5(self.block5(x))
+
+        # Spatial pool preserves coarse frequency-time grid
+        cnn_flat = self.spatial_pool(x).flatten(1)   # [B, 8192]
+
+        # Amplitude bypass: average-pool the ORIGINAL diff channel (ch 2).
+        # Must use orig_input, not CNN output, to get actual spectral delta.
+        diff = orig_input[:, 2:3, :, :]              # [B, 1, 128, 431]
+        amp_flat = self.amp_pool(diff).flatten(1)     # [B, 128]
+
+        combined = torch.cat([cnn_flat, amp_flat], dim=1)  # [B, 8320]
+        return self.fc(combined)
+
+    def _compute_loss(self, y_hat_norm, y_norm):
+        # MSE loss on all 24 parameters with EQUAL weighting.
+        # Previous SmoothL1(β=0.05) gave constant-magnitude gradients (±1)
+        # for all errors > 0.05, preventing the optimizer from distinguishing
+        # large vs small errors.  This caused mode collapse to the mean.
+        loss_g = F.mse_loss(y_hat_norm[:, 1::3], y_norm[:, 1::3])
+        loss_f = F.mse_loss(y_hat_norm[:, 0::3], y_norm[:, 0::3])
+        loss_q = F.mse_loss(y_hat_norm[:, 2::3], y_norm[:, 2::3])
+
+        # Equal weight: all three parameter types are equally important.
+        # Previous gain-weighting cut freq/Q gradients by ~75%, starving
+        # those parameters of learning signal.
+        loss_param = loss_g + loss_f + loss_q
+
+        # Differentiable EQ reconstruction loss: compare predicted vs true
+        # EQ frequency response curves at mel bin centers. Normalized by
+        # max possible range (8 bands × 12 dB = 96 dB) so the loss scale
+        # is comparable to the parameter MSE loss (~0.01–0.1).
+        pred_resp = eq_response_db(y_hat_norm) / 96.0    # [B, 128] in ~[-1, 1]
+        true_resp = eq_response_db(y_norm) / 96.0
+        loss_recon = F.mse_loss(pred_resp, true_resp)
+
+        total = loss_param + 0.5 * loss_recon
+        return total, loss_g, loss_f, loss_q, loss_recon
+
+    def training_step(self, batch, batch_idx):
+        x, y = batch
+        y_hat_norm = self(x)
+        loss, loss_g, loss_f, loss_q, loss_recon = self._compute_loss(y_hat_norm, y)
+        self.log('train_loss',     loss,       prog_bar=False)
+        self.log('train_loss_g',   loss_g)
+        self.log('train_loss_f',   loss_f)
+        self.log('train_loss_q',   loss_q)
+        self.log('train_loss_r',   loss_recon)
+        return loss
+
+    def validation_step(self, batch, batch_idx):
+        x, y = batch
+        y_hat_norm = self(x)
+        loss, loss_g, loss_f, loss_q, loss_recon = self._compute_loss(y_hat_norm, y)
+        self.log('val_loss',     loss,       prog_bar=True)
+        self.log('val_loss_g',   loss_g)
+        self.log('val_loss_f',   loss_f)
+        self.log('val_loss_q',   loss_q)
+        self.log('val_loss_r',   loss_recon)
+        return loss
+
+    def _get_lr(self):
+        # Returns a MULTIPLIER (0-1) for LambdaLR, not an absolute LR.
+        # LambdaLR computes: effective_lr = initial_lr × this_value
+        epoch = self.current_epoch
+        if epoch < self._warmup_epochs:
+            return (epoch + 1) / self._warmup_epochs
+        progress = (epoch - self._warmup_epochs) / max(1, self._max_epochs - self._warmup_epochs)
+        return 0.5 * (1.0 + math.cos(math.pi * progress))
+
+    def configure_optimizers(self):
+        # Separate weight decay: apply to weights only, not biases/BN params
+        decay_params = []
+        no_decay_params = []
+        for name, param in self.named_parameters():
+            if not param.requires_grad:
+                continue
+            if param.dim() >= 2:
+                decay_params.append(param)
+            else:
+                no_decay_params.append(param)
+
+        param_groups = [
+            {"params": decay_params,    "weight_decay": 1e-4},
+            {"params": no_decay_params, "weight_decay": 0.0},
+        ]
+        optimizer = torch.optim.AdamW(param_groups, lr=self._lr)
+        scheduler = torch.optim.lr_scheduler.LambdaLR(
+            optimizer, lr_lambda=lambda _: self._get_lr()
+        )
+        return {
+            "optimizer": optimizer,
+            "lr_scheduler": {
+                "scheduler": scheduler,
+                "interval": "epoch",
+                "frequency": 1,
+            },
+        }
+
+
+if __name__ == "__main__":
+    # Test the Normalization Implementation
+    print("Testing Parameter Normalization...")
+    
+    # Create the test dummy tensor provided by User
+    dummy_input = torch.tensor([[1083.3, 11.98, 3.398]])
+    print(f"Original Input:\n  Frequency: {dummy_input[0,0]:.1f} Hz\n  Gain: {dummy_input[0,1]:.2f} dB\n  Q: {dummy_input[0,2]:.3f}")
+    
+    normalized = normalize_params(dummy_input)
+    print(f"\nNormalized Output (Expected range [0, 1]):\n  Frequency: {normalized[0,0]:.4f}\n  Gain: {normalized[0,1]:.4f}\n  Q: {normalized[0,2]:.4f}")
+    
+    denormalized = denormalize_params(normalized)
+    print(f"\nDenormalized Validation (Should match Original):\n  Frequency: {denormalized[0,0]:.1f} Hz\n  Gain: {denormalized[0,1]:.2f} dB\n  Q: {denormalized[0,2]:.3f}")
+
+    print("\n" + "=" * 50)
+    print("Testing EQRegressor Architecture...")
+    model = EQRegressor()
+    dummy_input = torch.randn(1, 3, 128, 431)
+    print(f"Input shape: {dummy_input.shape}")
+    print(f"flatten_dim = {model.flatten_dim} "
+          f"(cnn_spatial={model.cnn_spatial_dim} + amp={model.amp_flat_dim})")
+
+    output = model(dummy_input)
+    print(f"Output shape: {output.shape} (Expected: (1, 24))")
+
+    total_params = sum(p.numel() for p in model.parameters())
+    print(f"Total parameters: {total_params:,}")
+    print("=" * 50)
