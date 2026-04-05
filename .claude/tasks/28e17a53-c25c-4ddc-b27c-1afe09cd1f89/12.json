@@ -1,0 +1,9 @@
+{
+  "id": "12",
+  "subject": "Fix mel normalization to preserve absolute level",
+  "description": "Remove mean subtraction, keep only std scaling so gain sign info is preserved.",
+  "activeForm": "Fixing mel normalization",
+  "status": "completed",
+  "blocks": [],
+  "blockedBy": []
+}

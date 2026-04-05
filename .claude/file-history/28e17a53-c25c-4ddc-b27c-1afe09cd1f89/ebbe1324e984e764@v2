@@ -1,0 +1,356 @@
+"""
+On-the-fly synthetic multi-type EQ dataset with optional precomputation.
+
+Generates (dry_audio, wet_audio, params) tuples with random multi-type
+parametric EQ applied using the differentiable biquad cascade.
+No external audio files needed — uses synthetic signals.
+
+Supports precompute mode to cache mel-spectrograms for faster training.
+"""
+import torch
+import torch.utils.data as data
+import numpy as np
+import random
+import math
+from pathlib import Path
+from differentiable_eq import (
+    DifferentiableBiquadCascade,
+    FILTER_PEAKING, FILTER_LOWSHELF, FILTER_HIGHSHELF,
+    FILTER_HIGHPASS, FILTER_LOWPASS, NUM_FILTER_TYPES,
+)
+
+FILTER_NAMES = ["peaking", "lowshelf", "highshelf", "highpass", "lowpass"]
+DEFAULT_TYPE_WEIGHTS = [0.5, 0.15, 0.15, 0.1, 0.1]
+
+
+class SyntheticEQDataset(data.Dataset):
+    """
+    Generates synthetic (dry_audio, wet_audio, params) tuples on-the-fly.
+    Applies random multi-type parametric EQ using the DifferentiableBiquadCascade.
+
+    Returns dict with wet_audio, dry_audio, gain, freq, q, filter_type tensors.
+    """
+
+    def __init__(
+        self,
+        num_bands=5,
+        sample_rate=44100,
+        duration=3.0,
+        n_fft=2048,
+        size=50000,
+        gain_range=(-24.0, 24.0),
+        freq_range=(20.0, 20000.0),
+        q_range=(0.1, 10.0),
+        type_weights=None,
+        signal_types=("noise", "sweep", "harmonic", "speech_like"),
+        augment=True,
+        precompute_mels=False,
+        n_mels=128,
+    ):
+        self.num_bands = num_bands
+        self.sample_rate = sample_rate
+        self.num_samples = int(duration * sample_rate)
+        self.n_fft = n_fft
+        self.hop_length = n_fft // 4
+        self._size = size
+        self.gain_range = gain_range
+        self.freq_range = freq_range
+        self.q_range = q_range
+        self.type_weights = type_weights or DEFAULT_TYPE_WEIGHTS
+        self.signal_types = signal_types
+        self.augment = augment
+        self.n_mels = n_mels
+        self.precompute_mels = precompute_mels
+        self.dsp = DifferentiableBiquadCascade(
+            num_bands=num_bands, sample_rate=sample_rate
+        )
+
+        # Mel filterbank for precompute mode
+        if precompute_mels:
+            self._build_mel_filterbank()
+
+    def _build_mel_filterbank(self):
+        """Build mel filterbank for precomputed mel-spectrograms."""
+        n_freqs = self.n_fft // 2 + 1
+        f_min = 20.0
+        f_max = self.sample_rate / 2.0
+
+        def hz_to_mel(hz):
+            return 2595.0 * np.log10(1.0 + hz / 700.0)
+
+        def mel_to_hz(mel):
+            return 700.0 * (10.0 ** (mel / 2595.0) - 1.0)
+
+        f_min_mel = hz_to_mel(f_min)
+        f_max_mel = hz_to_mel(f_max)
+        mel_points = np.linspace(f_min_mel, f_max_mel, self.n_mels + 2)
+        hz_points = mel_to_hz(mel_points)
+        bin_points = ((self.n_fft + 1) * hz_points / self.sample_rate).astype(int)
+
+        fb = np.zeros((self.n_mels, n_freqs))
+        for i in range(self.n_mels):
+            f_left = bin_points[i]
+            f_center = bin_points[i + 1]
+            f_right = bin_points[i + 2]
+            for j in range(f_left, f_center):
+                if j < n_freqs and f_center > f_left:
+                    fb[i, j] = (j - f_left) / (f_center - f_left)
+            for j in range(f_center, f_right):
+                if j < n_freqs and f_right > f_center:
+                    fb[i, j] = (f_right - j) / (f_right - f_center)
+
+        self.mel_fb = torch.tensor(fb, dtype=torch.float32)
+        self.mel_window = torch.hann_window(self.n_fft)
+
+    def __len__(self):
+        return self._size
+
+    def _generate_dry_signal(self, signal_type):
+        N = self.num_samples
+        sr = self.sample_rate
+        t = np.linspace(0, N / sr, N, endpoint=False)
+
+        if signal_type == "noise":
+            audio = np.random.randn(N).astype(np.float32) * 0.3
+        elif signal_type == "sweep":
+            f0 = random.uniform(100, 2000)
+            f1 = random.uniform(100, 2000)
+            freq = np.linspace(f0, f1, N)
+            phase = 2 * np.pi * np.cumsum(freq / sr)
+            audio = (0.3 * np.sin(phase)).astype(np.float32)
+        elif signal_type == "harmonic":
+            audio = np.zeros(N, dtype=np.float32)
+            n_harmonics = random.randint(3, 8)
+            fundamental = random.uniform(80, 500)
+            for h in range(1, n_harmonics + 1):
+                amp = 0.2 / h
+                audio += amp * np.sin(2 * np.pi * fundamental * h * t)
+        elif signal_type == "speech_like":
+            f0 = random.uniform(80, 300)
+            audio = np.zeros(N, dtype=np.float32)
+            for _ in range(random.randint(3, 12)):
+                freq = random.uniform(f0 * 0.5, f0 * 4)
+                amp = random.uniform(0.01, 0.1)
+                dur = random.randint(int(0.01 * sr), int(0.15 * sr))
+                onset = random.randint(0, max(1, N - dur))
+                env = np.hanning(dur)
+                audio[onset : onset + dur] += (
+                    amp * env * np.sin(2 * np.pi * freq * np.arange(dur) / sr)
+                )
+        else:
+            audio = np.random.randn(N).astype(np.float32) * 0.3
+
+        peak = np.max(np.abs(audio)) + 1e-8
+        audio = audio / peak
+        return audio
+
+    def _sample_multitype_params(self):
+        """Sample multi-type EQ parameters with weighted filter type distribution."""
+        gains = []
+        freqs = []
+        qs = []
+        types = []
+
+        for _ in range(self.num_bands):
+            ftype = random.choices(range(NUM_FILTER_TYPES), weights=self.type_weights, k=1)[0]
+
+            if ftype == FILTER_PEAKING:
+                g = self._sample_gain()
+                f = self._log_uniform(self.freq_range[0], self.freq_range[1])
+                q = self._log_uniform(self.q_range[0], self.q_range[1])
+            elif ftype == FILTER_LOWSHELF:
+                g = self._sample_gain()
+                f = self._log_uniform(max(20, self.freq_range[0]), min(5000, self.freq_range[1]))
+                q = self._log_uniform(self.q_range[0], self.q_range[1])
+            elif ftype == FILTER_HIGHSHELF:
+                g = self._sample_gain()
+                f = self._log_uniform(max(1000, self.freq_range[0]), min(20000, self.freq_range[1]))
+                q = self._log_uniform(self.q_range[0], self.q_range[1])
+            elif ftype == FILTER_HIGHPASS:
+                g = random.uniform(-3.0, 3.0)
+                f = self._log_uniform(20, 500)
+                q = self._log_uniform(self.q_range[0], min(2.0, self.q_range[1]))
+            elif ftype == FILTER_LOWPASS:
+                g = random.uniform(-3.0, 3.0)
+                f = self._log_uniform(2000, 20000)
+                q = self._log_uniform(self.q_range[0], min(2.0, self.q_range[1]))
+            else:
+                g = random.uniform(*self.gain_range)
+                f = self._log_uniform(self.freq_range[0], self.freq_range[1])
+                q = self._log_uniform(self.q_range[0], self.q_range[1])
+
+            gains.append(g)
+            freqs.append(f)
+            qs.append(q)
+            types.append(ftype)
+
+        # Sort by frequency for canonical ordering
+        order = sorted(range(len(freqs)), key=lambda i: freqs[i])
+        gains = [gains[i] for i in order]
+        freqs = [freqs[i] for i in order]
+        qs = [qs[i] for i in order]
+        types = [types[i] for i in order]
+
+        return (
+            torch.tensor(gains, dtype=torch.float32),
+            torch.tensor(freqs, dtype=torch.float32),
+            torch.tensor(qs, dtype=torch.float32),
+            torch.tensor(types, dtype=torch.long),
+        )
+
+    def _sample_gain(self):
+        """Sample gain with moderate concentration away from extremes."""
+        max_gain = min(abs(self.gain_range[0]), abs(self.gain_range[1]))
+        sign = random.choice([-1, 1])
+        # Beta(2, 2) gives moderate concentration, not as extreme as Beta(2, 5)
+        magnitude = np.random.beta(2, 2) * max_gain
+        return sign * magnitude
+
+    def _log_uniform(self, low, high):
+        """Sample from log-uniform distribution."""
+        return math.exp(random.uniform(math.log(low), math.log(high)))
+
+    def _apply_eq_freq_domain(self, dry_audio, gain_db, freq, q, filter_type):
+        """Apply multi-type EQ in frequency domain."""
+        window = torch.hann_window(self.n_fft)
+        dry_tensor = dry_audio.unsqueeze(0)
+        stft = torch.stft(
+            dry_tensor, self.n_fft, self.hop_length, self.n_fft,
+            window=window, return_complex=True,
+        )
+        wet_mag = self.dsp.apply_to_spectrum(
+            torch.abs(stft), gain_db.unsqueeze(0), freq.unsqueeze(0),
+            q.unsqueeze(0), filter_type=filter_type.unsqueeze(0)
+        )
+        phase = torch.angle(stft)
+        wet_stft = wet_mag * torch.exp(1j * phase)
+        wet_audio = torch.istft(
+            wet_stft, self.n_fft, self.hop_length, self.n_fft,
+            window=window, length=dry_audio.shape[0],
+        )
+        return wet_audio.squeeze(0)
+
+    def _audio_to_mel(self, audio):
+        """Convert audio tensor to log-mel spectrogram. Returns (n_mels, T)."""
+        stft = torch.stft(
+            audio.unsqueeze(0), self.n_fft, self.hop_length, self.n_fft,
+            window=self.mel_window, return_complex=True
+        )
+        mag = torch.abs(stft).squeeze(0)  # (F, T)
+        mel = self.mel_fb @ mag  # (n_mels, T)
+        mel = torch.clamp(mel, min=1e-8)
+        return torch.log(mel)
+
+    def precompute(self):
+        """
+        Pre-generate all samples and cache mel-spectrograms + params in memory.
+        Drops raw audio to save memory. Only caches what training needs.
+        """
+        print(f"Precomputing {self._size} samples...")
+        self._cache = []
+        for i in range(self._size):
+            sig_type = random.choice(self.signal_types)
+            dry_audio = torch.from_numpy(self._generate_dry_signal(sig_type))
+            gain_db, freq, q, filter_type = self._sample_multitype_params()
+            wet_audio = self._apply_eq_freq_domain(dry_audio, gain_db, freq, q, filter_type)
+
+            if self.augment:
+                scale = random.uniform(0.5, 1.0)
+                wet_audio = wet_audio * scale
+
+            sample = {
+                "gain": gain_db,
+                "freq": freq,
+                "q": q,
+                "filter_type": filter_type,
+            }
+
+            if self.precompute_mels:
+                sample["wet_mel"] = self._audio_to_mel(wet_audio)
+            else:
+                sample["wet_audio"] = wet_audio
+
+            self._cache.append(sample)
+            if (i + 1) % 2000 == 0:
+                print(f"  {i+1}/{self._size}")
+
+        print(f"Precomputation complete: {len(self._cache)} samples cached.")
+
+    def _generate_sample(self):
+        """Generate a single training sample."""
+        sig_type = random.choice(self.signal_types)
+        dry_audio = torch.from_numpy(self._generate_dry_signal(sig_type))
+
+        gain_db, freq, q, filter_type = self._sample_multitype_params()
+        wet_audio = self._apply_eq_freq_domain(dry_audio, gain_db, freq, q, filter_type)
+
+        if self.augment:
+            scale = random.uniform(0.5, 1.0)
+            wet_audio = wet_audio * scale
+            dry_audio = dry_audio * scale
+
+        result = {
+            "wet_audio": wet_audio,
+            "dry_audio": dry_audio,
+            "gain": gain_db,
+            "freq": freq,
+            "q": q,
+            "filter_type": filter_type,
+        }
+
+        if self.precompute_mels:
+            result["wet_mel"] = self._audio_to_mel(wet_audio)
+
+        return result
+
+    def __getitem__(self, idx):
+        if hasattr(self, '_cache') and idx < len(self._cache):
+            return self._cache[idx]
+        return self._generate_sample()
+
+
+def collate_fn(batch):
+    """Custom collate to pad variable-length audio and optional mel-spectrograms."""
+    has_audio = all("wet_audio" in item for item in batch)
+    has_mel = all("wet_mel" in item for item in batch)
+
+    def pad_audio(audio, target_len):
+        if audio.shape[0] < target_len:
+            audio = torch.nn.functional.pad(audio, (0, target_len - audio.shape[0]))
+        return audio
+
+    def pad_mel(mel, target_len):
+        if mel.shape[-1] < target_len:
+            mel = torch.nn.functional.pad(mel, (0, target_len - mel.shape[-1]))
+        return mel
+
+    gains = torch.stack([item["gain"] for item in batch])
+    freqs = torch.stack([item["freq"] for item in batch])
+    qs = torch.stack([item["q"] for item in batch])
+    types = torch.stack([item["filter_type"] for item in batch])
+
+    result = {
+        "gain": gains,
+        "freq": freqs,
+        "q": qs,
+        "filter_type": types,
+    }
+
+    if has_audio:
+        wet_list = [item["wet_audio"] for item in batch]
+        dry_list = [item["dry_audio"] for item in batch]
+        max_len = max(x.shape[0] for x in wet_list)
+        wet_padded = torch.stack([pad_audio(w, max_len) for w in wet_list])
+        dry_padded = torch.stack([pad_audio(d, max_len) for d in dry_list])
+        lengths = torch.tensor([w.shape[0] for w in wet_list])
+        result["wet_audio"] = wet_padded
+        result["dry_audio"] = dry_padded
+        result["lengths"] = lengths
+
+    if has_mel:
+        mel_list = [item["wet_mel"] for item in batch]
+        max_mel_len = max(m.shape[-1] for m in mel_list)
+        mel_padded = torch.stack([pad_mel(m, max_mel_len) for m in mel_list])
+        result["wet_mel"] = mel_padded
+
+    return result

@@ -1,0 +1,732 @@
+import math
+import torch
+import torch.nn as nn
+import torch.nn.functional as F
+
+
+class StraightThroughClamp(torch.autograd.Function):
+    """
+    Straight-through estimator clamp: forward uses torch.clamp (hard bounds),
+    backward passes gradients through unmodified (no tanh attenuation).
+
+    Forces float32 internally to avoid bf16 gradient corruption under AMP.
+    Custom autograd functions bypass PyTorch's AMP gradient coordination,
+    so bf16 forward outputs can produce mismatched/zero gradients.
+
+    The output dtype matches the input dtype (cast back after internal fp32).
+    """
+    @staticmethod
+    def forward(ctx, x, min_val, max_val):
+        ctx.input_dtype = x.dtype
+        x_fp32 = x.float()
+        return torch.clamp(x_fp32, min_val, max_val).to(ctx.input_dtype)
+
+    @staticmethod
+    def backward(ctx, grad_output):
+        # Ensure gradient is fp32 for numerical stability, cast back to match input
+        grad = grad_output.float()
+        return grad.to(ctx.input_dtype), None, None
+
+
+def ste_clamp(x, min_val, max_val):
+    return StraightThroughClamp.apply(x, min_val, max_val)
+
+
+# Filter type constants
+FILTER_PEAKING = 0
+FILTER_LOWSHELF = 1
+FILTER_HIGHSHELF = 2
+FILTER_HIGHPASS = 3
+FILTER_LOWPASS = 4
+NUM_FILTER_TYPES = 5
+
+FILTER_NAMES = ["peaking", "lowshelf", "highshelf", "highpass", "lowpass"]
+
+
+class DifferentiableBiquadCascade(nn.Module):
+    """
+    A differentiable biquad filter bank supporting multiple filter types.
+    Translates [Gain, Freq, Q, FilterType] predictions into biquad coefficients
+    and computes the frequency response, enabling exact gradient flow in PyTorch.
+
+    Coefficient formulas from the Robert Bristow-Johnson Audio EQ Cookbook.
+    """
+
+    def __init__(self, num_bands=5, sample_rate=44100):
+        super().__init__()
+        self.num_bands = num_bands
+        self.sample_rate = sample_rate
+
+    def compute_biquad_coeffs(self, gain_db, freq, q):
+        """
+        Computes biquad coefficients for Peaking/Bell EQ filters.
+        Inputs: tensors of shape (Batch, Num_Bands).
+        Returns: b0, b1, b2, a1, a2 (each shape (Batch, Num_Bands))
+        """
+        A = 10.0 ** (gain_db / 40.0)
+        w0 = 2.0 * torch.pi * freq / self.sample_rate
+        alpha = torch.sin(w0) / (2.0 * q + 1e-8)
+
+        b0 = 1.0 + alpha * A
+        b1 = -2.0 * torch.cos(w0)
+        b2 = 1.0 - alpha * A
+        a0 = 1.0 + alpha / A
+        a1 = -2.0 * torch.cos(w0)
+        a2 = 1.0 - alpha / A
+
+        b0 = b0 / a0
+        b1 = b1 / a0
+        b2 = b2 / a0
+        a1 = a1 / a0
+        a2 = a2 / a0
+
+        return b0, b1, b2, a1, a2
+
+    def compute_biquad_coeffs_multitype(self, gain_db, freq, q, filter_type):
+        """
+        Computes biquad coefficients for multiple filter types using the
+        Robert Bristow-Johnson Audio EQ Cookbook formulas.
+
+        Inputs:
+            gain_db: (Batch, Num_Bands) — gain in dB (ignored for HP/LP)
+            freq: (Batch, Num_Bands) — center/cutoff frequency in Hz
+            q: (Batch, Num_Bands) — quality factor
+            filter_type: (Batch, Num_Bands) — integer tensor in {0,1,2,3,4}
+
+        Returns: b0, b1, b2, a1, a2 (each shape (Batch, Num_Bands))
+        """
+        A = 10.0 ** (gain_db / 40.0)
+        w0 = 2.0 * torch.pi * freq / self.sample_rate
+        cos_w0 = torch.cos(w0)
+        sin_w0 = torch.sin(w0)
+        alpha = sin_w0 / (2.0 * q + 1e-8)
+        sqrt_A = torch.sqrt(torch.clamp(A, min=1e-8))
+        two_sqrt_A_alpha = 2.0 * sqrt_A * alpha
+
+        # --- Type 0: Peaking/Bell ---
+        peak_b0 = 1.0 + alpha * A
+        peak_b1 = -2.0 * cos_w0
+        peak_b2 = 1.0 - alpha * A
+        peak_a0 = 1.0 + alpha / A
+        peak_a1 = -2.0 * cos_w0
+        peak_a2 = 1.0 - alpha / A
+
+        # --- Type 1: Low-Shelf ---
+        ls_b0 = A * ((A + 1.0) - (A - 1.0) * cos_w0 + two_sqrt_A_alpha)
+        ls_b1 = 2.0 * A * ((A - 1.0) - (A + 1.0) * cos_w0)
+        ls_b2 = A * ((A + 1.0) - (A - 1.0) * cos_w0 - two_sqrt_A_alpha)
+        ls_a0 = (A + 1.0) + (A - 1.0) * cos_w0 + two_sqrt_A_alpha
+        ls_a1 = -2.0 * ((A - 1.0) + (A + 1.0) * cos_w0)
+        ls_a2 = (A + 1.0) + (A - 1.0) * cos_w0 - two_sqrt_A_alpha
+
+        # --- Type 2: High-Shelf ---
+        hs_b0 = A * ((A + 1.0) + (A - 1.0) * cos_w0 + two_sqrt_A_alpha)
+        hs_b1 = -2.0 * A * ((A - 1.0) + (A + 1.0) * cos_w0)
+        hs_b2 = A * ((A + 1.0) + (A - 1.0) * cos_w0 - two_sqrt_A_alpha)
+        hs_a0 = (A + 1.0) - (A - 1.0) * cos_w0 + two_sqrt_A_alpha
+        hs_a1 = 2.0 * ((A - 1.0) - (A + 1.0) * cos_w0)
+        hs_a2 = (A + 1.0) - (A - 1.0) * cos_w0 - two_sqrt_A_alpha
+
+        # --- Type 3: High-Pass (gain_db ignored) ---
+        hp_b0 = (1.0 + cos_w0) / 2.0
+        hp_b1 = -(1.0 + cos_w0)
+        hp_b2 = (1.0 + cos_w0) / 2.0
+        hp_a0 = 1.0 + alpha
+        hp_a1 = -2.0 * cos_w0
+        hp_a2 = 1.0 - alpha
+
+        # --- Type 4: Low-Pass (gain_db ignored) ---
+        lp_b0 = (1.0 - cos_w0) / 2.0
+        lp_b1 = 1.0 - cos_w0
+        lp_b2 = (1.0 - cos_w0) / 2.0
+        lp_a0 = 1.0 + alpha
+        lp_a1 = -2.0 * cos_w0
+        lp_a2 = 1.0 - alpha
+
+        # Select coefficients based on filter type using torch.where
+        ft = filter_type
+        b0 = torch.where(ft == FILTER_PEAKING, peak_b0,
+                torch.where(ft == FILTER_LOWSHELF, ls_b0,
+                    torch.where(ft == FILTER_HIGHSHELF, hs_b0,
+                        torch.where(ft == FILTER_HIGHPASS, hp_b0, lp_b0))))
+        b1 = torch.where(ft == FILTER_PEAKING, peak_b1,
+                torch.where(ft == FILTER_LOWSHELF, ls_b1,
+                    torch.where(ft == FILTER_HIGHSHELF, hs_b1,
+                        torch.where(ft == FILTER_HIGHPASS, hp_b1, lp_b1))))
+        b2 = torch.where(ft == FILTER_PEAKING, peak_b2,
+                torch.where(ft == FILTER_LOWSHELF, ls_b2,
+                    torch.where(ft == FILTER_HIGHSHELF, hs_b2,
+                        torch.where(ft == FILTER_HIGHPASS, hp_b2, lp_b2))))
+        a0 = torch.where(ft == FILTER_PEAKING, peak_a0,
+                torch.where(ft == FILTER_LOWSHELF, ls_a0,
+                    torch.where(ft == FILTER_HIGHSHELF, hs_a0,
+                        torch.where(ft == FILTER_HIGHPASS, hp_a0, lp_a0))))
+        a1 = torch.where(ft == FILTER_PEAKING, peak_a1,
+                torch.where(ft == FILTER_LOWSHELF, ls_a1,
+                    torch.where(ft == FILTER_HIGHSHELF, hs_a1,
+                        torch.where(ft == FILTER_HIGHPASS, hp_a1, lp_a1))))
+        a2 = torch.where(ft == FILTER_PEAKING, peak_a2,
+                torch.where(ft == FILTER_LOWSHELF, ls_a2,
+                    torch.where(ft == FILTER_HIGHSHELF, hs_a2,
+                        torch.where(ft == FILTER_HIGHPASS, hp_a2, lp_a2))))
+
+        # Normalize by a0 (clamp to prevent near-zero division)
+        a0 = torch.clamp(a0, min=1e-4)
+        b0 = b0 / a0
+        b1 = b1 / a0
+        b2 = b2 / a0
+        a1 = a1 / a0
+        a2 = a2 / a0
+
+        return b0, b1, b2, a1, a2
+
+    def compute_biquad_coeffs_multitype_soft(self, gain_db, freq, q, type_probs):
+        """
+        Compute biquad coefficients as a weighted mixture across filter types,
+        using soft type probabilities from Gumbel-Softmax.
+
+        Inputs:
+            gain_db: (Batch, Num_Bands)
+            freq: (Batch, Num_Bands)
+            q: (Batch, Num_Bands)
+            type_probs: (Batch, Num_Bands, 5) — soft type probabilities
+
+        Returns: b0, b1, b2, a1, a2 (each shape (Batch, Num_Bands))
+        """
+        A = 10.0 ** (gain_db / 40.0)
+        w0 = 2.0 * torch.pi * freq / self.sample_rate
+        cos_w0 = torch.cos(w0)
+        sin_w0 = torch.sin(w0)
+        alpha = sin_w0 / (2.0 * q + 1e-8)
+        sqrt_A = torch.sqrt(torch.clamp(A, min=1e-8))
+        two_sqrt_A_alpha = 2.0 * sqrt_A * alpha
+
+        # Peaking
+        peak_b0 = 1.0 + alpha * A
+        peak_b1 = -2.0 * cos_w0
+        peak_b2 = 1.0 - alpha * A
+        peak_a0 = 1.0 + alpha / A
+        peak_a1 = -2.0 * cos_w0
+        peak_a2 = 1.0 - alpha / A
+
+        # Low-Shelf
+        ls_b0 = A * ((A + 1.0) - (A - 1.0) * cos_w0 + two_sqrt_A_alpha)
+        ls_b1 = 2.0 * A * ((A - 1.0) - (A + 1.0) * cos_w0)
+        ls_b2 = A * ((A + 1.0) - (A - 1.0) * cos_w0 - two_sqrt_A_alpha)
+        ls_a0 = (A + 1.0) + (A - 1.0) * cos_w0 + two_sqrt_A_alpha
+        ls_a1 = -2.0 * ((A - 1.0) + (A + 1.0) * cos_w0)
+        ls_a2 = (A + 1.0) + (A - 1.0) * cos_w0 - two_sqrt_A_alpha
+
+        # High-Shelf
+        hs_b0 = A * ((A + 1.0) + (A - 1.0) * cos_w0 + two_sqrt_A_alpha)
+        hs_b1 = -2.0 * A * ((A - 1.0) + (A + 1.0) * cos_w0)
+        hs_b2 = A * ((A + 1.0) + (A - 1.0) * cos_w0 - two_sqrt_A_alpha)
+        hs_a0 = (A + 1.0) - (A - 1.0) * cos_w0 + two_sqrt_A_alpha
+        hs_a1 = 2.0 * ((A - 1.0) - (A + 1.0) * cos_w0)
+        hs_a2 = (A + 1.0) - (A - 1.0) * cos_w0 - two_sqrt_A_alpha
+
+        # High-Pass
+        hp_b0 = (1.0 + cos_w0) / 2.0
+        hp_b1 = -(1.0 + cos_w0)
+        hp_b2 = (1.0 + cos_w0) / 2.0
+        hp_a0 = 1.0 + alpha
+        hp_a1 = -2.0 * cos_w0
+        hp_a2 = 1.0 - alpha
+
+        # Low-Pass
+        lp_b0 = (1.0 - cos_w0) / 2.0
+        lp_b1 = 1.0 - cos_w0
+        lp_b2 = (1.0 - cos_w0) / 2.0
+        lp_a0 = 1.0 + alpha
+        lp_a1 = -2.0 * cos_w0
+        lp_a2 = 1.0 - alpha
+
+        # Stack into (Batch, Num_Bands, 5) and weight by type_probs
+        def weighted_sum(peak, ls, hs, hp, lp):
+            # Each input is (Batch, Num_Bands)
+            stacked = torch.stack([peak, ls, hs, hp, lp], dim=-1)  # (B, N, 5)
+            return (stacked * type_probs).sum(dim=-1)  # (B, N)
+
+        b0_raw = weighted_sum(peak_b0, ls_b0, hs_b0, hp_b0, lp_b0)
+        b1_raw = weighted_sum(peak_b1, ls_b1, hs_b1, hp_b1, lp_b1)
+        b2_raw = weighted_sum(peak_b2, ls_b2, hs_b2, hp_b2, lp_b2)
+        a0_raw = weighted_sum(peak_a0, ls_a0, hs_a0, hp_a0, lp_a0)
+        a1_raw = weighted_sum(peak_a1, ls_a1, hs_a1, hp_a1, lp_a1)
+        a2_raw = weighted_sum(peak_a2, ls_a2, hs_a2, hp_a2, lp_a2)
+
+        # Normalize by a0 — clamp to prevent near-zero division from
+        # convex combination of coefficients from different filter types
+        a0_raw = torch.clamp(a0_raw, min=1e-4)
+        b0 = b0_raw / a0_raw
+        b1 = b1_raw / a0_raw
+        b2 = b2_raw / a0_raw
+        a1 = a1_raw / a0_raw
+        a2 = a2_raw / a0_raw
+
+        return b0, b1, b2, a1, a2
+
+    def freq_response(self, b0, b1, b2, a1, a2, n_fft=2048):
+        """
+        Compute the frequency response of the biquad filter.
+        (Batch, Num_Bands) -> (Batch, Num_Bands, N_FFT // 2 + 1)
+        """
+        w = torch.linspace(0, torch.pi, n_fft // 2 + 1, device=b0.device)
+
+        cos_w = torch.cos(w).view(1, 1, -1)
+        sin_w = torch.sin(w).view(1, 1, -1)
+        cos_2w = torch.cos(2 * w).view(1, 1, -1)
+        sin_2w = torch.sin(2 * w).view(1, 1, -1)
+
+        b0_v = b0.unsqueeze(-1)
+        b1_v = b1.unsqueeze(-1)
+        b2_v = b2.unsqueeze(-1)
+        a1_v = a1.unsqueeze(-1)
+        a2_v = a2.unsqueeze(-1)
+
+        num_re = b0_v + b1_v * cos_w + b2_v * cos_2w
+        num_im = -(b1_v * sin_w + b2_v * sin_2w)
+
+        den_re = 1.0 + a1_v * cos_w + a2_v * cos_2w
+        den_im = -(a1_v * sin_w + a2_v * sin_2w)
+
+        num_mag2 = num_re**2 + num_im**2
+        den_mag2 = den_re**2 + den_im**2
+
+        H_mag = torch.sqrt(num_mag2 / (den_mag2 + 1e-6))
+
+        return H_mag
+
+    def forward(self, gain_db, freq, q, n_fft=2048, filter_type=None):
+        """
+        Forward pass calculates the overall magnitude response of the cascade.
+        If filter_type is None, uses peaking/bell for all bands (backward compat).
+
+        Args:
+            gain_db: (Batch, Num_Bands)
+            freq: (Batch, Num_Bands)
+            q: (Batch, Num_Bands)
+            n_fft: FFT size
+            filter_type: (Batch, Num_Bands) int tensor, or None for peaking-only
+
+        Returns: (Batch, N_FFT // 2 + 1)
+        """
+        if filter_type is None:
+            b0, b1, b2, a1, a2 = self.compute_biquad_coeffs(gain_db, freq, q)
+        else:
+            b0, b1, b2, a1, a2 = self.compute_biquad_coeffs_multitype(
+                gain_db, freq, q, filter_type
+            )
+        H_mag_bands = self.freq_response(b0, b1, b2, a1, a2, n_fft)
+        H_mag_total = torch.prod(H_mag_bands, dim=1)
+        # Clamp to prevent inf/NaN from product of 5 bands (matches forward_soft)
+        H_mag_total = torch.clamp(H_mag_total, min=1e-6, max=1e6)
+        return H_mag_total
+
+    def process_audio(self, audio, gain_db, freq, q, filter_type=None, n_fft=2048, hop_length=512):
+        """
+        Apply the differentiable EQ cascade to a time-domain audio signal.
+        Because time-domain recursive biquad filtering limits parallel gradient flow,
+        we apply the complex frequency response via STFT multiplication and iSTFT.
+        
+        Args:
+            audio: (Batch, Time)
+            gain_db, freq, q: (Batch, Num_Bands)
+            filter_type: (Batch, Num_Bands)
+        Returns:
+            filtered_audio: (Batch, Time)
+        """
+        window = torch.hann_window(n_fft, device=audio.device)
+        # 1. Take STFT
+        # (Batch, FreqBins, TimeFrames)
+        X = torch.stft(audio, n_fft=n_fft, hop_length=hop_length, 
+                       window=window, return_complex=True, pad_mode="constant")
+        
+        # 2. Get magnitude response of the EQ curve
+        H_mag = self.forward(gain_db, freq, q, n_fft=n_fft, filter_type=filter_type)
+        
+        # 3. Multiply standard complex spectrum by the magnitude response
+        # H_mag shape: (Batch, FreqBins). Broadcast over time frames.
+        Y = X * H_mag.unsqueeze(-1)
+        
+        # 4. Inverse STFT to get the filtered time-domain signal
+        y_time = torch.istft(Y, n_fft=n_fft, hop_length=hop_length, 
+                             window=window, length=audio.shape[-1])
+        return y_time
+
+    def forward_soft(self, gain_db, freq, q, type_probs, n_fft=2048):
+        """
+        Forward pass using soft type probabilities (for training with Gumbel-Softmax).
+
+        Forces float32 computation to prevent bf16 NaN from soft coefficient
+        blending. The Gumbel-Softmax produces blended biquad coefficients that
+        don't correspond to any real filter — under bf16, the intermediate
+        products can underflow/overflow at certain frequency bins, and the
+        product over 5 bands amplifies this into inf/NaN.
+
+        Args:
+            gain_db: (Batch, Num_Bands)
+            freq: (Batch, Num_Bands)
+            q: (Batch, Num_Bands)
+            type_probs: (Batch, Num_Bands, 5) soft type probabilities
+            n_fft: FFT size
+
+        Returns: (Batch, N_FFT // 2 + 1)
+        """
+        # Cast inputs to float32 for numerical stability
+        orig_dtype = gain_db.dtype
+        gain_db = gain_db.float()
+        freq = freq.float()
+        q = q.float()
+        type_probs = type_probs.float()
+
+        b0, b1, b2, a1, a2 = self.compute_biquad_coeffs_multitype_soft(
+            gain_db, freq, q, type_probs
+        )
+        H_mag_bands = self.freq_response(b0, b1, b2, a1, a2, n_fft)
+        H_mag_total = torch.prod(H_mag_bands, dim=1)
+
+        # Clamp to prevent inf from product of 5 bands before casting back
+        H_mag_total = torch.clamp(H_mag_total, min=1e-6, max=1e6)
+        return H_mag_total.to(orig_dtype)
+
+    def inverse_freq_response(self, gain_db, freq, q, n_fft=2048, max_gain=4.0,
+                               filter_type=None):
+        """
+        Compute the inverse magnitude response of the cascade (1/H).
+        Clamps per-band inverse to avoid instability at resonance peaks.
+        """
+        H_mag_total = self.forward(gain_db, freq, q, n_fft, filter_type)
+        H_inv_bands = 1.0 / (H_mag_total + 1e-8)
+        H_inv = torch.clamp(H_inv_bands, max=max_gain)
+        return H_inv
+
+    def apply_to_spectrum(self, stft_mag, gain_db, freq, q, filter_type=None):
+        """
+        Apply the EQ cascade to an existing STFT magnitude tensor.
+        stft_mag: (Batch, FreqBins) or (Batch, FreqBins, Time)
+        """
+        n_fft = (stft_mag.shape[-2 if stft_mag.dim() == 3 else 1] - 1) * 2
+        H_mag = self.forward(gain_db, freq, q, n_fft=n_fft, filter_type=filter_type)
+        if stft_mag.dim() == 3:
+            H_mag = H_mag.unsqueeze(-1)
+        return stft_mag * H_mag
+
+    def apply_inverse_to_spectrum(self, stft_mag, gain_db, freq, q,
+                                   max_gain=4.0, filter_type=None):
+        """
+        Apply the inverse EQ cascade to an existing STFT magnitude tensor.
+        """
+        n_fft = (stft_mag.shape[-2 if stft_mag.dim() == 3 else 1] - 1) * 2
+        H_inv = self.inverse_freq_response(
+            gain_db, freq, q, n_fft=n_fft, max_gain=max_gain,
+            filter_type=filter_type
+        )
+        if stft_mag.dim() == 3:
+            H_inv = H_inv.unsqueeze(-1)
+        return stft_mag * H_inv
+
+
+class EQParameterHead(nn.Module):
+    """
+    Maps raw network embeddings to constrained [Gain, Freq, Q] parameters.
+    Peaking/bell only — kept for backward compatibility.
+    """
+
+    def __init__(self, embedding_dim, num_bands=5):
+        super().__init__()
+        self.num_bands = num_bands
+        self.fc = nn.Linear(embedding_dim, num_bands * 3)
+
+    def forward(self, embedding):
+        raw = self.fc(embedding)
+        raw = raw.view(-1, self.num_bands, 3)
+
+        gain_db = ste_clamp(raw[:, :, 0] * 24.0, -24.0, 24.0)
+        freq = torch.sigmoid(raw[:, :, 1]) * (20000.0 - 20.0) + 20.0
+        q = torch.sigmoid(raw[:, :, 2]) * (10.0 - 0.1) + 0.1
+
+        return gain_db, freq, q
+
+class MultiTypeEQParameterHead(nn.Module):
+    """
+    Maps TCN embeddings + mel_profile to [Gain, Freq, Q] + filter type classification.
+
+    Frequency: attention over position-aware 1D CNN on mel spectrogram + direct sigmoid regression.
+    Gain: trunk regression via gain_trunk_head (primary), Gaussian mel readout (auxiliary).
+    Q: trunk features.
+    Type: trunk + mel features with Gumbel-Softmax.
+    """
+
+    def __init__(self, embedding_dim, num_bands=5, num_filter_types=NUM_FILTER_TYPES, n_mels=0):
+        super().__init__()
+        self.num_bands = num_bands
+        self.num_filter_types = num_filter_types
+        self.log_f_min = math.log(20.0)
+        self.log_f_max = math.log(20000.0)
+
+        hidden_dim = 64
+        cnn_channels = 32
+
+        # Shared trunk: embedding -> per-band features
+        self.trunk = nn.Linear(embedding_dim, num_bands * hidden_dim)
+
+        # --- Gain: dedicated 2-layer MLP from trunk embedding (no mel-residual dependency) ---
+        # Previous Gaussian readout had only 10 learnable params (scale+bias per band)
+        # and could not map log-mel residual amplitude to dB gain.
+        # MLP regression head takes the full 64-dim trunk embedding and outputs gain directly.
+        # Output is scaled by gain_output_scale (24.0) so the MLP only needs to produce
+        # values in [-1, 1] instead of [-24, 24], matching typical Xavier initialization range.
+        self.gain_mlp = nn.Sequential(
+            nn.Linear(hidden_dim, hidden_dim),
+            nn.ReLU(),
+            nn.Linear(hidden_dim, 1),
+            nn.Tanh(),  # Bounded [-1, 1] output, then scaled to [-24, 24]
+        )
+        self.gain_output_scale = nn.Parameter(torch.tensor(24.0))
+        self.use_mel_for_gain = n_mels > 0
+        if self.use_mel_for_gain:
+            kernel = max(1, min(65, n_mels))
+            pad = kernel // 2
+            self.gain_smooth_pool = nn.AvgPool1d(kernel_size=kernel, stride=1, padding=pad)
+            # Aux gain from mel-residual (kept as auxiliary signal, not primary)
+            self.gain_mel_aux = nn.Sequential(
+                nn.Linear(hidden_dim + 1, hidden_dim),
+                nn.ReLU(),
+                nn.Linear(hidden_dim, 1),
+            )
+
+        # Gain: trunk regression head (primary path)
+        self.gain_trunk_head = nn.Linear(hidden_dim, 1)
+        # Gain fallback: trunk features -> gain (when no mel profile, legacy)
+        self.gain_fallback = self.gain_trunk_head  # alias for backward compat
+        # Q head: trunk features -> Q
+        self.q_head = nn.Linear(hidden_dim, 1)
+        self.dropout = nn.Dropout(p=0.1)
+
+        # --- Type classification: trunk + mel spectral shape features ---
+        self.type_mel_proj = (
+            nn.Sequential(
+                nn.Conv1d(1, 32, kernel_size=15, stride=4, padding=7),
+                nn.ReLU(),
+                nn.AdaptiveAvgPool1d(1),
+                nn.Flatten(),
+                nn.Linear(32, 32),
+            )
+            if n_mels > 0
+            else None
+        )
+        type_input_dim = hidden_dim + (32 if n_mels > 0 else 0)
+        self.classification_head = nn.Sequential(
+            nn.Linear(type_input_dim, 64),
+            nn.ReLU(),
+            nn.Dropout(0.1),
+            nn.Linear(64, num_filter_types),
+        )
+
+        # Gumbel-Softmax temperature
+        self.register_buffer("gumbel_temperature", torch.tensor(1.0))
+        self.min_tau = 0.1
+
+        # --- Frequency: attention over position-aware CNN on mel profile ---
+        self.use_mel_profile = n_mels > 0
+        if self.use_mel_profile:
+            log_f_min, log_f_max = math.log(20.0), math.log(20000.0)
+            log_freq_coord = torch.linspace(log_f_min, log_f_max, n_mels).view(1, 1, -1)
+            self.register_buffer("log_freq_coord", log_freq_coord)
+
+            if n_mels > 512:
+                downsample_ratio = max(1, n_mels // 256)
+                kernel = downsample_ratio * 2 + 1
+                stride = downsample_ratio
+                padding = downsample_ratio
+                self.input_downsample = nn.Sequential(
+                    nn.Conv1d(2, 2, kernel_size=kernel, stride=stride, padding=padding),
+                    nn.ReLU(),
+                )
+                self._downsampled_bins = (n_mels + stride - 1) // stride
+            else:
+                self.input_downsample = None
+                self._downsampled_bins = n_mels
+
+            self.mel_cnn = nn.Sequential(
+                nn.Conv1d(2, cnn_channels, kernel_size=7, padding=3),
+                nn.ReLU(),
+                nn.Conv1d(cnn_channels, cnn_channels, kernel_size=5, padding=2),
+                nn.ReLU(),
+            )
+            self.mel_cnn_dilated = nn.Sequential(
+                nn.Conv1d(2, cnn_channels, kernel_size=5, padding=8, dilation=4),
+                nn.ReLU(),
+                nn.Conv1d(cnn_channels, cnn_channels, kernel_size=3, padding=8, dilation=8),
+                nn.ReLU(),
+            )
+            self.cnn_merge = nn.Conv1d(cnn_channels * 2, cnn_channels, kernel_size=1)
+
+            self.query_proj = nn.Linear(hidden_dim, cnn_channels)
+            mel_pos = torch.linspace(0, 1, self._downsampled_bins)
+            centers = torch.linspace(0.15, 0.85, num_bands)
+            gaussian_init = -0.5 * (mel_pos.unsqueeze(0) - centers.unsqueeze(1)) ** 2
+            self.attn_position_bias = nn.Parameter(gaussian_init)
+            self.register_buffer("attn_temperature", torch.tensor(0.5))
+
+        # Fallback frequency: sigmoid regression
+        self.freq_fallback = nn.Linear(hidden_dim, 1)
+        uniform_raw = torch.linspace(0.1, 0.9, num_bands)
+        self.register_buffer("freq_prior_raw", uniform_raw)
+        self.freq_prior_scale = nn.Parameter(torch.tensor(1.0))
+
+        # Direct frequency regression (parallel to attention)
+        self.freq_direct = nn.Linear(hidden_dim, 1)
+        self.freq_blend_weight = nn.Parameter(torch.tensor(0.0))
+
+        # Init
+        nn.init.xavier_uniform_(self.trunk.weight, gain=2.0)
+        nn.init.zeros_(self.trunk.bias)
+        nn.init.xavier_uniform_(self.gain_trunk_head.weight, gain=1.0)
+        nn.init.zeros_(self.gain_trunk_head.bias)
+        if self.use_mel_profile:
+            for module in [self.mel_cnn, self.mel_cnn_dilated]:
+                for m in module.modules():
+                    if isinstance(m, nn.Conv1d):
+                        nn.init.xavier_uniform_(m.weight, gain=2.0)
+                        if m.bias is not None:
+                            nn.init.zeros_(m.bias)
+            nn.init.xavier_uniform_(self.cnn_merge.weight, gain=2.0)
+            nn.init.zeros_(self.cnn_merge.bias)
+            nn.init.xavier_uniform_(self.query_proj.weight, gain=1.0)
+            nn.init.zeros_(self.query_proj.bias)
+
+        # Init classification head (2-layer MLP)
+        for module in self.classification_head:
+            if isinstance(module, nn.Linear):
+                nn.init.xavier_uniform_(module.weight, gain=1.0)
+                nn.init.zeros_(module.bias)
+
+    def forward(self, embedding, mel_profile=None, hard_types=False):
+        trunk_out = self.trunk(embedding)
+        trunk_out = trunk_out.view(-1, self.num_bands, 64)
+        trunk_out = F.relu(trunk_out)
+        trunk_out = self.dropout(trunk_out)
+
+        attn = None
+        gain_db = None
+        freq = None
+
+        if self.use_mel_profile and mel_profile is not None:
+            n_mels = mel_profile.shape[-1]
+            assert n_mels == self.log_freq_coord.shape[-1], \
+                f"mel_profile has {n_mels} bins but parameter head expects {self.log_freq_coord.shape[-1]}"
+
+            # Normalize mel profile (std-only to preserve absolute level for gain sign)
+            mp_mean = mel_profile.mean(dim=-1, keepdim=True)
+            mp_std = mel_profile.std(dim=-1, keepdim=True).clamp(min=1e-4)
+            mel_profile_normed = (mel_profile - mp_mean) / mp_std
+
+            # Build CNN input
+            pos = self.log_freq_coord.expand(embedding.shape[0], -1, -1)
+            cnn_in = torch.cat([mel_profile_normed.unsqueeze(1), pos], dim=1)
+
+            if self.input_downsample is not None:
+                cnn_in = self.input_downsample(cnn_in)
+
+            cnn_local = self.mel_cnn(cnn_in)
+            cnn_wide = self.mel_cnn_dilated(cnn_in)
+            cnn_feat = self.cnn_merge(torch.cat([cnn_local, cnn_wide], dim=1))
+
+            # Attention frequency
+            queries = self.query_proj(trunk_out)
+            content = torch.einsum("bnf,bfm->bnm", queries, cnn_feat)
+            attn_logits = content + self.attn_position_bias.unsqueeze(0)
+            attn = F.softmax(
+                attn_logits.float() / self.attn_temperature.clamp(min=0.01).float(),
+                dim=-1,
+            ).to(attn_logits.dtype)
+
+            n_bins = cnn_feat.shape[-1]
+            mel_log_freqs = torch.linspace(
+                self.log_f_min, self.log_f_max, n_bins, device=mel_profile.device
+            )
+            log_freq_attn = (attn * mel_log_freqs.view(1, 1, n_bins)).sum(-1)
+            freq_attn = torch.exp(log_freq_attn)
+
+            # Direct regression frequency
+            raw_freq_direct = self.freq_direct(trunk_out).squeeze(-1)
+            prior = self.freq_prior_scale * self.freq_prior_raw
+            blended_direct = raw_freq_direct + prior.unsqueeze(0)
+            log_freq_direct = (
+                torch.sigmoid(blended_direct) * (self.log_f_max - self.log_f_min)
+                + self.log_f_min
+            )
+            freq_direct = torch.exp(log_freq_direct)
+
+            alpha = torch.sigmoid(self.freq_blend_weight)
+            freq = alpha * freq_attn + (1 - alpha) * freq_direct
+            freq = torch.nan_to_num(freq, nan=1000.0, posinf=20000.0, neginf=20.0)
+            freq = freq.clamp(min=20.0, max=20000.0)
+
+            # --- Gain: MLP from trunk embedding (primary) + mel-residual auxiliary ---
+            # Primary: dedicated 2-layer MLP takes full 64-dim trunk features -> gain
+            # Tanh output scaled by gain_output_scale (init 24.0) so MLP range matches target range
+            gain_db = self.gain_mlp(trunk_out).squeeze(-1) * self.gain_output_scale
+
+            # Auxiliary: mel-residual path (blended with primary for spectral context)
+            mel_2d = mel_profile.unsqueeze(1)
+            mel_smooth = self.gain_smooth_pool(mel_2d).squeeze(1)
+            mel_residual = mel_profile - mel_smooth
+
+            if attn is not None:
+                gain_readout = (attn * mel_residual.unsqueeze(1)).sum(-1)  # (B, bands)
+            else:
+                gain_readout = mel_residual.mean(dim=-1, keepdim=True).expand(-1, self.num_bands)
+
+            gain_mel_in = torch.cat([trunk_out, gain_readout.unsqueeze(-1)], dim=-1)
+            gain_aux = self.gain_mel_aux(gain_mel_in).squeeze(-1)
+
+            # Blend: primary MLP dominates, aux provides spectral context
+            gain_db = 0.7 * gain_db + 0.3 * gain_aux
+            gain_db = torch.nan_to_num(gain_db, nan=0.0, posinf=24.0, neginf=-24.0)
+            gain_db = ste_clamp(gain_db, -24.0, 24.0)
+
+        else:
+            raw_freq = self.freq_fallback(trunk_out).squeeze(-1)
+            prior = self.freq_prior_scale * self.freq_prior_raw
+            blended = raw_freq + prior.unsqueeze(0)
+            log_freq = (
+                torch.sigmoid(blended) * (self.log_f_max - self.log_f_min)
+                + self.log_f_min
+            )
+            freq = torch.exp(log_freq)
+
+            gain_raw = self.gain_trunk_head(trunk_out).squeeze(-1)
+            gain_db = ste_clamp(gain_raw, -24.0, 24.0)
+
+        # Q from trunk features
+        q_raw = self.q_head(trunk_out).squeeze(-1)
+        q = torch.exp(
+            torch.sigmoid(q_raw) * (math.log(10.0) - math.log(0.1)) + math.log(0.1)
+        )
+        # Guard against NaN from corrupted weights (gain and freq already have this)
+        q = torch.nan_to_num(q, nan=1.0, posinf=10.0, neginf=0.1)
+        q = torch.clamp(q, min=0.1, max=10.0)
+
+        # Type classification: trunk + mel spectral shape
+        if self.type_mel_proj is not None and mel_profile is not None:
+            mel_type_feat = self.type_mel_proj(mel_profile.unsqueeze(1))
+            mel_type_feat = mel_type_feat.unsqueeze(1).expand(-1, self.num_bands, -1)
+            type_input = torch.cat([trunk_out, mel_type_feat], dim=-1)
+        else:
+            type_input = trunk_out
+        type_logits = self.classification_head(type_input)
+
+        if self.training and not hard_types:
+            # Generate Gumbel noise in float32 to avoid bf16 underflow:
+            # bf16 normal min ~1.2e-7, so log(exp_draw) can produce -inf
+            gumbels_fp32 = -torch.empty_like(type_logits, dtype=torch.float32).exponential_().log()
+            gumbels = gumbels_fp32.clamp(-10.0, 10.0).to(type_logits.dtype)
+            tau = torch.clamp(self.gumbel_temperature, min=self.min_tau)
+            type_probs = ((type_logits + gumbels) / tau).softmax(dim=-1)
+        else:
+            type_probs = F.softmax(type_logits, dim=-1)
+        filter_type = type_logits.argmax(dim=-1)
+
+        return gain_db, freq, q, type_logits, type_probs, filter_type

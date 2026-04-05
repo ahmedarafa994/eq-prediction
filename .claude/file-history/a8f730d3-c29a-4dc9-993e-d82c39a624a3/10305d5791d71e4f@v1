@@ -1,0 +1,92 @@
+# Configuration for the IDSP Multi-Type EQ Blind Estimator
+
+experiment_name: "idsp-eq-multitype-blind-estimator"
+seed: 42
+
+data:
+  num_bands: 5
+  sample_rate: 44100
+  audio_duration: 3.0
+  n_fft: 2048
+  hop_length: 256
+  n_mels: 128
+  gain_bounds: [-24.0, 24.0]
+  freq_bounds: [20.0, 20000.0]
+  q_bounds: [0.1, 10.0]
+  filter_types: ["peaking", "lowshelf", "highshelf", "highpass", "lowpass"]
+  type_weights: [0.5, 0.15, 0.15, 0.1, 0.1]
+  dataset_size: 30000
+  val_dataset_size: 2000
+  train_split: 0.8
+  val_split: 0.1
+  test_split: 0.1
+  batch_size: 32
+  num_workers: 4
+
+model:
+  encoder:
+    type: "tcn"
+    n_mels: 128
+    embedding_dim: 128
+    channels: 128
+    num_blocks: 4
+    num_stacks: 2
+    kernel_size: 3
+  num_bands: 5
+  learning_rate: 0.0002
+  weight_decay: 0.00001
+
+loss:
+  # Combined param weight disabled — use independent per-parameter weights
+  lambda_param: 0.0
+  lambda_gain: 3.0
+  lambda_freq: 1.0
+  lambda_q: 0.5
+  lambda_type: 2.0
+  lambda_spectral: 1.0
+  lambda_hmag: 0.1
+  lambda_activity: 0.1
+  lambda_spread: 0.05
+  lambda_freq_match: 1.0
+  lambda_q_match: 0.5
+  # Anti-collapse regularization: reduce after encoder fix
+  lambda_embed_var: 0.2
+  lambda_contrastive: 0.05
+  embed_var_threshold: 0.1
+
+trainer:
+  max_epochs: 80
+  accelerator: "auto"
+  devices: 1
+  precision: "fp32"
+  log_every_n_steps: 10
+  fast_dev_run: false
+  gradient_accumulation_steps: 4
+  # Optimization flags (QLoRA/Unsloth/DeepSpeed-inspired)
+  use_8bit_optimizer: false
+  use_torch_compile: false
+  use_gradient_checkpointing: false
+  use_activation_quantization: false
+  use_deepspeed: false
+  deepspeed_config: "conf/deepspeed_config.json"
+  precompute_cache_path: null
+
+curriculum:
+  stages:
+    - name: "warmup"
+      epochs: 10
+      lambda_type: 1.0
+      gumbel_temperature: 1.0
+    - name: "type_learning"
+      epochs: 20
+      lambda_type: 2.0
+      gumbel_temperature: 0.5
+    - name: "consolidation"
+      epochs: 30
+      lambda_type: 1.5
+      gumbel_temperature: 0.1
+    - name: "finetune"
+      epochs: 10
+      lambda_type: 1.0
+      gumbel_temperature: 0.05
+      learning_rate_scale: 0.1

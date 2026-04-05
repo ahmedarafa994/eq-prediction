@@ -1,0 +1,219 @@
+import torch
+from model_cnn import EQEstimatorCNN
+from dsp_frontend import STFTFrontend
+from loss import FreqResponseLoss, EQParameterPriorLoss, CombinedIDSPLoss
+from dataset import SyntheticEQDataset, collate_fn
+from torch.utils.data import DataLoader
+import time
+
+
+def test_forward_pass():
+    batch_size = 4
+    num_bands = 6
+    n_fft = 2048
+    sample_rate = 22050
+    num_samples = int(2.5 * sample_rate)
+    device = torch.device("cpu")
+
+    print("=== Test 1: CNN forward pass ===")
+    model = EQEstimatorCNN(num_bands=num_bands, sample_rate=sample_rate)
+    wet_audio = torch.randn(batch_size, num_samples)
+    output = model(wet_audio)
+    gain_db, freq, q = output["params"]
+    H_mag = output["H_mag"]
+    wet_stft = output["wet_stft"]
+    dry_mag_est = output["dry_mag_est"]
+
+    assert gain_db.shape == (batch_size, num_bands), f"gain shape: {gain_db.shape}"
+    assert freq.shape == (batch_size, num_bands), f"freq shape: {freq.shape}"
+    assert q.shape == (batch_size, num_bands), f"q shape: {q.shape}"
+    assert H_mag.shape == (batch_size, n_fft // 2 + 1), f"H_mag shape: {H_mag.shape}"
+    assert torch.all(gain_db >= -24.0) and torch.all(gain_db <= 24.0)
+    assert torch.all(freq >= 20.0) and torch.all(freq <= 20000.0)
+    assert torch.all(q >= 0.1) and torch.all(q <= 10.0)
+    print(f"  gain_db range: [{gain_db.min():.2f}, {gain_db.max():.2f}]")
+    print(f"  freq range: [{freq.min():.1f}, {freq.max():.1f}]")
+    print(f"  q range: [{q.min():.3f}, {q.max():.3f}]")
+    print(f"  H_mag range: [{H_mag.min():.4f}, {H_mag.max():.4f}]")
+    print("  PASSED")
+
+
+def test_inverse_filter():
+    batch_size = 4
+    num_bands = 6
+    n_fft = 2048
+    sample_rate = 22050
+    num_samples = int(2.5 * sample_rate)
+
+    print("=== Test 2: Inverse filter ===")
+    model = EQEstimatorCNN(num_bands=num_bands, sample_rate=sample_rate)
+    wet_audio = torch.randn(batch_size, num_samples)
+    output = model(wet_audio)
+    gain_db, freq, q = output["params"]
+    wet_stft = output["wet_stft"]
+    wet_mag = torch.abs(wet_stft)
+    dry_mag_est = model.dsp_cascade.apply_inverse_to_spectrum(wet_mag, gain_db, freq, q)
+
+    assert dry_mag_est.shape == wet_mag.shape, (
+        f"Shape mismatch: {dry_mag_est.shape} vs {wet_mag.shape}"
+    )
+    print("  PASSED")
+
+
+def test_cycle_consistency():
+    batch_size = 4
+    num_bands = 6
+    n_fft = 2048
+    sample_rate = 22050
+    num_samples = int(2.5 * sample_rate)
+
+    print("=== Test 3: Cycle consistency ===")
+    model = EQEstimatorCNN(num_bands=num_bands, sample_rate=sample_rate)
+    wet_audio = torch.randn(batch_size, num_samples)
+    output, roundtrip_mag = model.reconstruct_roundtrip(wet_audio)
+    gain_db, freq, q = output["params"]
+
+    assert roundtrip_mag.shape == torch.abs(output["wet_stft"]).shape
+    cycle_error = (roundtrip_mag - torch.abs(output["wet_stft"])).abs().mean()
+    print(f"  Cycle-consistency error (should be ~0 for identity): {cycle_error:.6f}")
+    print("  PASSED")
+
+
+def test_gradient_flow():
+    batch_size = 4
+    num_bands = 6
+    n_fft = 2048
+    sample_rate = 22050
+    num_samples = int(2.5 * sample_rate)
+
+    print("=== Test 4: Gradient flow through full pipeline ===")
+    model = EQEstimatorCNN(num_bands=num_bands, sample_rate=sample_rate)
+    wet_audio = torch.randn(batch_size, num_samples)
+    output = model(wet_audio)
+    gain_db, freq, q = output["params"]
+    H_mag = output["H_mag"]
+    target_H = torch.ones_like(H_mag)
+    loss = torch.nn.functional.mse_loss(H_mag, target_H)
+    loss.backward()
+    has_grads = all(p.grad is not None for p in model.parameters() if p.requires_grad)
+    assert has_grads, "Gradients not flowing to all parameters"
+    print(f"  Loss: {loss.item():.4f}")
+    print(
+        f"  All {sum(1 for p in model.parameters() if p.requires_grad)} parameters have gradients"
+    )
+    print("  PASSED")
+
+
+def test_combined_loss():
+    batch_size = 4
+    num_bands = 6
+    n_fft = 2048
+    sample_rate = 22050
+    num_samples = int(2.5 * sample_rate)
+
+    print("=== Test 5: Combined IDSP loss ===")
+    model = EQEstimatorCNN(num_bands=num_bands, sample_rate=sample_rate)
+    wet_audio = torch.randn(batch_size, num_samples)
+    output = model(wet_audio)
+    gain_db, freq, q = output["params"]
+    H_pred = output["H_mag"]
+    target_params = torch.stack(
+        [
+            torch.randn(batch_size, num_bands) * 3.0,
+            20.0 + torch.sigmoid(torch.randn(batch_size, num_bands)) * (20000.0 - 20.0),
+            0.1 + torch.sigmoid(torch.randn(batch_size, num_bands)) * 9.9,
+        ],
+        dim=-1,
+    )
+    H_target = model.dsp_cascade(
+        target_params[:, :, 0],
+        target_params[:, :, 1],
+        target_params[:, :, 2],
+        n_fft=n_fft,
+    )
+    pred_params_stack = torch.stack([gain_db, freq, q], dim=-1)
+    criterion = CombinedIDSPLoss(num_bands=num_bands, n_fft=n_fft)
+    total_loss, components = criterion(
+        H_pred=H_pred,
+        H_target=H_target,
+        pred_params=pred_params_stack,
+        target_params=target_params,
+        gain_db=gain_db,
+        freq=freq,
+        q=q,
+    )
+    total_loss.backward()
+    print(f"  Total loss: {total_loss.item():.4f}")
+    for k, v in components.items():
+        print(f"  {k}: {v:.4f}")
+    print("  PASSED")
+
+
+def test_dataset_and_training_step():
+    print("=== Test 6: Dataset + single training step ===")
+    num_bands = 6
+    sample_rate = 22050
+    n_fft = 2048
+    batch_size = 4
+    device = torch.device("cpu")
+
+    dataset = SyntheticEQDataset(
+        num_bands=num_bands,
+        sample_rate=sample_rate,
+        duration=2.5,
+        size=20,
+        gain_range=(-15.0, 15.0),
+        freq_range=(20.0, 10000.0),
+        q_range=(0.1, 10.0),
+    )
+    loader = DataLoader(
+        dataset, batch_size=batch_size, collate_fn=collate_fn, num_workers=0
+    )
+    batch = next(iter(loader))
+    wet_audio = batch["wet_audio"]
+    target_params = batch["params"]
+    print(f"  wet_audio: {wet_audio.shape}, params: {target_params.shape}")
+
+    model = EQEstimatorCNN(num_bands=num_bands, sample_rate=sample_rate).to(device)
+    criterion = CombinedIDSPLoss(num_bands=num_bands, n_fft=n_fft)
+    optimizer = torch.optim.AdamW(model.parameters(), lr=1e-3)
+    wet_audio = wet_audio.to(device)
+    target_params = target_params.to(device)
+    output = model(wet_audio)
+    gain_db, freq, q = output["params"]
+    H_pred = output["H_mag"]
+    H_target = model.dsp_cascade(
+        target_params[:, 0, :],
+        target_params[:, 1, :],
+        target_params[:, 2, :],
+        n_fft=n_fft,
+    )
+    pred_stack = torch.stack([gain_db, freq, q], dim=-1)
+    target_stack = target_params.permute(0, 2, 1)
+    total_loss, components = criterion(
+        H_pred=H_pred,
+        H_target=H_target,
+        pred_params=pred_stack,
+        target_params=target_stack,
+        gain_db=gain_db,
+        freq=freq,
+        q=q,
+    )
+    optimizer.zero_grad()
+    total_loss.backward()
+    torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
+    optimizer.step()
+    print(f"  Training step loss: {total_loss.item():.4f}")
+    for k, v in components.items():
+        print(f"    {k}: {v:.4f}")
+    print("  PASSED")
+
+
+if __name__ == "__main__":
+    test_forward_pass()
+    test_inverse_filter()
+    test_cycle_consistency()
+    test_gradient_flow()
+    test_combined_loss()
+    test_dataset_and_training_step()
+    print("\n=== ALL PHASE 0 TESTS PASSED ===")

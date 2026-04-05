@@ -116,3 +116,5 @@ INFO  2026-04-04 00:56:05,150 [MainThread] serena.mcp:server_lifespan:343 - MCP 
 INFO  2026-04-04 00:56:05,153 [MainThread] mcp.server.lowlevel.server:_handle_request:720 - Processing request of type ListToolsRequest
 INFO  2026-04-04 00:56:05,154 [MainThread] mcp.server.lowlevel.server:_handle_request:720 - Processing request of type ListPromptsRequest
 INFO  2026-04-04 00:56:05,154 [MainThread] mcp.server.lowlevel.server:_handle_request:720 - Processing request of type ListResourcesRequest
+INFO  2026-04-04 01:49:50,712 [MainThread] serena.mcp:server_lifespan:347 - MCP server shutting down
+INFO  2026-04-04 01:49:50,722 [MainThread] serena.agent:shutdown:953 - SerenaAgent is shutting down ...

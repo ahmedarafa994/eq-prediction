@@ -1,0 +1,333 @@
+"""
+Generate a 200K precomputed MUSDB18 EQ dataset — multiprocess version.
+
+Creates data/dataset_musdb_200k.pt compatible with the training pipeline.
+Each sample: wet_mel (log-mel spectrogram), gain, freq, q, filter_type tensors.
+Uses all available CPU cores via multiprocessing.Pool.
+"""
+
+import sys
+import time
+import math
+import random
+import numpy as np
+import torch
+import torchaudio
+from pathlib import Path
+from multiprocessing import Pool, cpu_count, shared_memory
+import ctypes
+
+sys.path.append(str(Path(__file__).parent))
+
+MUSDB_ROOT = "/teamspace/lightning_storage/SNAP_DATA_SET/musdb18_hq"
+SR = 44100
+N_FFT = 2048
+HOP = N_FFT // 4  # 512
+N_MELS = 128
+DURATION = 3.0
+NUM_SAMPLES = int(DURATION * SR)
+N_BANDS = 5
+SIZE = 200_000
+CHUNK_SIZE = 1_000  # samples per worker call
+
+FILTER_PEAKING = 0
+FILTER_LOWSHELF = 1
+FILTER_HIGHSHELF = 2
+FILTER_HIGHPASS = 3
+FILTER_LOWPASS = 4
+TYPE_WEIGHTS = [0.5, 0.15, 0.15, 0.1, 0.1]
+
+# Global state shared across workers via initializer
+_audio_pool_raw = None
+_audio_lengths = None
+_mel_fb = None
+
+
+def _init_worker(audio_shm_name, audio_shapes, audio_lengths_arr):
+    """Initialize worker process with shared audio data."""
+    global _audio_pool_raw, _audio_lengths, _mel_fb
+
+    # Reconstruct shared numpy arrays from shared memory
+    _audio_lengths = audio_lengths_arr
+    _audio_pool_raw = []
+    offset = 0
+    for length in audio_lengths_arr:
+        shm = shared_memory.SharedMemory(name=audio_shm_name)
+        arr = np.ndarray(length, dtype=np.float32, buffer=shm.buf[offset:offset + length * 4])
+        _audio_pool_raw.append(arr)
+        offset += length * 4
+
+    # Build mel filterbank (lightweight, rebuild per worker)
+    _mel_fb = _build_mel_filterbank()
+
+
+def _build_mel_filterbank():
+    n_freqs = N_FFT // 2 + 1
+    f_min, f_max = 20.0, SR / 2.0
+    hz2mel = lambda h: 2595.0 * np.log10(1 + h / 700.0)
+    mel2hz = lambda m: 700.0 * (10.0 ** (m / 2595.0) - 1.0)
+    mel_pts = np.linspace(hz2mel(f_min), hz2mel(f_max), N_MELS + 2)
+    hz_pts = mel2hz(mel_pts)
+    bins = ((N_FFT + 1) * hz_pts / SR).astype(int)
+    fb = np.zeros((N_MELS, n_freqs))
+    for i in range(N_MELS):
+        for j in range(bins[i], bins[i + 1]):
+            if j < n_freqs and bins[i + 1] > bins[i]:
+                fb[i, j] = (j - bins[i]) / (bins[i + 1] - bins[i])
+        for j in range(bins[i + 1], bins[i + 2]):
+            if j < n_freqs and bins[i + 2] > bins[i + 1]:
+                fb[i, j] = (bins[i + 2] - j) / (bins[i + 2] - bins[i + 1])
+    return torch.tensor(fb, dtype=torch.float32)
+
+
+def _sample_eq_params():
+    params = []
+    for _ in range(N_BANDS):
+        ft = random.choices(range(5), weights=TYPE_WEIGHTS, k=1)[0]
+        if ft == FILTER_PEAKING:
+            g = random.choice([-1, 1]) * random.uniform(1, 18)
+            f = math.exp(random.uniform(math.log(50), math.log(18000)))
+            q = math.exp(random.uniform(math.log(0.2), math.log(8)))
+        elif ft == FILTER_LOWSHELF:
+            g = random.choice([-1, 1]) * random.uniform(1, 18)
+            f = math.exp(random.uniform(math.log(50), math.log(3000)))
+            q = math.exp(random.uniform(math.log(0.2), math.log(5)))
+        elif ft == FILTER_HIGHSHELF:
+            g = random.choice([-1, 1]) * random.uniform(1, 18)
+            f = math.exp(random.uniform(math.log(1500), math.log(18000)))
+            q = math.exp(random.uniform(math.log(0.2), math.log(5)))
+        elif ft == FILTER_HIGHPASS:
+            g = 0.0
+            f = math.exp(random.uniform(math.log(30), math.log(400)))
+            q = math.exp(random.uniform(math.log(0.2), math.log(1.5)))
+        else:
+            g = 0.0
+            f = math.exp(random.uniform(math.log(3000), math.log(18000)))
+            q = math.exp(random.uniform(math.log(0.2), math.log(1.5)))
+        params.append((g, f, q, ft))
+    return params
+
+
+def _biquad_coeff(gain_db, freq, q, ftype, sr=44100):
+    A = 10.0 ** (gain_db / 40.0) if ftype in (0, 1, 2) else 1.0
+    w0 = 2.0 * math.pi * freq / sr
+    alpha = math.sin(w0) / (2.0 * q)
+    sqA = math.sqrt(A) if A > 0 else 1.0
+
+    if ftype == 0:  # peaking
+        b0, b1, b2 = 1+alpha*A, -2*math.cos(w0), 1-alpha*A
+        a0, a1, a2 = 1+alpha/A, -2*math.cos(w0), 1-alpha/A
+    elif ftype == 1:  # lowshelf
+        b0 = A*((A+1)-(A-1)*math.cos(w0)+2*sqA*alpha)
+        b1 = 2*A*((A-1)-(A+1)*math.cos(w0))
+        b2 = A*((A+1)-(A-1)*math.cos(w0)-2*sqA*alpha)
+        a0 = (A+1)+(A-1)*math.cos(w0)+2*sqA*alpha
+        a1 = -2*((A-1)+(A+1)*math.cos(w0))
+        a2 = (A+1)+(A-1)*math.cos(w0)-2*sqA*alpha
+    elif ftype == 2:  # highshelf
+        b0 = A*((A+1)+(A-1)*math.cos(w0)+2*sqA*alpha)
+        b1 = -2*A*((A-1)+(A+1)*math.cos(w0))
+        b2 = A*((A+1)+(A-1)*math.cos(w0)-2*sqA*alpha)
+        a0 = (A+1)-(A-1)*math.cos(w0)+2*sqA*alpha
+        a1 = 2*((A-1)-(A+1)*math.cos(w0))
+        a2 = (A+1)-(A-1)*math.cos(w0)-2*sqA*alpha
+    elif ftype == 3:  # highpass
+        b0 = (1+math.cos(w0))/2; b1 = -(1+math.cos(w0)); b2 = (1+math.cos(w0))/2
+        a0 = 1+alpha; a1 = -2*math.cos(w0); a2 = 1-alpha
+    else:  # lowpass
+        b0 = (1-math.cos(w0))/2; b1 = 1-math.cos(w0); b2 = (1-math.cos(w0))/2
+        a0 = 1+alpha; a1 = -2*math.cos(w0); a2 = 1-alpha
+
+    return np.array([b0/a0, b1/a0, b2/a0]), np.array([1.0, a1/a0, a2/a0])
+
+
+def _apply_eq(audio, params):
+    from scipy.signal import lfilter
+    wet = audio.copy()
+    for g, f, q, ft in params:
+        b, a = _biquad_coeff(g, f, q, ft, SR)
+        wet = lfilter(b, a, wet)
+    return wet
+
+
+def _audio_to_mel_numpy(audio_np):
+    """Pure numpy mel spectrogram (no torch.stft to avoid per-worker torch overhead)."""
+    # STFT via numpy
+    window = np.hanning(N_FFT)
+    n_frames = 1 + (len(audio_np) - N_FFT) // HOP
+    stft_out = np.zeros((N_FFT // 2 + 1, n_frames), dtype=np.complex128)
+    for t in range(n_frames):
+        frame = audio_np[t * HOP:t * HOP + N_FFT] * window
+        spectrum = np.fft.rfft(frame)
+        stft_out[:, t] = spectrum[:N_FFT // 2 + 1]
+    mag = np.abs(stft_out)
+    mel = _mel_fb.numpy() @ mag
+    mel = np.clip(mel, 1e-8, None)
+    return np.log(mel)
+
+
+def generate_chunk(chunk_id):
+    """Generate CHUNK_SIZE samples. Returns list of sample dicts."""
+    from scipy.signal import lfilter  # import in worker
+    chunk_samples = []
+    for _ in range(CHUNK_SIZE):
+        # Random crop
+        idx = random.randint(0, len(_audio_pool_raw) - 1)
+        audio = _audio_pool_raw[idx]
+        if len(audio) <= NUM_SAMPLES:
+            audio = np.pad(audio, (0, NUM_SAMPLES - len(audio)), mode='wrap')
+        start = random.randint(0, len(audio) - NUM_SAMPLES)
+        dry = audio[start:start + NUM_SAMPLES].copy()
+
+        # Random EQ
+        params = _sample_eq_params()
+
+        # Apply EQ cascade
+        wet = _apply_eq(dry, params)
+
+        # Loudness augmentation
+        wet *= random.uniform(0.5, 1.0)
+
+        # Mel spectrogram
+        wet_mel = _audio_to_mel_numpy(wet)
+
+        # Pack params
+        gains = [p[0] for p in params]
+        freqs = [p[1] for p in params]
+        qs = [p[2] for p in params]
+        types = [p[3] for p in params]
+
+        chunk_samples.append((
+            wet_mel,  # numpy array, convert later
+            gains, freqs, qs, types,
+        ))
+
+    return chunk_id, chunk_samples
+
+
+def main():
+    n_workers = max(1, cpu_count() - 2)  # Leave 2 cores free
+    n_chunks = SIZE // CHUNK_SIZE
+    print(f"Generating {SIZE:,} MUSDB18 EQ samples with {n_workers} workers")
+    print(f"  SR={SR}, N_FFT={N_FFT}, HOP={HOP}, N_MELS={N_MELS}, DURATION={DURATION}s")
+    print(f"  N_BANDS={N_BANDS}, chunk_size={CHUNK_SIZE}, n_chunks={n_chunks}")
+    print()
+
+    # Load audio once in main process
+    print("Loading MUSDB18 audio...")
+    audio_segments = []
+    musdb_root = Path(MUSDB_ROOT)
+    for subset in ["train", "test"]:
+        subset_dir = musdb_root / subset
+        if not subset_dir.exists():
+            continue
+        for song_dir in sorted(subset_dir.iterdir()):
+            if not song_dir.is_dir():
+                continue
+            wav_path = song_dir / "mixture.wav"
+            if not wav_path.exists():
+                continue
+            wf, sr = torchaudio.load(str(wav_path))
+            if sr != SR:
+                wf = torchaudio.functional.resample(wf, sr, SR)
+            if wf.size(0) > 1:
+                wf = wf.mean(dim=0)
+            else:
+                wf = wf.squeeze(0)
+            audio_segments.append(wf.numpy())
+
+    total_dur = sum(a.shape[0] / SR for a in audio_segments)
+    print(f"  Loaded {len(audio_segments)} songs ({total_dur:.0f}s total)")
+
+    # Put audio in shared memory so workers can read without copy
+    total_samples = sum(a.shape[0] for a in audio_segments)
+    print(f"  Creating shared memory ({total_samples * 4 / 1e9:.2f} GB)...")
+    shm = shared_memory.SharedMemory(create=True, size=total_samples * 4)
+    shm_arr = np.ndarray(total_samples, dtype=np.float32, buffer=shm.buf)
+    audio_lengths = np.array([a.shape[0] for a in audio_segments], dtype=np.int64)
+    offset = 0
+    for a in audio_segments:
+        shm_arr[offset:offset + a.shape[0]] = a
+        offset += a.shape[0]
+
+    print(f"  Shared memory name: {shm.name}")
+    print()
+
+    # Create output dir
+    output_path = Path("data/dataset_musdb_200k.pt")
+    output_path.parent.mkdir(exist_ok=True)
+
+    # Process in rounds to manage memory (save to disk periodically)
+    BATCH_CHUNKS = 20  # Save every 20 chunks = 20K samples
+    all_cache = []
+    t0 = time.time()
+    completed = 0
+
+    with Pool(
+        processes=n_workers,
+        initializer=_init_worker,
+        initargs=(shm.name, None, audio_lengths),
+    ) as pool:
+        batch_idx = 0
+        for chunk_id, chunk_samples in pool.imap_unordered(
+            generate_chunk, range(n_chunks), chunksize=1
+        ):
+            # Convert to tensors and add to cache
+            for wet_mel_np, gains, freqs, qs, types in chunk_samples:
+                all_cache.append({
+                    "wet_mel": torch.tensor(wet_mel_np, dtype=torch.float32),
+                    "gain": torch.tensor(gains, dtype=torch.float32),
+                    "freq": torch.tensor(freqs, dtype=torch.float32),
+                    "q": torch.tensor(qs, dtype=torch.float32),
+                    "filter_type": torch.tensor(types, dtype=torch.long),
+                })
+
+            completed += CHUNK_SIZE
+            elapsed = time.time() - t0
+            rate = completed / elapsed
+
+            # Save batch to disk periodically
+            if len(all_cache) >= BATCH_CHUNKS * CHUNK_SIZE:
+                batch_idx += 1
+                batch_path = output_path.parent / f"dataset_musdb_200k_batch_{batch_idx:03d}.pt"
+                torch.save(all_cache, str(batch_path))
+                print(f"  {completed:>8,}/{SIZE:,} ({rate:.0f} samples/s) "
+                      f"- saved batch {batch_idx} ({len(all_cache):,} samples)")
+                all_cache = []
+            elif completed % 10000 == 0:
+                eta = (SIZE - completed) / rate
+                print(f"  {completed:>8,}/{SIZE:,} ({rate:.0f} samples/s, ETA {eta:.0f}s)")
+
+        # Save remaining
+        if all_cache:
+            batch_idx += 1
+            batch_path = output_path.parent / f"dataset_musdb_200k_batch_{batch_idx:03d}.pt"
+            torch.save(all_cache, str(batch_path))
+            print(f"  Saved final batch {batch_idx} ({len(all_cache):,} samples)")
+
+    # Cleanup shared memory
+    shm.close()
+    shm.unlink()
+
+    # Merge all batch files
+    print("\nMerging batch files...")
+    full_cache = []
+    batch_files = sorted(output_path.parent.glob("dataset_musdb_200k_batch_*.pt"))
+    for bf in batch_files:
+        batch = torch.load(str(bf), weights_only=False)
+        full_cache.extend(batch)
+        print(f"  Loaded {len(batch):,} from {bf.name}")
+        bf.unlink()
+
+    torch.save(full_cache, str(output_path))
+    elapsed = time.time() - t0
+    print(f"\nDone! Saved {len(full_cache):,} samples to {output_path}")
+    print(f"  Total time: {elapsed:.0f}s ({elapsed/60:.1f}min)")
+    print(f"  File size: {output_path.stat().st_size / 1e9:.1f} GB")
+
+
+if __name__ == "__main__":
+    random.seed(42)
+    np.random.seed(42)
+    torch.manual_seed(42)
+    main()

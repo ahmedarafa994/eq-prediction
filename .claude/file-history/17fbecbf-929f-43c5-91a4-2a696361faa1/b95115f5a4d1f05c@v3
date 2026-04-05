@@ -1,0 +1,75 @@
+"""Test STE clamp gradient preservation at boundaries."""
+import torch
+from differentiable_eq import ste_clamp, MultiTypeEQParameterHead
+from model_tcn import StreamingTCNModel
+from loss_multitype import MultiTypeEQLoss
+
+
+def test_ste_clamp():
+    device = 'cuda' if torch.cuda.is_available() else 'cpu'
+    x = torch.linspace(-24, 24.0, 8, device=device).detach().clone().requires_grad_(True)
+    ste_clamped = ste_clamp(x, -24.0, 24.0)
+    grad = torch.autograd.grad(ste_clamped.sum(), x)[0]
+    print(f"STE gradient at boundary: {grad.sum().item():.6f} (expected ~8.0)")
+    assert abs(grad.sum().item() - 8.0) < 0.1, "STE gradient should be ~8.0"
+    print("STE clamp test PASSED")
+
+
+def test_gain_mlp_gradient_flow():
+    """Test that gain_mlp receives gradients through the full model."""
+    device = 'cuda' if torch.cuda.is_available() else 'cpu'
+    model = StreamingTCNModel(n_mels=128, embedding_dim=128, num_bands=5,
+                                channels=128, num_blocks=4, num_stacks=2,
+                                sample_rate=44100, n_fft=2048).to(device)
+    mel = torch.randn(4, 128, 64, device=device)
+    output = model(mel)
+    gain = output['params'][0]
+    loss = gain.sum()
+    loss.backward()
+    gain_mlp_has_grad = False
+    for name, param in model.named_parameters():
+        if param.grad is not None and 'gain_mlp' in name:
+            gain_mlp_has_grad = True
+            print(f"  {name}: grad norm = {param.grad.norm().item():.6f}")
+    assert gain_mlp_has_grad, "gain_mlp should have gradients"
+    print("gain_mlp gradient flow test PASSED")
+
+
+def test_loss_component_split():
+    """Test that loss splits gain/freq/Q with independent weights."""
+    device = 'cuda' if torch.cuda.is_available() else 'cpu'
+    B, N = 4, 5
+    pred_gain = torch.randn(B, N, device=device) * 5
+    pred_freq = torch.rand(B, N, device=device) * 20000 + 20
+    pred_q = torch.rand(B, N, device=device) * 10 + 0.1
+    pred_type = torch.randn(B, N, 5, device=device)
+    pred_H = torch.rand(B, N * 100 + 1, device=device) + 0.5
+    target_gain = torch.randn(B, N, device=device) * 5
+    target_freq = torch.rand(B, N, device=device) * 20000 + 20
+    target_q = torch.rand(B, N, device=device) * 10 + 0.1
+    target_type = torch.randint(0, 5, (B, N), device=device)
+    target_H = torch.rand(B, N * 100 + 1, device=device) + 0.5
+
+    criterion = MultiTypeEQLoss(
+        lambda_gain=3.0, lambda_freq=1.0, lambda_q=0.5,
+        lambda_hmag=0.3, lambda_param=0.0,
+    ).to(device)
+    total_loss, components = criterion(
+        pred_gain, pred_freq, pred_q, pred_type, pred_H,
+        target_gain, target_freq, target_q, target_type, target_H,
+    )
+    print(f"Total loss: {total_loss.item():.4f}")
+    print(f"  loss_gain: {components['loss_gain'].item():.4f}")
+    print(f"  loss_freq: {components['loss_freq'].item():.4f}")
+    print(f"  loss_q: {components['loss_q'].item():.4f}")
+    assert 'loss_gain' in components
+    assert 'loss_freq' in components
+    assert 'loss_q' in components
+    print("Loss component split test PASSED")
+
+
+if __name__ == "__main__":
+    test_ste_clamp()
+    test_gain_mlp_gradient_flow()
+    test_loss_component_split()
+    print("\nAll remediation verification tests PASSED")

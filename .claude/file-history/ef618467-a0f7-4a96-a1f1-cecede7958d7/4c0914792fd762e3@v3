@@ -1,0 +1,476 @@
+"""
+Test the best checkpoint against ground truth audio.
+
+Loads a MUSDB18 test song, applies known multi-type EQ parameters,
+runs the trained model to predict those parameters, and compares:
+  - Predicted vs ground truth parameters (gain, freq, Q, type)
+  - Spectral reconstruction error (predicted H vs true H)
+  - Audio reconstruction quality (predicted EQ on dry vs true wet)
+  - Plots frequency response comparison
+
+Usage:
+  python test_checkpoint.py --checkpoint checkpoints/best.pt
+  python test_checkpoint.py --checkpoint checkpoints/best.pt --audio path/to/song.wav
+"""
+
+import argparse
+import math
+import sys
+import time
+from pathlib import Path
+
+import numpy as np
+import torch
+import torchaudio
+
+import matplotlib
+matplotlib.use("Agg")
+import matplotlib.pyplot as plt
+
+sys.path.append(str(Path(__file__).parent))
+
+from model_tcn import StreamingTCNModel
+from dsp_frontend import STFTFrontend
+from differentiable_eq import DifferentiableBiquadCascade, FILTER_NAMES
+
+SAMPLE_RATE = 44100
+N_FFT = 2048
+HOP_LENGTH = 512
+N_MELS = 128
+DURATION = 3.0
+NUM_BANDS = 5
+
+
+def apply_eq_numpy(waveform, gain_db, freq, q, filter_type, sr=44100):
+    """Apply a single biquad EQ band to a numpy waveform."""
+    ftype = FILTER_NAMES[filter_type]
+
+    if ftype == "peaking":
+        A = 10.0 ** (gain_db / 40.0)
+    elif ftype in ("lowshelf", "highshelf"):
+        A = 10.0 ** (gain_db / 40.0)
+    else:
+        A = 1.0
+
+    w0 = 2.0 * math.pi * freq / sr
+    alpha = math.sin(w0) / (2.0 * q)
+    sqA = math.sqrt(A) if A > 0 else 1.0
+
+    if ftype == "peaking":
+        b0 = 1.0 + alpha * A
+        b1 = -2.0 * math.cos(w0)
+        b2 = 1.0 - alpha * A
+        a0 = 1.0 + alpha / A
+        a1 = -2.0 * math.cos(w0)
+        a2 = 1.0 - alpha / A
+    elif ftype == "lowshelf":
+        b0 = A * ((A + 1) - (A - 1) * math.cos(w0) + 2 * sqA * alpha)
+        b1 = 2 * A * ((A - 1) - (A + 1) * math.cos(w0))
+        b2 = A * ((A + 1) - (A - 1) * math.cos(w0) - 2 * sqA * alpha)
+        a0 = (A + 1) + (A - 1) * math.cos(w0) + 2 * sqA * alpha
+        a1 = -2 * ((A - 1) + (A + 1) * math.cos(w0))
+        a2 = (A + 1) + (A - 1) * math.cos(w0) - 2 * sqA * alpha
+    elif ftype == "highshelf":
+        b0 = A * ((A + 1) + (A - 1) * math.cos(w0) + 2 * sqA * alpha)
+        b1 = -2 * A * ((A - 1) + (A + 1) * math.cos(w0))
+        b2 = A * ((A + 1) + (A - 1) * math.cos(w0) - 2 * sqA * alpha)
+        a0 = (A + 1) - (A - 1) * math.cos(w0) + 2 * sqA * alpha
+        a1 = 2 * ((A - 1) - (A + 1) * math.cos(w0))
+        a2 = (A + 1) - (A - 1) * math.cos(w0) - 2 * sqA * alpha
+    elif ftype == "highpass":
+        b0 = (1 + math.cos(w0)) / 2
+        b1 = -(1 + math.cos(w0))
+        b2 = (1 + math.cos(w0)) / 2
+        a0 = 1 + alpha
+        a1 = -2 * math.cos(w0)
+        a2 = 1 - alpha
+    elif ftype == "lowpass":
+        b0 = (1 - math.cos(w0)) / 2
+        b1 = 1 - math.cos(w0)
+        b2 = (1 - math.cos(w0)) / 2
+        a0 = 1 + alpha
+        a1 = -2 * math.cos(w0)
+        a2 = 1 - alpha
+    else:
+        return waveform
+
+    b = np.array([b0 / a0, b1 / a0, b2 / a0])
+    a = np.array([1.0, a1 / a0, a2 / a0])
+
+    from scipy.signal import lfilter
+    return lfilter(b, a, waveform)
+
+
+def apply_eq_cascade(waveform, params_list, sr=44100):
+    """Apply a cascade of EQ bands to a waveform."""
+    wet = waveform.copy()
+    for p in params_list:
+        wet = apply_eq_numpy(wet, p["gain"], p["freq"], p["q"], p["type"], sr)
+    return wet
+
+
+def build_mel_filterbank(n_fft, n_mels, sample_rate):
+    """Build mel filterbank matrix."""
+    n_freqs = n_fft // 2 + 1
+    f_min, f_max = 20.0, sample_rate / 2.0
+
+    def hz_to_mel(hz):
+        return 2595.0 * np.log10(1.0 + hz / 700.0)
+
+    def mel_to_hz(mel):
+        return 700.0 * (10.0 ** (mel / 2595.0) - 1.0)
+
+    f_min_mel = hz_to_mel(f_min)
+    f_max_mel = hz_to_mel(f_max)
+    mel_points = np.linspace(f_min_mel, f_max_mel, n_mels + 2)
+    hz_points = mel_to_hz(mel_points)
+    bin_points = ((n_fft + 1) * hz_points / sample_rate).astype(int)
+
+    fb = np.zeros((n_mels, n_freqs))
+    for i in range(n_mels):
+        f_left = bin_points[i]
+        f_center = bin_points[i + 1]
+        f_right = bin_points[i + 2]
+        for j in range(f_left, f_center):
+            if j < n_freqs and f_center > f_left:
+                fb[i, j] = (j - f_left) / (f_center - f_left)
+        for j in range(f_center, f_right):
+            if j < n_freqs and f_right > f_center:
+                fb[i, j] = (f_right - j) / (f_right - f_center)
+
+    return torch.tensor(fb, dtype=torch.float32)
+
+
+def audio_to_mel(audio_tensor, n_fft=2048, hop_length=512, n_mels=128, sr=44100):
+    """Convert audio tensor to log-mel spectrogram."""
+    mel_fb = build_mel_filterbank(n_fft, n_mels, sr)
+    window = torch.hann_window(n_fft)
+
+    stft = torch.stft(
+        audio_tensor.unsqueeze(0), n_fft, hop_length, n_fft,
+        window=window, return_complex=True,
+    )
+    mag = torch.abs(stft).squeeze(0)  # (F, T)
+    mel = mel_fb @ mag  # (n_mels, T)
+    mel = torch.clamp(mel, min=1e-8)
+    return torch.log(mel)
+
+
+def main():
+    parser = argparse.ArgumentParser(description="Test checkpoint against ground truth EQ")
+    parser.add_argument("--checkpoint", type=str, default="checkpoints/best.pt",
+                        help="Path to model checkpoint")
+    parser.add_argument("--config", type=str, default="conf/config_musdb_50k.yaml",
+                        help="Config YAML for model architecture")
+    parser.add_argument("--audio", type=str, default=None,
+                        help="Path to dry audio file (default: use MUSDB18 test)")
+    parser.add_argument("--duration", type=float, default=3.0,
+                        help="Audio clip duration in seconds")
+    parser.add_argument("--output_dir", type=str, default="test_checkpoint_output")
+    args = parser.parse_args()
+
+    import yaml
+    with open(args.config, "r") as f:
+        cfg = yaml.safe_load(f)
+
+    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    print(f"Device: {device}")
+
+    # Load checkpoint
+    print(f"\nLoading checkpoint: {args.checkpoint}")
+    ckpt = torch.load(args.checkpoint, map_location=device, weights_only=False)
+    state_dict = ckpt.get("model_state_dict", ckpt)
+    epoch = ckpt.get("epoch", "?")
+    val_loss = ckpt.get("val_loss", "?")
+    print(f"  Epoch: {epoch}, Val loss: {val_loss}")
+
+    # Build model
+    model = StreamingTCNModel(
+        n_mels=cfg["data"].get("n_mels", 128),
+        embedding_dim=cfg["model"]["encoder"].get("embedding_dim", 128),
+        num_bands=cfg["data"].get("num_bands", 5),
+        channels=cfg["model"]["encoder"].get("channels", 128),
+        num_blocks=cfg["model"]["encoder"].get("num_blocks", 4),
+        num_stacks=cfg["model"]["encoder"].get("num_stacks", 2),
+        sample_rate=cfg["data"].get("sample_rate", 44100),
+        n_fft=cfg["data"].get("n_fft", 2048),
+    ).to(device)
+
+    model.load_state_dict(state_dict)
+    model.eval()
+    print(f"  Parameters: {sum(p.numel() for p in model.parameters()):,}")
+
+    # Load dry audio
+    sr = cfg["data"]["sample_rate"]
+    n_fft = cfg["data"]["n_fft"]
+    n_mels = cfg["data"].get("n_mels", 128)
+    num_samples = int(args.duration * sr)
+
+    if args.audio:
+        dry_path = args.audio
+    else:
+        # Use first MUSDB18 test song
+        musdb_root = cfg["data"].get("musdb_root", "")
+        test_dir = Path(musdb_root) / "test"
+        songs = sorted([d for d in test_dir.iterdir() if d.is_dir()]) if test_dir.exists() else []
+        if not songs:
+            print("ERROR: No MUSDB18 test songs found")
+            return
+        dry_path = songs[0] / "mixture.wav"
+        print(f"Using MUSDB18 test song: {songs[0].name}")
+
+    print(f"Loading audio: {dry_path}")
+    waveform, file_sr = torchaudio.load(str(dry_path))
+    if file_sr != sr:
+        waveform = torchaudio.functional.resample(waveform, file_sr, sr)
+    if waveform.size(0) > 1:
+        waveform = waveform.mean(dim=0)
+    else:
+        waveform = waveform.squeeze(0)
+
+    # Random crop
+    if waveform.size(0) > num_samples:
+        start = torch.randint(0, waveform.size(0) - num_samples, (1,)).item()
+        waveform = waveform[start:start + num_samples]
+    elif waveform.size(0) < num_samples:
+        waveform = torch.nn.functional.pad(waveform, (0, num_samples - waveform.size(0)))
+
+    dry_audio = waveform.numpy()
+
+    # Define ground truth EQ parameters (5 bands with different types)
+    gt_params = [
+        {"gain": 6.0,  "freq": 200.0,  "q": 1.0, "type": 1},  # lowshelf +6dB at 200Hz
+        {"gain": -4.0, "freq": 800.0,  "q": 2.5, "type": 0},  # peaking -4dB at 800Hz
+        {"gain": 3.0,  "freq": 3000.0, "q": 1.5, "type": 0},  # peaking +3dB at 3kHz
+        {"gain": -2.0, "freq": 8000.0, "q": 0.8, "type": 2},  # highshelf -2dB at 8kHz
+        {"gain": 0.0,  "freq": 150.0,  "q": 0.7, "type": 3},  # highpass at 150Hz
+    ]
+    # Sort by frequency
+    gt_params.sort(key=lambda p: p["freq"])
+
+    print(f"\nGround truth EQ ({len(gt_params)} bands):")
+    print(f"  {'Band':<6} {'Type':<12} {'Gain':>8} {'Freq':>10} {'Q':>6}")
+    print(f"  {'-'*6} {'-'*12} {'-'*8} {'-'*10} {'-'*6}")
+    for i, p in enumerate(gt_params):
+        print(f"  {i:<6} {FILTER_NAMES[p['type']]:<12} {p['gain']:>+7.1f}dB {p['freq']:>9.1f}Hz {p['q']:>5.2f}")
+
+    # Apply ground truth EQ to dry audio
+    wet_audio = apply_eq_cascade(dry_audio, gt_params, sr)
+
+    # Convert wet audio to mel-spectrogram
+    wet_tensor = torch.from_numpy(wet_audio).float()
+    mel = audio_to_mel(wet_tensor, n_fft=n_fft, hop_length=HOP_LENGTH, n_mels=n_mels, sr=sr)
+    mel_input = mel.unsqueeze(0).to(device)  # (1, n_mels, T)
+
+    # Run model
+    print(f"\nRunning model inference...")
+    t0 = time.time()
+    with torch.no_grad():
+        output = model(mel_input)
+    t1 = time.time()
+
+    pred_gain = output["params"][0].cpu().squeeze(0)   # (num_bands,)
+    pred_freq = output["params"][1].cpu().squeeze(0)   # (num_bands,)
+    pred_q = output["params"][2].cpu().squeeze(0)      # (num_bands,)
+    pred_ftype = output["filter_type"].cpu().squeeze(0) # (num_bands,)
+    pred_type_logits = output["type_logits"].cpu().squeeze(0)  # (num_bands, 5)
+    pred_type_probs = output["type_probs"].cpu().squeeze(0)  # (num_bands, 5)
+    H_pred = output["H_mag"].cpu().squeeze(0)  # (n_fft//2+1,)
+
+    print(f"  Inference time: {(t1-t0)*1000:.1f}ms")
+    print(f"  Mel input shape: {mel_input.shape}")
+
+    # Print raw predictions
+    print(f"\nPredicted EQ ({len(gt_params)} bands, raw order):")
+    print(f"  {'Band':<6} {'Type':<12} {'Gain':>8} {'Freq':>10} {'Q':>6} {'Conf':>6}")
+    print(f"  {'-'*6} {'-'*12} {'-'*8} {'-'*10} {'-'*6} {'-'*6}")
+    for i in range(NUM_BANDS):
+        conf = pred_type_probs[i].max().item()
+        print(f"  {i:<6} {FILTER_NAMES[pred_ftype[i].item()]:<12} "
+              f"{pred_gain[i].item():>+7.1f}dB {pred_freq[i].item():>9.1f}Hz "
+              f"{pred_q[i].item():>5.2f} {conf:>5.1%}")
+
+    # Ground truth tensors
+    gt_gain = torch.tensor([p["gain"] for p in gt_params])
+    gt_freq = torch.tensor([p["freq"] for p in gt_params])
+    gt_q = torch.tensor([p["q"] for p in gt_params])
+    gt_ftype = torch.tensor([p["type"] for p in gt_params])
+
+    # --- Hungarian matching (same as training validation) ---
+    from loss_multitype import HungarianBandMatcher
+    matcher = HungarianBandMatcher(lambda_freq=1.0, lambda_q=0.5, lambda_type_match=0.5)
+    matched_gain, matched_freq, matched_q, matched_ftype = matcher(
+        pred_gain.unsqueeze(0), pred_freq.unsqueeze(0), pred_q.unsqueeze(0),
+        gt_gain.unsqueeze(0), gt_freq.unsqueeze(0), gt_q.unsqueeze(0),
+        target_filter_type=gt_ftype.unsqueeze(0),
+        pred_type_logits=pred_type_logits.unsqueeze(0),
+    )
+    matched_gain = matched_gain.squeeze(0)
+    matched_freq = matched_freq.squeeze(0)
+    matched_q = matched_q.squeeze(0)
+    matched_ftype = matched_ftype.squeeze(0)
+
+    print(f"\nHungarian-matched GT bands (reordered to match predictions):")
+    for i in range(NUM_BANDS):
+        print(f"  pred[{i}]: {FILTER_NAMES[pred_ftype[i].item()]:<12} {pred_gain[i]:>+7.1f}dB {pred_freq[i]:>9.1f}Hz  "
+              f"<->  gt: {FILTER_NAMES[matched_ftype[i].item()]:<12} {matched_gain[i]:>+7.1f}dB {matched_freq[i]:>9.1f}Hz")
+
+    # Compute per-band errors (matched)
+    gain_err = (pred_gain - matched_gain).abs()
+    freq_err_oct = torch.log2(pred_freq / (matched_freq + 1e-8)).abs()
+    q_err_dec = torch.log10(pred_q / (matched_q + 1e-8)).abs()
+    type_match = (pred_ftype == matched_ftype).float()
+
+    print(f"\nPer-band errors (Hungarian-matched):")
+    print(f"  {'Band':<6} {'Gain err':>10} {'Freq err':>12} {'Q err':>10} {'Type':>6}")
+    print(f"  {'-'*6} {'-'*10} {'-'*12} {'-'*10} {'-'*6}")
+    for i in range(NUM_BANDS):
+        print(f"  {i:<6} {gain_err[i].item():>+9.2f}dB {freq_err_oct[i].item():>10.3f}oct "
+              f"{q_err_dec[i].item():>8.3f}dec {'OK' if type_match[i].item() else 'WRONG':>6}")
+
+    print(f"\n  Mean Gain MAE:  {gain_err.mean().item():.2f} dB")
+    print(f"  Mean Freq MAE:  {freq_err_oct.mean().item():.3f} octaves")
+    print(f"  Mean Q MAE:     {q_err_dec.mean().item():.3f} decades")
+    print(f"  Type Accuracy:  {type_match.mean().item():.0%}")
+
+    # Compute ground truth H_mag for comparison
+    gt_gain_t = gt_gain.unsqueeze(0).to(device)
+    gt_freq_t = gt_freq.unsqueeze(0).to(device)
+    gt_q_t = gt_q.unsqueeze(0).to(device)
+    gt_ftype_t = gt_ftype.unsqueeze(0).to(device)
+
+    with torch.no_grad():
+        H_gt = model.dsp_cascade(gt_gain_t, gt_freq_t, gt_q_t, n_fft=n_fft,
+                                  filter_type=gt_ftype_t).cpu().squeeze(0)
+
+    # Spectral error
+    H_err_db = (20 * torch.log10(H_pred + 1e-8) - 20 * torch.log10(H_gt + 1e-8)).abs()
+    freqs = torch.linspace(0, sr / 2, H_gt.shape[0])
+
+    print(f"\n  Spectral MAE:   {H_err_db.mean().item():.2f} dB")
+    print(f"  Spectral Max:   {H_err_db.max().item():.2f} dB")
+
+    # Reconstruct audio from predicted EQ
+    pred_params = []
+    for i in range(NUM_BANDS):
+        pred_params.append({
+            "gain": pred_gain[i].item(),
+            "freq": pred_freq[i].item(),
+            "q": pred_q[i].item(),
+            "type": pred_ftype[i].item(),
+        })
+    pred_params.sort(key=lambda p: p["freq"])
+    recon_audio = apply_eq_cascade(dry_audio, pred_params, sr)
+
+    # Spectral distance between true wet and reconstructed
+    wet_spec = np.abs(np.fft.rfft(wet_audio))
+    recon_spec = np.abs(np.fft.rfft(recon_audio))
+    spec_dist_db = 20 * np.log10(np.maximum(wet_spec, 1e-8) / np.maximum(recon_spec, 1e-8) + 1e-8)
+    print(f"  Audio recon MADB: {np.abs(spec_dist_db).mean():.2f} dB")
+
+    # Save output audio
+    out_dir = Path(args.output_dir)
+    out_dir.mkdir(exist_ok=True)
+
+    torchaudio.save(str(out_dir / "dry.wav"), torch.from_numpy(dry_audio).unsqueeze(0), sr)
+    torchaudio.save(str(out_dir / "wet_gt.wav"), torch.from_numpy(wet_audio).unsqueeze(0).float(), sr)
+    torchaudio.save(str(out_dir / "wet_pred.wav"), torch.from_numpy(recon_audio).unsqueeze(0).float().clamp(-1, 1), sr)
+
+    print(f"\nSaved audio files to {out_dir}/")
+
+    # ===== PLOT =====
+    fig, axes = plt.subplots(2, 2, figsize=(16, 10))
+    fig.suptitle(f"Checkpoint Test (epoch {epoch}, val_loss={val_loss})\n"
+                 f"Audio: {Path(dry_path).stem}", fontsize=13, fontweight="bold")
+
+    # 1. Frequency response comparison
+    ax = axes[0, 0]
+    freq_axis = freqs.numpy()
+    H_gt_db = 20 * np.log10(H_gt.numpy() + 1e-8)
+    H_pred_db = 20 * np.log10(H_pred.numpy() + 1e-8)
+    ax.plot(freq_axis, H_gt_db, "b-", linewidth=2, label="Ground Truth", alpha=0.9)
+    ax.plot(freq_axis, H_pred_db, "r--", linewidth=2, label="Predicted", alpha=0.9)
+    ax.set_xscale("log")
+    ax.set_xlim(20, 20000)
+    ax.set_xlabel("Frequency (Hz)")
+    ax.set_ylabel("Magnitude (dB)")
+    ax.set_title("Frequency Response: GT vs Predicted")
+    ax.legend()
+    ax.grid(True, alpha=0.3)
+    ax.axhline(y=0, color="k", linewidth=0.5)
+
+    # 2. Spectral error
+    ax = axes[0, 1]
+    ax.plot(freq_axis, H_err_db.numpy(), "r-", linewidth=1)
+    ax.fill_between(freq_axis, 0, H_err_db.numpy(), alpha=0.3, color="red")
+    ax.set_xscale("log")
+    ax.set_xlim(20, 20000)
+    ax.set_xlabel("Frequency (Hz)")
+    ax.set_ylabel("|Error| (dB)")
+    ax.set_title(f"Spectral Error (MAE={H_err_db.mean():.2f} dB)")
+    ax.grid(True, alpha=0.3)
+
+    # 3. Parameter comparison bar chart
+    ax = axes[1, 0]
+    x = np.arange(NUM_BANDS)
+    width = 0.35
+    ax.bar(x - width/2, gt_gain.numpy(), width, label="GT Gain", color="blue", alpha=0.7)
+    ax.bar(x + width/2, pred_gain.numpy(), width, label="Pred Gain", color="red", alpha=0.7)
+    ax.set_xlabel("Band")
+    ax.set_ylabel("Gain (dB)")
+    ax.set_title("Gain: GT vs Predicted")
+    ax.legend()
+    ax.grid(True, alpha=0.3, axis="y")
+    ax.axhline(y=0, color="k", linewidth=0.5)
+
+    # Add type labels
+    for i in range(NUM_BANDS):
+        gt_label = FILTER_NAMES[gt_ftype[i].item()][:4]
+        pred_label = FILTER_NAMES[pred_ftype[i].item()][:4]
+        color = "green" if gt_ftype[i] == pred_ftype[i] else "red"
+        ax.text(i, max(gt_gain[i].item(), pred_gain[i].item()) + 1,
+                f"{gt_label}/{pred_label}", ha="center", fontsize=7, color=color)
+
+    # 4. Spectrogram comparison
+    ax = axes[1, 1]
+    ax.specgram(wet_audio, Fs=sr, NFFT=512, noverlap=384, cmap="viridis", alpha=0.6,
+                label="GT wet")
+    ax.specgram(recon_audio, Fs=sr, NFFT=512, noverlap=384, cmap="magma", alpha=0.4,
+                label="Pred wet")
+    ax.set_xlabel("Time (s)")
+    ax.set_ylabel("Frequency (Hz)")
+    ax.set_title("Spectrogram: GT (viridis) vs Pred (magma)")
+    ax.set_ylim(0, sr / 2)
+
+    plt.tight_layout()
+    plot_path = out_dir / "checkpoint_test_results.png"
+    plt.savefig(str(plot_path), dpi=150, bbox_inches="tight")
+    print(f"Saved plot: {plot_path}")
+
+    # ===== Summary =====
+    print(f"\n{'='*60}")
+    print(f"CHECKPOINT TEST SUMMARY")
+    print(f"{'='*60}")
+    print(f"  Checkpoint:     {args.checkpoint} (epoch {epoch})")
+    print(f"  Audio source:   {Path(dry_path).name}")
+    print(f"  EQ bands:       {NUM_BANDS}")
+    print(f"  Gain MAE:       {gain_err.mean().item():.2f} dB")
+    print(f"  Freq MAE:       {freq_err_oct.mean().item():.3f} octaves")
+    print(f"  Q MAE:          {q_err_dec.mean().item():.3f} decades")
+    print(f"  Type accuracy:  {type_match.mean().item():.0%}")
+    print(f"  Spectral MAE:   {H_err_db.mean().item():.2f} dB")
+    print(f"  Audio recon:    {np.abs(spec_dist_db).mean():.2f} dB MADB")
+    print(f"{'='*60}")
+
+    return {
+        "gain_mae": gain_err.mean().item(),
+        "freq_mae": freq_err_oct.mean().item(),
+        "q_mae": q_err_dec.mean().item(),
+        "type_acc": type_match.mean().item(),
+        "spectral_mae": H_err_db.mean().item(),
+        "audio_madb": np.abs(spec_dist_db).mean(),
+    }
+
+
+if __name__ == "__main__":
+    main()

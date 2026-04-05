@@ -1,13 +1,14 @@
 {
   "env": {
     "CLAUDE_CODE_EXPERIMENTAL_AGENT_TEAMS": "1",
-    "ANTHROPIC_AUTH_TOKEN": "64319a76d63f45f09cdeeebe95273bf3.IrmXRQY9oVwHVuOq",
-    "ANTHROPIC_BASE_URL": "https://api.z.ai/api/anthropic",
-    "API_TIMEOUT_MS": "3000000",
-    "ANTHROPIC_DEFAULT_HAIKU_MODEL": "glm-4.7-flash",
-      "ANTHROPIC_DEFAULT_SONNET_MODEL": "glm-5.1",
-      "ANTHROPIC_DEFAULT_OPUS_MODEL": "glm-5.1",
     "CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC": "1"
+  },
+  "permissions": {
+    "allow": [
+      "Read(//tmp/**)",
+      "Bash(ls /tmp/*.log)",
+      "Bash(kill 216537)"
+    ]
   },
   "enabledPlugins": {
     "superpowers@claude-plugins-official": true,

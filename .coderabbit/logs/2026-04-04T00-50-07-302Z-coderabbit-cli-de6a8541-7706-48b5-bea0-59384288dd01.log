@@ -1,2 +1,0 @@
-{"timestamp":"2026-04-04T00:50:07.351Z","level":"INFO","message":"Starting CodeRabbit CLI v0.4.0","namespace":"init"}
-{"timestamp":"2026-04-04T00:50:07.368Z","level":"INFO","message":"initiating graceful exit","namespace":"init","code":0,"signal":null}

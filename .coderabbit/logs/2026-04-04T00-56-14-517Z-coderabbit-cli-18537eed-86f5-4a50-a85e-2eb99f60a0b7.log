@@ -1,3 +1,0 @@
-{"timestamp":"2026-04-04T00:56:14.565Z","level":"INFO","message":"Starting CodeRabbit CLI v0.4.0","namespace":"init"}
-{"timestamp":"2026-04-04T00:56:14.574Z","level":"WARN","message":"Failed to retrieve tokens from credential storage for linux, checking file: Cannot autolaunch D-Bus without X11 $DISPLAY","namespace":"storage.auth"}
-{"timestamp":"2026-04-04T00:56:14.583Z","level":"INFO","message":"initiating graceful exit","namespace":"init","code":0,"signal":null}

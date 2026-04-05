@@ -1,0 +1,11 @@
+{
+  "prObjectives": "Title: \nNumber: 0\nURL: vscode://https://github.com/ahmedarafa994/insight.git\nUser: cli/95274f34bd3940838bac080542b539a9\nSource branch: vscode-changes\nTarget branch: main\nStatus: open\nReviewers: \nLabels: \nCreated at: 2026-04-04T01:03:12.627Z",
+  "rawSummaryMap": {
+    "CLAUDE.md": "## AI-generated summary of changes\n\nAdded a new `CLAUDE.md` file to the repository. The file currently contains only a single blank line and no additional content or logic.\n\n\n\n## Alterations to the declarations of exported or public entities\n\n- None (new file contains no exported/public code entities).\n\nEstimated code review effort: Low"
+  },
+  "rawSummary": "CLAUDE.md:\n\"\"\"\n## AI-generated summary of changes\n\nAdded a new `CLAUDE.md` file to the repository. The file currently contains only a single blank line and no additional content or logic.\n\n\n\n## Alterations to the declarations of exported or public entities\n\n- None (new file contains no exported/public code entities).\n\nEstimated code review effort: Low\n\"\"\"",
+  "reviewedCommitIds": [
+    "bcc374e88188ca8c4140bcc0b8cb21bf6f9c5676"
+  ],
+  "crReviewed": true
+}

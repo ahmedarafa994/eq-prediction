@@ -1,0 +1,745 @@
+"""
+Training script for the multi-type IDSP EQ Estimator.
+
+Uses StreamingTCNModel with MultiTypeEQLoss (Hungarian matching,
+permutation-invariant parameter regression, type classification).
+On-the-fly synthetic multi-type data generation.
+
+Optimization features (QLoRA/Unsloth/DeepSpeed-inspired):
+  - 8-bit AdamW optimizer (bitsandbytes) for reduced memory
+  - torch.compile for graph-level optimization
+  - Gradient checkpointing for TCN stacks
+  - Fused Triton kernels for gated activation
+  - DeepSpeed ZeRO-2 integration for multi-GPU
+  - Pin memory + async GPU transfer
+  - Precomputed dataset caching to disk
+"""
+
+import torch
+import torch.nn as nn
+from torch.utils.data import DataLoader, random_split
+from model_tcn import StreamingTCNModel
+from dsp_frontend import STFTFrontend
+from loss_multitype import MultiTypeEQLoss, HungarianBandMatcher
+from dataset import SyntheticEQDataset, collate_fn
+import yaml
+from pathlib import Path
+import time
+import json
+import math
+import os
+from contextlib import nullcontext
+
+try:
+    import bitsandbytes as bnb
+
+    HAS_BITSANDBYTES = True
+except ImportError:
+    HAS_BITSANDBYTES = False
+
+try:
+    import deepspeed
+
+    HAS_DEEPSPEED = True
+except ImportError:
+    HAS_DEEPSPEED = False
+
+
+def load_config(path="conf/config.yaml"):
+    with open(path, "r") as f:
+        return yaml.safe_load(f)
+
+
+class Trainer:
+    def __init__(self, config_path="conf/config.yaml"):
+        self.cfg = load_config(config_path)
+        self.device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+
+        data_cfg = self.cfg["data"]
+        model_cfg = self.cfg["model"]
+        loss_cfg = self.cfg["loss"]
+        trainer_cfg = self.cfg["trainer"]
+
+        self.num_bands = data_cfg["num_bands"]
+        self.sample_rate = data_cfg["sample_rate"]
+        self.max_epochs = trainer_cfg["max_epochs"]
+        self.log_every = trainer_cfg["log_every_n_steps"]
+        self.n_fft = data_cfg.get("n_fft", 2048)
+
+        # Optimization flags from config
+        self.use_8bit_optimizer = (
+            trainer_cfg.get("use_8bit_optimizer", False) and HAS_BITSANDBYTES
+        )
+        self.use_torch_compile = trainer_cfg.get("use_torch_compile", False)
+        self.use_gradient_checkpointing = trainer_cfg.get(
+            "use_gradient_checkpointing", False
+        )
+        self.use_activation_quantization = trainer_cfg.get(
+            "use_activation_quantization", False
+        )
+        self.use_deepspeed = trainer_cfg.get("use_deepspeed", False) and HAS_DEEPSPEED
+        self.precompute_cache_path = trainer_cfg.get("precompute_cache_path", None)
+
+        if self.use_8bit_optimizer:
+            print("  [opt] Using 8-bit AdamW optimizer (bitsandbytes)")
+        if self.use_torch_compile:
+            print("  [opt] Using torch.compile for graph optimization")
+        if self.use_gradient_checkpointing:
+            print("  [opt] Using gradient checkpointing for TCN stacks")
+        if self.use_activation_quantization:
+            print("  [opt] Using INT8 activation quantization")
+        if self.use_deepspeed:
+            print("  [opt] Using DeepSpeed ZeRO-2 optimization")
+
+        # Dataset with precomputed mel-spectrograms
+        dataset_size = data_cfg.get("dataset_size", 30000)
+        self.train_dataset = SyntheticEQDataset(
+            num_bands=self.num_bands,
+            sample_rate=self.sample_rate,
+            duration=1.5,
+            n_fft=self.n_fft,
+            size=dataset_size,
+            gain_range=tuple(data_cfg["gain_bounds"]),
+            freq_range=tuple(data_cfg["freq_bounds"]),
+            q_range=tuple(data_cfg["q_bounds"]),
+            type_weights=data_cfg.get("type_weights", None),
+            precompute_mels=True,
+            n_mels=data_cfg.get("n_mels", 128),
+        )
+
+        # Try loading precomputed cache from disk
+        if self.precompute_cache_path and self.train_dataset.load_precomputed(
+            self.precompute_cache_path
+        ):
+            print(f"  [data] Loaded cached dataset from {self.precompute_cache_path}")
+        else:
+            # Precompute all samples with mel-spectrograms upfront
+            self.train_dataset.precompute()
+            # Save cache if path specified
+            if self.precompute_cache_path:
+                self.train_dataset.save_precomputed(self.precompute_cache_path)
+
+        # Fixed validation dataset — generated once with full type distribution (global
+        # type_weights), never regenerated at stage transitions. This ensures val metrics
+        # are comparable across the entire run even as the training distribution changes.
+        val_dataset_size = data_cfg.get("val_dataset_size", 2000)
+        self.val_dataset = SyntheticEQDataset(
+            num_bands=self.num_bands,
+            sample_rate=self.sample_rate,
+            duration=1.5,
+            n_fft=self.n_fft,
+            size=val_dataset_size,
+            gain_range=tuple(data_cfg["gain_bounds"]),
+            freq_range=tuple(data_cfg["freq_bounds"]),
+            q_range=tuple(data_cfg["q_bounds"]),
+            type_weights=data_cfg.get("type_weights", None),
+            precompute_mels=True,
+            n_mels=data_cfg.get("n_mels", 128),
+        )
+        self.val_dataset.precompute()
+
+        # Train split: fold val portion into training since we have a separate val set.
+        n_train = int(len(self.train_dataset) * (data_cfg["train_split"] + data_cfg["val_split"]))
+        n_test = len(self.train_dataset) - n_train
+        self.train_set, self.test_set = random_split(
+            self.train_dataset,
+            [n_train, n_test],
+            generator=torch.Generator().manual_seed(42),
+        )
+
+        # Pin memory for async GPU transfer
+        pin_memory = self.device.type == "cuda"
+        num_workers = data_cfg.get("num_workers", 0)
+
+        self.train_loader = DataLoader(
+            self.train_set,
+            batch_size=data_cfg["batch_size"],
+            shuffle=True,
+            num_workers=num_workers,
+            collate_fn=collate_fn,
+            pin_memory=pin_memory,
+            drop_last=True,
+            prefetch_factor=2 if num_workers > 0 else None,
+        )
+        self.val_loader = DataLoader(
+            self.val_dataset,
+            batch_size=data_cfg["batch_size"],
+            shuffle=False,
+            num_workers=num_workers,
+            collate_fn=collate_fn,
+            pin_memory=pin_memory,
+            prefetch_factor=2 if num_workers > 0 else None,
+        )
+
+        # Model
+        enc_cfg = model_cfg.get("encoder", {})
+        self.model = StreamingTCNModel(
+            n_mels=data_cfg.get("n_mels", 128),
+            embedding_dim=enc_cfg.get("embedding_dim", 128),
+            num_bands=self.num_bands,
+            channels=enc_cfg.get("channels", 128),
+            num_blocks=enc_cfg.get("num_blocks", 4),
+            num_stacks=enc_cfg.get("num_stacks", 2),
+            sample_rate=self.sample_rate,
+            n_fft=self.n_fft,
+        ).to(self.device)
+
+        # STFT frontend
+        self.frontend = STFTFrontend(
+            n_fft=self.n_fft,
+            hop_length=data_cfg.get("hop_length", 256),
+            win_length=self.n_fft,
+            mel_bins=data_cfg.get("n_mels", 128),
+            sample_rate=self.sample_rate,
+        ).to(self.device)
+
+        # Loss
+        self.criterion = MultiTypeEQLoss(
+            n_fft=self.n_fft,
+            sample_rate=self.sample_rate,
+            lambda_param=loss_cfg.get("lambda_param", 0.0),
+            lambda_gain=loss_cfg.get("lambda_gain", 3.0),
+            lambda_freq=loss_cfg.get("lambda_freq", 1.0),
+            lambda_q=loss_cfg.get("lambda_q", 0.5),
+            lambda_type=loss_cfg.get("lambda_type", 0.5),
+            lambda_spectral=loss_cfg.get("lambda_spectral", 1.0),
+            lambda_hmag=loss_cfg.get("lambda_hmag", 0.3),
+            lambda_activity=loss_cfg.get("lambda_activity", 0.1),
+            lambda_spread=loss_cfg.get("lambda_spread", 0.05),
+            lambda_embed_var=loss_cfg.get("lambda_embed_var", 0.3),
+            lambda_contrastive=loss_cfg.get("lambda_contrastive", 0.05),
+            lambda_type_match=loss_cfg.get("lambda_type_match", 0.5),
+            embed_var_threshold=loss_cfg.get("embed_var_threshold", 0.1),
+        )
+
+        # Hungarian matcher for fair validation metrics (matches target ordering to predictions)
+        self.matcher = HungarianBandMatcher(lambda_freq=1.0, lambda_q=0.5, lambda_type_match=0.5)
+
+        # Optimizer: per-group learning rates to handle the ~17,000x gradient imbalance
+        # between the mel_cnn encoder (large grads) and gain_mlp head (tiny grads).
+        base_lr = model_cfg["learning_rate"]
+        wd = model_cfg["weight_decay"]
+
+        # Classify parameters: encoder backbone gets base_lr, param head gets 5x higher
+        encoder_params = []
+        head_params = []
+        for name, param in self.model.named_parameters():
+            if not param.requires_grad:
+                continue
+            if "param_head" in name:
+                head_params.append(param)
+            else:
+                encoder_params.append(param)
+
+        param_groups = [
+            {"params": encoder_params, "lr": base_lr, "weight_decay": wd, "initial_lr": base_lr},
+            {"params": head_params, "lr": base_lr * 5.0, "weight_decay": wd, "initial_lr": base_lr * 5.0},
+        ]
+
+        if self.use_8bit_optimizer:
+            self.optimizer = bnb.optim.AdamW8bit(param_groups)
+        else:
+            self.optimizer = torch.optim.AdamW(param_groups)
+        self.scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(
+            self.optimizer, T_max=self.max_epochs, eta_min=1e-6
+        )
+
+        # LR warmup: linear warmup over first 500 steps, then hand off to CosineAnnealing
+        warmup_steps = 500
+        warmup_scheduler = torch.optim.lr_scheduler.LinearLR(
+            self.optimizer, start_factor=1e-3, end_factor=1.0, total_iters=warmup_steps
+        )
+        self.scheduler = torch.optim.lr_scheduler.SequentialLR(
+            self.optimizer,
+            schedulers=[warmup_scheduler, self.scheduler],
+            milestones=[warmup_steps],
+        )
+
+        self.gradient_accumulation_steps = trainer_cfg.get(
+            "gradient_accumulation_steps", 1
+        )
+        self.global_step = 0
+        self.best_val_loss = float("inf")
+        self.history = []
+
+        # bf16-mixed precision: autocast context (no GradScaler needed for bf16)
+        self.use_bf16 = trainer_cfg.get("precision", "").lower() == "bf16-mixed"
+        if self.use_bf16:
+            device_type = "cuda" if self.device.type == "cuda" else "cpu"
+            self.autocast_ctx = torch.autocast(device_type, dtype=torch.bfloat16)
+        else:
+            self.autocast_ctx = nullcontext()
+
+        # Curriculum stages from config
+        self.curriculum_stages = self.cfg.get("curriculum", {}).get("stages", [])
+        self._current_stage_idx = -1
+
+        # Per-stage LR warmup state
+        self._stage_warmup_active = False
+        self._stage_warmup_step_count = 0
+        self._target_type_weights = None
+
+        # DeepSpeed initialization
+        if self.use_deepspeed:
+            ds_config_path = trainer_cfg.get(
+                "deepspeed_config", "conf/deepspeed_config.json"
+            )
+            if os.path.exists(ds_config_path):
+                with open(ds_config_path, "r") as f:
+                    ds_config = json.load(f)
+                self.model, self.optimizer, _, _ = deepspeed.initialize(
+                    model=self.model,
+                    optimizer=self.optimizer,
+                    config=ds_config,
+                )
+                print(f"  [opt] DeepSpeed initialized with config: {ds_config_path}")
+            else:
+                print(
+                    f"  [opt] WARNING: DeepSpeed config not found at {ds_config_path}, disabling"
+                )
+                self.use_deepspeed = False
+
+        # torch.compile after DeepSpeed init to avoid conflicts
+        if self.use_torch_compile:
+            self.model = torch.compile(self.model)
+            print("  [opt] torch.compile applied to model")
+
+    def _prepare_input(self, batch):
+        """Get mel-spectrogram from precomputed cache or compute on-the-fly."""
+        if "wet_mel" in batch:
+            # Use precomputed mel-spectrogram
+            return batch["wet_mel"].to(self.device, non_blocking=True)
+        # Fallback: compute from audio
+        wet_audio = batch["wet_audio"].to(self.device, non_blocking=True)
+        mel_spec = self.frontend.mel_spectrogram(wet_audio)
+        return mel_spec.squeeze(1)
+
+    def train_one_epoch(self, epoch):
+        self.model.train()
+        epoch_loss = 0.0
+        n_batches = 0
+        n_nan_batches = 0
+
+        # Accumulate per-component losses for epoch-level logging
+        component_accum = {}
+
+        self.optimizer.zero_grad(set_to_none=True)
+
+        for batch_idx, batch in enumerate(self.train_loader):
+            mel_frames = self._prepare_input(batch)
+            target_gain = batch["gain"].to(self.device, non_blocking=True)
+            target_freq = batch["freq"].to(self.device, non_blocking=True)
+            target_q = batch["q"].to(self.device, non_blocking=True)
+            target_ft = batch["filter_type"].to(self.device, non_blocking=True)
+
+            # Forward (wrapped in autocast for bf16-mixed precision)
+            with self.autocast_ctx:
+                output = self.model(mel_frames)
+                pred_gain, pred_freq, pred_q = output["params"]
+
+                # Ground truth frequency response
+                target_H_mag = self.model.dsp_cascade(
+                    target_gain,
+                    target_freq,
+                    target_q,
+                    n_fft=self.n_fft,
+                    filter_type=target_ft,
+                )
+
+                # Use soft-typed H_mag with gain detached for spectral loss.
+                # Hard-typed dsp_cascade uses nested torch.where which produces
+                # NaN gradients — non-selected branches still propagate NaN through
+                # the backward pass (0 * NaN = NaN in gradient accumulation).
+                # forward_soft blends coefficients via type_probs, giving clean
+                # gradients. Gain is detached so hmag_loss only trains
+                # freq/Q/type — gain learns purely from the Huber regression term.
+                pred_H_mag_for_loss = self.model.dsp_cascade.forward_soft(
+                    pred_gain.detach(),
+                    pred_freq,
+                    pred_q,
+                    output["type_probs"],
+                    self.n_fft,
+                )
+
+                # Loss (pass embedding for anti-collapse regularization)
+                total_loss, components = self.criterion(
+                    pred_gain,
+                    pred_freq,
+                    pred_q,
+                    output["type_logits"],
+                    pred_H_mag_for_loss,
+                    target_gain,
+                    target_freq,
+                    target_q,
+                    target_ft,
+                    target_H_mag,
+                    embedding=output["embedding"],
+                )
+
+            # Skip batch if loss is NaN (from early training instability)
+            if not torch.isfinite(total_loss):
+                self.optimizer.zero_grad(set_to_none=True)
+                n_nan_batches += 1
+                if n_nan_batches >= 10:
+                    print(
+                        f"  [train] WARNING: {n_nan_batches} NaN batches in epoch {epoch}, stopping epoch early"
+                    )
+                    break
+                continue
+
+            # Scale loss for gradient accumulation
+            scaled_loss = total_loss / self.gradient_accumulation_steps
+
+            if self.use_deepspeed:
+                self.model.backward(scaled_loss)
+            else:
+                scaled_loss.backward()
+
+            if (batch_idx + 1) % self.gradient_accumulation_steps == 0:
+                if not self.use_deepspeed:
+                    grad_norm = torch.nn.utils.clip_grad_norm_(
+                        self.model.parameters(), max_norm=1.0
+                    )
+                    if not torch.isfinite(grad_norm):
+                        self.optimizer.zero_grad(set_to_none=True)
+                        n_nan_batches += 1
+                        continue
+
+                    # Per-parameter gradient norm monitoring (logged every N steps)
+                    if self.global_step % self.log_every == 0:
+                        grad_parts = []
+                        for name, param in self.model.named_parameters():
+                            if param.grad is not None and param.grad.norm() > 0:
+                                if "gain" in name:
+                                    grad_parts.append(
+                                        ("gain", param.grad.norm().item())
+                                    )
+                                elif "freq" in name or "log_freq" in name:
+                                    grad_parts.append(
+                                        ("freq", param.grad.norm().item())
+                                    )
+                                elif "q_head" in name:
+                                    grad_parts.append(("q", param.grad.norm().item()))
+                                elif "classif" in name or "type" in name:
+                                    grad_parts.append(
+                                        ("type", param.grad.norm().item())
+                                    )
+                        if grad_parts:
+                            grouped = {}
+                            for k, v in grad_parts:
+                                grouped.setdefault(k, []).append(v)
+                            avg_grads = {k: sum(v) / len(v) for k, v in grouped.items()}
+                            grad_str = " | ".join(
+                                f"grad_{k}={v:.4f}"
+                                for k, v in sorted(avg_grads.items())
+                            )
+                            print(f"  [grads] step={self.global_step} {grad_str}")
+
+                    self.optimizer.step()
+                else:
+                    self.model.step()
+
+                self.optimizer.zero_grad(set_to_none=True)
+                self.global_step += 1
+
+                # Stage warmup: linearly ramp LR from start to target over N steps
+                if self._stage_warmup_active:
+                    self._stage_warmup_step_count += 1
+                    progress = min(1.0, self._stage_warmup_step_count / max(self._stage_warmup_steps, 1))
+                    for pg_idx, pg in enumerate(self.optimizer.param_groups):
+                        start_lr = self._stage_warmup_start_lrs[pg_idx]
+                        target_lr = self._stage_warmup_target_lrs[pg_idx]
+                        pg["lr"] = start_lr + (target_lr - start_lr) * progress
+                    if progress >= 1.0:
+                        self._stage_warmup_active = False
+
+            epoch_loss += total_loss.item()
+            n_batches += 1
+
+            # Accumulate per-component losses
+            for k, v in components.items():
+                val = v.item() if isinstance(v, torch.Tensor) else v
+                component_accum[k] = component_accum.get(k, 0.0) + val
+
+            if self.global_step % self.log_every == 0:
+                lr = self.optimizer.param_groups[0]["lr"]
+                parts = [
+                    f"step={self.global_step} loss={total_loss.item():.4f} lr={lr:.2e}"
+                ]
+                for k, v in components.items():
+                    parts.append(f"{k}={v:.4f}")
+                # Log embedding variance diagnostic (monitors anti-collapse health)
+                if "embed_var_loss" in components:
+                    embed_var = output["embedding"].var(dim=0).mean().item()
+                    parts.append(f"embed_var={embed_var:.4f}")
+                print(f"  [train] " + " | ".join(parts))
+
+        if n_nan_batches > 0:
+            print(f"  [train] Epoch {epoch}: {n_nan_batches} NaN batches skipped")
+
+        # Per-component epoch averages
+        if n_batches > 0:
+            comp_strs = []
+            for k in sorted(component_accum.keys()):
+                avg = component_accum[k] / n_batches
+                comp_strs.append(f"{k}={avg:.4f}")
+            print(f"  [train] Epoch {epoch} components: " + " | ".join(comp_strs))
+
+        return epoch_loss / max(n_batches, 1)
+
+    @torch.no_grad()
+    def validate(self, epoch):
+        self.model.eval()
+        val_loss = 0.0
+        n_batches = 0
+        param_maes = {"gain": [], "gain_raw": [], "freq": [], "q": [], "type_acc": []}
+
+        for batch in self.val_loader:
+            mel_frames = self._prepare_input(batch)
+            target_gain = batch["gain"].to(self.device, non_blocking=True)
+            target_freq = batch["freq"].to(self.device, non_blocking=True)
+            target_q = batch["q"].to(self.device, non_blocking=True)
+            target_ft = batch["filter_type"].to(self.device, non_blocking=True)
+
+            with self.autocast_ctx:
+                output = self.model(mel_frames)
+                pred_gain, pred_freq, pred_q = output["params"]
+
+                target_H_mag = self.model.dsp_cascade(
+                    target_gain,
+                    target_freq,
+                    target_q,
+                    n_fft=self.n_fft,
+                    filter_type=target_ft,
+                )
+
+                total_loss, _ = self.criterion(
+                    pred_gain,
+                    pred_freq,
+                    pred_q,
+                    output["type_logits"],
+                    output["H_mag"],
+                    target_gain,
+                    target_freq,
+                    target_q,
+                    target_ft,
+                    target_H_mag,
+                    embedding=output["embedding"],
+                )
+
+            val_loss += total_loss.item()
+            n_batches += 1
+
+            # Hungarian matching for fair MAE computation — also matches filter types
+            # so type_acc is compared against the correctly-permuted ground truth.
+            matched_gain, matched_freq, matched_q, matched_ft = self.matcher(
+                pred_gain, pred_freq, pred_q, target_gain, target_freq, target_q,
+                target_filter_type=target_ft,
+                pred_type_logits=output["type_logits"],
+            )
+
+            # Metrics (matched = fair, raw = for comparison)
+            param_maes["gain"].append((pred_gain - matched_gain).abs().mean().item())
+            param_maes["gain_raw"].append((pred_gain - target_gain).abs().mean().item())
+            param_maes["freq"].append(
+                (torch.log2(pred_freq / (matched_freq + 1e-8))).abs().mean().item()
+            )
+            param_maes["q"].append(
+                (torch.log10(pred_q / (matched_q + 1e-8))).abs().mean().item()
+            )
+            param_maes["type_acc"].append(
+                (output["filter_type"] == matched_ft).float().mean().item()
+            )
+
+        avg_val_loss = val_loss / max(n_batches, 1)
+        metrics = {k: sum(v) / len(v) for k, v in param_maes.items() if v}
+
+        print(
+            f"  [val] epoch={epoch} val_loss={avg_val_loss:.4f} "
+            f"gain_mae={metrics.get('gain', 0):.2f}dB "
+            f"gain_raw={metrics.get('gain_raw', 0):.2f}dB "
+            f"freq_mae={metrics.get('freq', 0):.3f}oct "
+            f"q_mae={metrics.get('q', 0):.3f}dec "
+            f"type_acc={metrics.get('type_acc', 0):.1%}"
+        )
+        return avg_val_loss, metrics
+
+    def save_checkpoint(self, epoch, val_loss, is_best=False):
+        ckpt_dir = Path("checkpoints")
+        ckpt_dir.mkdir(exist_ok=True)
+
+        if self.use_deepspeed:
+            # DeepSpeed handles checkpointing
+            ckpt_path = ckpt_dir / f"epoch_{epoch:03d}"
+            self.model.save_checkpoint(str(ckpt_path), tag=f"epoch_{epoch}")
+            if is_best:
+                self.model.save_checkpoint(str(ckpt_dir / "best"), tag="best")
+        else:
+            state = {
+                "epoch": epoch,
+                "model_state_dict": self.model.state_dict(),
+                "optimizer_state_dict": self.optimizer.state_dict(),
+                "val_loss": val_loss,
+                "global_step": self.global_step,
+            }
+            path = ckpt_dir / f"epoch_{epoch:03d}.pt"
+            torch.save(state, path)
+            if is_best:
+                best_path = ckpt_dir / "best.pt"
+                torch.save(state, best_path)
+            print(f"  Saved checkpoint: {path}" + (" (best)" if is_best else ""))
+
+    def _has_nan_weights(self):
+        """Check if any model parameter contains NaN."""
+        for p in self.model.parameters():
+            if not torch.isfinite(p).all():
+                return True
+        return False
+
+    def _update_type_transition(self, epoch):
+        """No-op: data distribution stays fixed across stages."""
+        pass
+
+    def _apply_curriculum_stage(self, epoch):
+        """Determine and apply curriculum stage based on epoch number."""
+        # Handle gradual type weight transition at the start of each epoch
+        self._update_type_transition(epoch)
+
+        if not self.curriculum_stages:
+            return
+
+        # Determine stage from cumulative epoch boundaries
+        cumulative = 0
+        stage_idx = 0
+        stage_start_epoch = 0
+        for i, stage in enumerate(self.curriculum_stages):
+            prev_cumulative = cumulative
+            cumulative += stage["epochs"]
+            if epoch <= cumulative:
+                stage_idx = i
+                stage_start_epoch = prev_cumulative + 1
+                break
+        else:
+            stage_idx = len(self.curriculum_stages) - 1
+
+        # Skip if stage hasn't changed (but still do intra-stage annealing)
+        stage = self.curriculum_stages[stage_idx]
+        stage_epochs = stage["epochs"]
+
+        # Intra-stage Gumbel temperature annealing
+        target_tau = stage.get("gumbel_temperature", 1.0)
+        epoch_in_stage = epoch - stage_start_epoch
+        if stage_idx > 0:
+            prev_tau = self.curriculum_stages[stage_idx - 1].get(
+                "gumbel_temperature", 1.0
+            )
+        else:
+            prev_tau = 1.0
+
+        # Smooth linear annealing from prev_tau to target_tau within stage
+        progress = epoch_in_stage / max(stage_epochs - 1, 1)
+        current_tau = prev_tau + (target_tau - prev_tau) * progress
+        current_tau = max(current_tau, 0.1)  # floor — prevent vanishing gradients
+        self.model.param_head.gumbel_temperature.fill_(current_tau)
+
+        # Only re-precompute data when stage changes
+        if stage_idx == self._current_stage_idx:
+            return
+
+        self._current_stage_idx = stage_idx
+
+        # Per-stage LR warmup: restore LR to fraction of initial, short linear warmup
+        stage_lr_scale = stage.get("learning_rate_scale", 0.3)
+        for pg in self.optimizer.param_groups:
+            pg["lr"] = pg.get("initial_lr", pg["lr"]) * stage_lr_scale
+        self._stage_warmup_active = True
+        self._stage_warmup_steps = 200
+        self._stage_warmup_step_count = 0
+        self._stage_warmup_start_lrs = [pg["lr"] for pg in self.optimizer.param_groups]
+        self._stage_warmup_target_lrs = [pg.get("initial_lr", pg["lr"]) for pg in self.optimizer.param_groups]
+
+        # Apply per-stage loss weight overrides (NO data re-precompute)
+        # The curriculum now controls only loss weights, Gumbel temperature,
+        # and LR warmup. Data distribution stays fixed for the entire run.
+        # This prevents the fatal distribution shift that destroyed optimizer
+        # state alignment at stage boundaries (epoch 30→31 never recovered).
+        stage_lambda_type = stage.get("lambda_type", None)
+        if stage_lambda_type is not None:
+            self.criterion.lambda_type = stage_lambda_type
+
+        print(
+            f"  [curriculum] Epoch {epoch}: stage '{stage['name']}' "
+            f"(gumbel_tau={target_tau:.2f}, lambda_type={self.criterion.lambda_type}, lr_warmup={self._stage_warmup_steps} steps)"
+        )
+
+    def fit(self):
+        total_params = sum(p.numel() for p in self.model.parameters())
+        print(f"IDSP Multi-Type EQ Estimator Training")
+        print(f"  Device: {self.device}")
+        print(f"  Parameters: {total_params:,}")
+        print(
+            f"  Train batches: {len(self.train_loader)}, Val batches: {len(self.val_loader)}"
+        )
+        print(f"  Max epochs: {self.max_epochs}")
+        print(f"  Receptive field: {self.model.receptive_field_frames} frames")
+        print()
+
+        consecutive_nan_epochs = 0
+
+        for epoch in range(1, self.max_epochs + 1):
+            t0 = time.time()
+            self._apply_curriculum_stage(epoch)
+            train_loss = self.train_one_epoch(epoch)
+
+            # Check for NaN weights after training
+            if self._has_nan_weights():
+                print(
+                    f"  ERROR: NaN detected in model weights after epoch {epoch}. Stopping."
+                )
+                break
+
+            val_loss, metrics = self.validate(epoch)
+            self.scheduler.step()
+            elapsed = time.time() - t0
+
+            # Track consecutive NaN epochs (death spiral detection)
+            if math.isnan(val_loss):
+                consecutive_nan_epochs += 1
+                if consecutive_nan_epochs >= 3:
+                    print(
+                        f"  ERROR: val_loss has been NaN for {consecutive_nan_epochs} consecutive epochs. Stopping."
+                    )
+                    break
+            else:
+                consecutive_nan_epochs = 0
+
+            is_best = val_loss < self.best_val_loss
+            if is_best:
+                self.best_val_loss = val_loss
+            self.save_checkpoint(epoch, val_loss, is_best)
+
+            self.history.append(
+                {
+                    "epoch": epoch,
+                    "train_loss": train_loss,
+                    "val_loss": val_loss,
+                    "metrics": metrics,
+                    "time_s": elapsed,
+                }
+            )
+
+            print(
+                f"Epoch {epoch}/{self.max_epochs} ({elapsed:.1f}s) "
+                f"train={train_loss:.4f} val={val_loss:.4f}"
+            )
+
+        hist_path = Path("checkpoints") / "training_history.json"
+        with open(hist_path, "w") as f:
+            json.dump(self.history, f, indent=2, default=str)
+        print(f"\nTraining complete. Best val loss: {self.best_val_loss:.4f}")
+        print(f"History saved to {hist_path}")
+
+
+if __name__ == "__main__":
+    trainer = Trainer()
+    trainer.fit()

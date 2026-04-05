@@ -1,0 +1,74 @@
+You are an expert audio DSP and deep learning engineer specializing in differentiable signal processing systems and neural network optimization. I have a failing IDSP EQ parameter estimation system and need you to architect, implement, and validate a comprehensive remediation plan—producing working, production-quality code changes for each fix.
+
+**System Overview:**
+The differentiable DSP system performs blind parametric EQ parameter estimation. It processes wet audio into mel-spectrograms, encodes them via a TCN, and predicts 5-band parametric EQ parameters using Hungarian matching, Gumbel-Softmax, and a multi-component loss. The system has failed to converge across 9 training iterations (v3–v9).
+
+**Failure Summary:**
+- Training loss decreased 3x (18.2 → 6.2), but validation metrics stagnated
+- Gain MAE plateaued at 3.2 dB; type classification accuracy stalled at 53% (vs. 20% random baseline)
+- Training-to-validation loss gap widened from 1.1 → 2.7 (progressive overfitting without task convergence)
+- All runs converge to identical metrics regardless of learning rate — the failure is **architectural**, not a hyperparameter issue
+- The optimizer sacrifices gain accuracy to minimize total loss (spectral reconstruction dominates)
+
+---
+
+**Diagnostic Findings to Address:**
+
+- **C1 — Broken Gaussian readout gain mechanism** (`insight/differentiable_eq.py` lines 589–608, `insight/model_tcn.py`): Gaussian-weighted sum of mel-residual values with only per-band scale/bias (10 learnable parameters for 5 bands) cannot map log-mel residual amplitude to dB gain
+- **C2 — Spectral loss dominance** (`insight/loss_multitype.py` lines 269–334, `insight/conf/config.yaml`): `hmag_loss` is easily minimized by joint parameter adjustment, allowing spectral shape matching without learning individual parameter values
+- **C3 — Partial encoder collapse**: Anti-collapse regularization forces variance spread but fails to encode discriminative parameter information
+- **H1 — tanh soft-clamp gradient vanishing** (`insight/differentiable_eq.py` line 608): 20–42% gradient attenuation for common gain values
+- **H2 — Gumbel-Softmax gradient dilution** at temperature 1.0: only 20% of gain gradients reach peaking filter coefficients during early training
+- **H3 — Beta(2,5) gain distribution bias** (`insight/dataset.py` lines 201–205): samples concentrated near 7 dB, incentivizing near-zero gain predictions
+- **M1** — Hungarian matching cost imbalance
+- **M2** — Product-based band response gradient instability
+- **M3** — Configured 4-stage curriculum is never executed
+- **M4** — Completely stagnant Q prediction due to minimal spectral impact
+- **Validation metric bug**: `gain_raw` shows 7.0 dB error vs. 3.2 dB `gain_mae` due to permutation noise in the validation pathway
+
+---
+
+**Implementation Directives — Execute in Strict Sequence:**
+
+**Step 1** — `insight/differentiable_eq.py` line 608: Replace the `tanh` clamp with a straight-through estimator clamp using `torch.clamp` with gradient bypass to preserve gradients at boundaries.
+
+**Step 2** — `insight/dataset.py` lines 201–205: Replace `Beta(2,5)` with `Beta(2,2)` or a scaled uniform distribution to ensure equal representation across the full gain range.
+
+**Step 3** — `insight/conf/config.yaml`: Set `lambda_gain` to 3.0, `lambda_hmag` to 0.3, and disable the combined `lambda_param` in favor of independent gain, frequency, and Q weight components.
+
+**Step 4** — `insight/model_tcn.py`: Replace the Gaussian readout with a dedicated two-layer MLP regression head taking the 128-dimensional trunk embedding and outputting gain directly, removing mel-residual dependency entirely.
+
+**Step 5** — `insight/loss_multitype.py`: Split the combined parameter loss into independent `loss_gain`, `loss_freq`, and `loss_q` components with individually configurable weights.
+
+**Step 6** — `insight/train.py` + `insight/dataset.py`: Implement the 4-stage curriculum by loading stages from `config.yaml`, modifying `SyntheticEQDataset` to accept dynamic filter type and parameter range overrides, and executing Gumbel temperature annealing across stages.
+
+**Step 7** — `insight/train.py`: Integrate per-parameter gradient norm monitoring for gain, frequency, and Q to detect and log imbalance during training.
+
+For each step, provide the complete modified code for the affected file section, explain what the change does mechanistically, and identify any downstream dependencies or call-site changes required.
+
+---
+
+**Validation Protocol:**
+
+After implementing all changes, specify the exact unit test commands to run against `test_eq.py`, `test_model.py`, and `test_multitype_eq.py` to verify gradient flow and loss computation correctness. Then define the full 80-epoch training validation procedure with explicit pass/fail criteria:
+
+- Gain MAE < 2.0 dB
+- Type classification accuracy > 80%
+- Frequency MAE < 1.0 octave
+- Q MAE < 0.3 decades
+- Training-to-validation loss gap eliminated
+
+Also specify how to run `test_real_audio.py` against ground-truth labeled test files to verify synthetic-to-real generalization.
+
+---
+
+**Final Verification Outputs Required:**
+
+Once training completes, produce or describe how to generate:
+1. Gradient norm traces per parameter (gain, freq, Q) across epochs
+2. Per-type breakdown of gain MAE and classification accuracy
+3. t-SNE visualization of TCN embeddings colored by ground-truth parameters
+4. Inference-time comparison between `forward_soft` and `forward_hard` predictions
+5. Direct performance metrics from `test_real_audio.py`
+
+Compare final TCN performance against the spectral model baseline from `model_spectral.py` (which achieved 0.20 dB MAE) to contextualize results and confirm the remediation is complete.

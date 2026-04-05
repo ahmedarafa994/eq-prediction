@@ -1,0 +1,32 @@
+{
+  "name": "training-stability",
+  "description": "Fix NaN collapse and training instability in IDSP EQ estimator",
+  "createdAt": 1775353050275,
+  "leadAgentId": "team-lead@training-stability",
+  "leadSessionId": "e8578239-c051-4b73-bff6-2a48d981762c",
+  "members": [
+    {
+      "agentId": "team-lead@training-stability",
+      "name": "team-lead",
+      "agentType": "team-lead",
+      "model": "glm-5.1",
+      "joinedAt": 1775353050275,
+      "tmuxPaneId": "",
+      "cwd": "/teamspace/studios/this_studio",
+      "subscriptions": []
+    },
+    {
+      "agentId": "config-fixer@training-stability",
+      "name": "config-fixer",
+      "model": "claude-opus-4-6",
+      "prompt": "Make two changes to /teamspace/studios/this_studio/insight/conf/config.yaml:\n\n## Change 1: Increase dataset size (line 18)\n\nChange:\n```yaml\n  dataset_size: 10000\n```\nto:\n```yaml\n  dataset_size: 30000\n```\n\n## Change 2: Add lambda_type_match to loss section (after line 50)\n\nCurrently the loss section has `lambda_freq_match: 1.0` and `lambda_q_match: 0.5` but is missing `lambda_type_match`. The train.py reads this with `loss_cfg.get(\"lambda_type_match\", 0.5)` so it falls back to 0.5. Add it explicitly.\n\nAdd this line after `lambda_q_match: 0.5`:\n```yaml\n  lambda_type_match: 1.0\n```\n\nIMPORTANT:\n- Read the file first\n- Only change these values, nothing else\n- Preserve exact YAML indentation (2 spaces)",
+      "color": "yellow",
+      "planModeRequired": false,
+      "joinedAt": 1775353076767,
+      "tmuxPaneId": "in-process",
+      "cwd": "/teamspace/studios/this_studio",
+      "subscriptions": [],
+      "backendType": "in-process"
+    }
+  ]
+}

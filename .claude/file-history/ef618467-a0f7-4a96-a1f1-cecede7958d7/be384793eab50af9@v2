@@ -1,0 +1,102 @@
+# Configuration for 50K MUSDB18-based IDSP EQ Estimator Training
+# Uses real audio from MUSDB18 instead of synthetic signals
+
+experiment_name: "idsp-eq-musdb-50k"
+seed: 42
+
+data:
+  dataset_type: "musdb"           # "synthetic" or "musdb"
+  musdb_root: "/teamspace/lightning_storage/SNAP_DATA_SET/musdb18_hq"
+  musdb_subsets: ["train", "test"]
+  num_bands: 5
+  sample_rate: 44100
+  audio_duration: 3.0
+  n_fft: 2048
+  hop_length: 256
+  n_mels: 128
+  gain_bounds: [-24.0, 24.0]
+  freq_bounds: [20.0, 20000.0]
+  q_bounds: [0.1, 10.0]
+  filter_types: ["peaking", "lowshelf", "highshelf", "highpass", "lowpass"]
+  type_weights: [0.5, 0.15, 0.15, 0.1, 0.1]
+  dataset_size: 50000
+  val_dataset_size: 2000
+  train_split: 0.8
+  val_split: 0.1
+  test_split: 0.1
+  batch_size: 256
+  num_workers: 4
+
+model:
+  encoder:
+    type: "tcn"
+    n_mels: 128
+    embedding_dim: 128
+    channels: 128
+    num_blocks: 4
+    num_stacks: 2
+    kernel_size: 3
+  num_bands: 5
+  learning_rate: 0.0001
+  weight_decay: 0.02
+
+loss:
+  lambda_param: 0.0
+  lambda_gain: 1.5
+  lambda_freq: 1.5
+  lambda_q: 1.5
+  lambda_type: 3.0
+  lambda_spectral: 0.0
+  lambda_hmag: 0.5
+  lambda_activity: 0.05
+  lambda_spread: 0.02
+  lambda_freq_match: 1.0
+  lambda_q_match: 0.5
+  lambda_type_match: 2.0
+  lambda_embed_var: 0.3
+  lambda_contrastive: 0.1
+  embed_var_threshold: 0.1
+
+trainer:
+  max_epochs: 80
+  accelerator: "auto"
+  devices: 1
+  precision: "fp32"
+  log_every_n_steps: 10
+  fast_dev_run: false
+  gradient_accumulation_steps: 4
+  use_8bit_optimizer: false
+  use_torch_compile: false
+  use_gradient_checkpointing: false
+  use_activation_quantization: false
+  use_deepspeed: false
+  deepspeed_config: "conf/deepspeed_config.json"
+  precompute_cache_path: "data/dataset_musdb_50k.pt"
+  early_stopping_patience: 8
+  monitor_val_metric: "val_loss"
+  mode: "min"
+
+curriculum:
+  stages:
+    - name: "warmup"
+      epochs: 10
+      lambda_type: 1.5
+      gumbel_temperature: 1.5
+    - name: "type_learning"
+      epochs: 20
+      lambda_type: 2.0
+      gumbel_temperature: 0.8
+    - name: "consolidation"
+      epochs: 30
+      lambda_type: 2.0
+      gumbel_temperature: 0.3
+    - name: "finetune"
+      epochs: 10
+      lambda_type: 1.5
+      gumbel_temperature: 0.05
+      learning_rate_scale: 0.1
+    - name: "real_audio_boost"
+      epochs: 10
+      lambda_type: 1.5
+      gumbel_temperature: 0.05
+      learning_rate_scale: 0.05

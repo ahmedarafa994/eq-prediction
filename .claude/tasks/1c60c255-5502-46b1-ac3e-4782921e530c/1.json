@@ -1,0 +1,9 @@
+{
+  "id": "1",
+  "subject": "Replace tanh clamp with STE clamp in differentiable_eq.py",
+  "description": "Replace `tanh(gain_db / 24.0) * 24.0` with a straight-through estimator clamp that preserves gradient flow at gain boundaries. File: insight/differentiable_eq.py",
+  "activeForm": "Replacing tanh clamp with STE clamp",
+  "status": "pending",
+  "blocks": [],
+  "blockedBy": []
+}

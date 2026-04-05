@@ -1,0 +1,9 @@
+{
+  "id": "4",
+  "subject": "Fix model_tcn.py - add encoder dropout",
+  "description": "Add dropout to the encoder output projection in model_tcn.py to combat overfitting",
+  "activeForm": "Adding encoder dropout",
+  "status": "completed",
+  "blocks": [],
+  "blockedBy": []
+}
