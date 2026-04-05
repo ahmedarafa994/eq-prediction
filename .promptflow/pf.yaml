@@ -1,4 +1,0 @@
-connection:
-  provider: local
-extension:
-  telemetry_enabled: true

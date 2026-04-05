@@ -1,9 +1,0 @@
-{
-  "id": "7",
-  "subject": "Update training config",
-  "description": "Reduce spread loss, increase type loss weight",
-  "activeForm": "Updating config",
-  "status": "completed",
-  "blocks": [],
-  "blockedBy": []
-}

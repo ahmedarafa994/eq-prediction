@@ -1,9 +1,0 @@
-[
-  {
-    "from": "optimizer-fixer",
-    "text": "{\"type\":\"idle_notification\",\"from\":\"optimizer-fixer\",\"timestamp\":\"2026-04-05T02:03:35.798Z\",\"idleReason\":\"available\"}",
-    "timestamp": "2026-04-05T02:03:35.798Z",
-    "color": "blue",
-    "read": false
-  }
-]

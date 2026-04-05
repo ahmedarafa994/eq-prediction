@@ -1,9 +1,0 @@
-{
-  "id": "6",
-  "subject": "Retrain and evaluate",
-  "description": "Retrain on 50K MUSDB18 with all fixes, run both test scripts",
-  "activeForm": "Retraining model",
-  "status": "in_progress",
-  "blocks": [],
-  "blockedBy": []
-}

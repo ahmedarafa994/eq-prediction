@@ -1,9 +1,0 @@
-{
-  "id": "9",
-  "subject": "Rebalance loss weights in config and loss_multitype.py",
-  "description": "Reduce lambda_gain 2.0→1.0, increase lambda_type 0.5→1.0, update config.yaml and loss defaults.",
-  "activeForm": "Rebalancing loss weights",
-  "status": "completed",
-  "blocks": [],
-  "blockedBy": []
-}

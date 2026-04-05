@@ -1,9 +1,0 @@
-{
-  "id": "10",
-  "subject": "Phase 2c: Frequency anchor loss",
-  "description": "Add L1 loss on log-frequency of matched bands, weighted by gain magnitude. Sharper gradient than Huber for large octave errors.",
-  "activeForm": "Adding frequency anchor loss",
-  "status": "completed",
-  "blocks": [],
-  "blockedBy": []
-}

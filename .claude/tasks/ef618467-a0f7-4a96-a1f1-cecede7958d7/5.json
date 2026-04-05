@@ -1,9 +1,0 @@
-{
-  "id": "5",
-  "subject": "Fix gain head blend (unbounded aux)",
-  "description": "Replace fixed 0.7/0.3 blend with learned gate, add Tanh to gain_mel_aux",
-  "activeForm": "Fixing gain head",
-  "status": "completed",
-  "blocks": [],
-  "blockedBy": []
-}

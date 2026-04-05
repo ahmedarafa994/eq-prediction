@@ -1,9 +1,0 @@
-{
-  "id": "3",
-  "subject": "Add gradient checkpointing to model_tcn.py",
-  "description": "Add use_gradient_checkpointing option and implement in GatedResidualBlock",
-  "activeForm": "Updating model_tcn.py",
-  "status": "pending",
-  "blocks": [],
-  "blockedBy": []
-}

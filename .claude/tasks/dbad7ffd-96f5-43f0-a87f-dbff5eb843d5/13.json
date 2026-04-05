@@ -1,9 +1,0 @@
-{
-  "id": "13",
-  "subject": "Phase 4b: Curriculum and config updates",
-  "description": "Add frequency_spread curriculum stage and new loss weight parameters to config.yaml.",
-  "activeForm": "Updating curriculum config",
-  "status": "completed",
-  "blocks": [],
-  "blockedBy": []
-}

@@ -1,9 +1,0 @@
-{
-  "id": "2",
-  "subject": "Split loss_param into independent components in loss_multitype.py",
-  "description": "Separate loss_param into independent loss_gain, loss_freq, loss_q with separate lambda weights. Rebalance: lambda_gain=3.0, lambda_hmag=0.3. File: insight/loss_multitype.py",
-  "activeForm": "Splitting loss components",
-  "status": "pending",
-  "blocks": [],
-  "blockedBy": []
-}

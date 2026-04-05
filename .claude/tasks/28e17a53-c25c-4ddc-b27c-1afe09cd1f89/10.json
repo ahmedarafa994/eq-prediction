@@ -1,9 +1,0 @@
-{
-  "id": "10",
-  "subject": "Fix gain distribution in dataset.py",
-  "description": "Replace Beta(2,5) with uniform sampling. Allow HP/LP filters to have non-zero gains.",
-  "activeForm": "Fixing gain distribution",
-  "status": "completed",
-  "blocks": [],
-  "blockedBy": []
-}

@@ -1,9 +1,0 @@
-{
-  "id": "8",
-  "subject": "Fix test evaluation with Hungarian matching",
-  "description": "Add Hungarian matching to test_checkpoint.py and test_checkpoint_multi.py to get fair band comparison",
-  "activeForm": "Fixing test evaluation",
-  "status": "completed",
-  "blocks": [],
-  "blockedBy": []
-}

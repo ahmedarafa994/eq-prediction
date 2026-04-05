@@ -1,9 +1,0 @@
-{
-  "id": "4",
-  "subject": "Rebalance loss weights in config.yaml",
-  "description": "Update config.yaml with new loss weights: lambda_gain=3.0, lambda_freq=1.0, lambda_q=0.5, lambda_hmag=0.3, disable anti-collapse losses. File: insight/conf/config.yaml",
-  "activeForm": "Rebalancing loss weights",
-  "status": "pending",
-  "blocks": [],
-  "blockedBy": []
-}

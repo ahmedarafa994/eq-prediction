@@ -1,9 +1,0 @@
-{
-  "id": "9",
-  "subject": "Add spectral shape features for type classification",
-  "description": "Add mel-profile-derived spectral shape features to the type classification head in MultiTypeEQParameterHead. The classifier currently only has 64-dim trunk features, which don't carry enough spectral shape info to distinguish filter types. Add a parallel CNN path that extracts type-discriminative features from the mel profile.",
-  "activeForm": "Adding spectral shape features for type classification",
-  "status": "completed",
-  "blocks": [],
-  "blockedBy": []
-}

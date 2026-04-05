@@ -1,9 +1,0 @@
-{
-  "id": "12",
-  "subject": "Phase 4a: Per-octave validation metrics",
-  "description": "Add per-octave frequency error breakdown and frequency span metric to validation logging in train.py.",
-  "activeForm": "Adding validation metrics",
-  "status": "completed",
-  "blocks": [],
-  "blockedBy": []
-}
