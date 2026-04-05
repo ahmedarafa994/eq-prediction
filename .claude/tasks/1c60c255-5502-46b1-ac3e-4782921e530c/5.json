@@ -1,0 +1,9 @@
+{
+  "id": "5",
+  "subject": "Run tests to verify all changes",
+  "description": "Run test_eq.py, test_model.py, test_multitype_eq.py to verify gradient flow and correctness of all changes before training.",
+  "activeForm": "Running verification tests",
+  "status": "pending",
+  "blocks": [],
+  "blockedBy": []
+}

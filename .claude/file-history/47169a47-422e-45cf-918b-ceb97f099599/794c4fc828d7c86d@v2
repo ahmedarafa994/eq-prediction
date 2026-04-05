@@ -1,0 +1,305 @@
+"""
+audit_loss.py
+
+Diagnostic utilities for train/val loss asymmetry in StreamingTCNModel.
+
+The observed train_loss >> val_loss pattern in this codebase has a confirmed
+root cause: validate() in train.py calls _load_ema_weights() before model.eval(),
+so validation runs on the EMA model (ema_decay=0.999) — a smoother, lower-loss
+snapshot — while training reports live-weight loss. This is intentional but means
+the two metrics are NOT directly comparable.
+
+This module provides:
+  - audit_loss_reduction(): quantifies EMA gap, BN mode gap, per-sample ratio
+  - ConsistentReductionLossWrapper: range assertions + NaN routing for any loss fn
+
+Usage:
+    from audit_loss import audit_loss_reduction
+    results = audit_loss_reduction(
+        trainer.model, train_loader, val_loader, trainer.criterion,
+        device=trainer.device, ema_weights=trainer.ema_model,
+    )
+    print(results)
+"""
+
+from __future__ import annotations
+
+import math
+from typing import Any
+
+import torch
+import torch.nn as nn
+
+
+def audit_loss_reduction(
+    model: nn.Module,
+    train_loader: torch.utils.data.DataLoader,
+    val_loader: torch.utils.data.DataLoader,
+    loss_fn: nn.Module,
+    device: torch.device | str = "cpu",
+    *,
+    ema_weights: dict[str, torch.Tensor] | None = None,
+) -> dict[str, Any]:
+    """
+    Diagnose train/val loss asymmetry by comparing per-sample losses under
+    live weights vs. EMA weights, and under train mode vs. eval mode.
+
+    This function specifically tests three sources of train > val loss inversion
+    as observed in StreamingTCNModel training:
+
+      1. EMA weight substitution at validation (dominant cause — validate() uses EMA).
+      2. BatchNorm train vs. eval mode divergence (secondary).
+      3. Reduction mismatch (sum vs. mean × batch size).
+
+    Args:
+        model:        The StreamingTCNModel.
+        train_loader: DataLoader for the training split.
+        val_loader:   DataLoader for the validation split.
+        loss_fn:      MultiTypeEQLoss instance (or any callable returning
+                      (scalar_loss, components_dict)).
+        device:       Computation device.
+        ema_weights:  Optional dict of EMA shadow weights
+                      (trainer.ema_model from train.py). If provided, also
+                      evaluates val loss under EMA weights to quantify the gap.
+
+    Returns:
+        Dict with keys:
+            'train_loss_live'   — loss on one train batch, live weights, train mode
+            'train_loss_eval'   — loss on one train batch, live weights, eval mode
+            'val_loss_live'     — loss on one val batch, live weights, eval mode
+            'val_loss_ema'      — loss on one val batch, EMA weights, eval mode (or None)
+            'per_sample_train'  — train_loss_live / batch_size_train
+            'per_sample_val'    — val_loss_live / batch_size_val
+            'batch_size_train'  — batch size used for train audit
+            'batch_size_val'    — batch size used for val audit
+            'ema_gap'           — val_loss_ema - val_loss_live (negative = EMA is better)
+            'batchnorm_gap'     — abs(train_loss_live - train_loss_eval)
+            'train_val_ratio'   — train_loss_live / val_loss_live
+            'warnings'          — list of detected anomalies with explanations
+
+    Raises:
+        RuntimeError: If any forward pass produces NaN/Inf loss.
+    """
+    device = torch.device(device)
+    warnings: list[str] = []
+
+    # Save live weights so we can restore them after EMA substitution
+    live_weights = {n: p.data.clone() for n, p in model.named_parameters()}
+
+    def _forward_batch(
+        loader: torch.utils.data.DataLoader,
+        train_mode: bool,
+        substitute_weights: dict[str, torch.Tensor] | None = None,
+    ) -> tuple[float, int]:
+        """Single forward pass returning (loss_value, batch_size)."""
+        if substitute_weights is not None:
+            for name, param in model.named_parameters():
+                if name in substitute_weights:
+                    param.data.copy_(substitute_weights[name])
+
+        model.train(train_mode)
+        batch = next(iter(loader))
+
+        # Move batch to device
+        if isinstance(batch, dict):
+            batch = {
+                k: v.to(device, non_blocking=True) if isinstance(v, torch.Tensor) else v
+                for k, v in batch.items()
+            }
+
+        ctx = torch.no_grad() if not train_mode else torch.enable_grad()
+        with ctx:
+            mel = batch["mel_frames"].to(device)
+            output = model(mel)
+
+            total_loss, _ = loss_fn(
+                output["params"][0],
+                output["params"][1],
+                output["params"][2],
+                output["type_logits"].float(),
+                output["H_mag"].float(),
+                batch["gain"].to(device),
+                batch["freq"].to(device),
+                batch["q"].to(device),
+                batch["filter_type"].to(device),
+                batch.get("target_H_mag", output["H_mag"]).to(device),
+            )
+
+        val = total_loss.item()
+        if not math.isfinite(val):
+            raise RuntimeError(
+                f"Loss is {'NaN' if math.isnan(val) else 'Inf'} during audit. "
+                "Fix numerical issues before running this diagnostic."
+            )
+        return val, mel.shape[0]
+
+    try:
+        # 1. Live weights, training mode (how train_loss is reported)
+        train_live, bs_train = _forward_batch(train_loader, train_mode=True)
+
+        # 2. Live weights, eval mode (isolates BN train/eval effect)
+        train_eval, _ = _forward_batch(train_loader, train_mode=False)
+
+        # 3. Live weights, eval mode on val set
+        val_live, bs_val = _forward_batch(val_loader, train_mode=False)
+
+        # 4. EMA weights, eval mode on val set (how validate() reports val_loss)
+        val_ema: float | None = None
+        if ema_weights is not None:
+            val_ema, _ = _forward_batch(
+                val_loader, train_mode=False, substitute_weights=ema_weights
+            )
+    finally:
+        # Always restore live weights
+        for name, param in model.named_parameters():
+            if name in live_weights:
+                param.data.copy_(live_weights[name])
+        model.eval()
+
+    bn_gap = abs(train_live - train_eval)
+    ratio = train_live / (val_live + 1e-8)
+    ema_gap = (val_ema - val_live) if val_ema is not None else float("nan")
+
+    # Anomaly detection
+    if ratio > 1.5:
+        warnings.append(
+            f"train/val ratio = {ratio:.2f}x (> 1.5 threshold). "
+            "Primary cause: validate() substitutes EMA weights, which are lower-loss "
+            "than live weights. Expected behavior — not a bug — but makes raw "
+            "train_loss / val_loss comparison misleading. "
+            "Monitor the ratio approaching 1.0 as training converges."
+        )
+    if val_ema is not None and ema_gap < -0.5:
+        warnings.append(
+            f"EMA advantage: val_ema={val_ema:.4f} vs val_live={val_live:.4f} "
+            f"(gap={ema_gap:+.4f}). "
+            "This EMA gap directly explains the observed train > val inversion."
+        )
+    if bn_gap > 0.3 * train_live:
+        warnings.append(
+            f"BatchNorm train/eval gap = {bn_gap:.4f} ({bn_gap/train_live*100:.1f}% of "
+            f"train loss). BN running statistics have not converged or batch sizes are "
+            "too small for reliable batch statistics. "
+            "Consider replacing BatchNorm1d with WeightNorm or LayerNorm."
+        )
+    if abs(ratio - bs_train / max(bs_val, 1)) < 0.1 and bs_train != bs_val:
+        warnings.append(
+            f"train/val ratio ({ratio:.2f}x) ≈ batch_size ratio "
+            f"({bs_train}/{bs_val}={bs_train/bs_val:.2f}x). "
+            "Possible reduction='sum' vs reduction='mean' mismatch between "
+            "train and val loss computations."
+        )
+
+    results: dict[str, Any] = {
+        "train_loss_live": train_live,
+        "train_loss_eval": train_eval,
+        "val_loss_live": val_live,
+        "val_loss_ema": val_ema,
+        "per_sample_train": train_live / bs_train,
+        "per_sample_val": val_live / bs_val,
+        "batch_size_train": bs_train,
+        "batch_size_val": bs_val,
+        "ema_gap": ema_gap,
+        "batchnorm_gap": bn_gap,
+        "train_val_ratio": ratio,
+        "warnings": warnings,
+    }
+
+    print("=" * 64)
+    print("Loss Audit Results")
+    print("=" * 64)
+    print(f"  train_loss (live, train mode): {train_live:.4f}  [B={bs_train}]")
+    print(f"  train_loss (live, eval mode) : {train_eval:.4f}  [BN gap={bn_gap:.4f}]")
+    print(f"  val_loss   (live, eval mode) : {val_live:.4f}  [B={bs_val}]")
+    if val_ema is not None:
+        print(f"  val_loss   (EMA,  eval mode) : {val_ema:.4f}  [EMA gap={ema_gap:+.4f}]")
+    print(f"  per-sample train : {train_live/bs_train:.6f}")
+    print(f"  per-sample val   : {val_live/bs_val:.6f}")
+    print(f"  train/val ratio  : {ratio:.2f}x")
+    if warnings:
+        print("\nWarnings:")
+        for w in warnings:
+            print(f"  [!] {w}")
+    print("=" * 64)
+
+    return results
+
+
+class ConsistentReductionLossWrapper(nn.Module):
+    """
+    Wraps any loss function to add range assertions and NaN routing.
+
+    Use as a drop-in wrapper around MultiTypeEQLoss to catch:
+      - NaN/Inf loss values (with option to warn-and-continue vs. raise)
+      - Loss values outside an expected plausible range
+      - Optional per-component normalization to stabilize curriculum transitions
+
+    Args:
+        loss_fn:         The wrapped loss function (must return (scalar, dict)).
+        expected_range:  (min, max) plausible range for per-batch total loss.
+                         Raises AssertionError outside this range.
+        warn_on_nan:     If True, print warning and return zero loss on NaN/Inf
+                         instead of raising. Default: False.
+        normalize_components: If True, divide total loss by count of active
+                              components (> 1e-8). Helps when curriculum toggles
+                              terms on/off. Default: False.
+
+    Example:
+        criterion = ConsistentReductionLossWrapper(
+            MultiTypeEQLoss(...), expected_range=(0.0, 200.0)
+        )
+        loss, components = criterion(pred_gain, ...)
+    """
+
+    def __init__(
+        self,
+        loss_fn: nn.Module,
+        expected_range: tuple[float, float] = (0.0, 500.0),
+        warn_on_nan: bool = False,
+        normalize_components: bool = False,
+    ) -> None:
+        super().__init__()
+        assert expected_range[0] < expected_range[1], (
+            f"expected_range must be (min, max), got {expected_range}"
+        )
+        self.loss_fn = loss_fn
+        self.expected_min, self.expected_max = expected_range
+        self.warn_on_nan = warn_on_nan
+        self.normalize_components = normalize_components
+
+    def forward(self, *args: Any, **kwargs: Any) -> tuple[torch.Tensor, dict]:
+        total_loss, components = self.loss_fn(*args, **kwargs)
+        val = total_loss.item()
+
+        if not math.isfinite(val):
+            component_str = ", ".join(
+                f"{k}={v.item():.4f}" for k, v in components.items()
+                if isinstance(v, torch.Tensor)
+            )
+            msg = (
+                f"Loss is {'NaN' if math.isnan(val) else 'Inf'}. "
+                f"Components: [{component_str}]"
+            )
+            if self.warn_on_nan:
+                print(f"[ConsistentReductionLossWrapper] WARNING: {msg}")
+                return total_loss.new_zeros(()), components
+            raise RuntimeError(msg)
+
+        assert self.expected_min <= val <= self.expected_max, (
+            f"Loss {val:.4f} outside [{self.expected_min}, {self.expected_max}]. "
+            f"Components: " + ", ".join(
+                f"{k}={v.item():.4f}" for k, v in components.items()
+                if isinstance(v, torch.Tensor)
+            )
+        )
+
+        if self.normalize_components:
+            n_active = sum(
+                1 for v in components.values()
+                if isinstance(v, (int, float)) and v > 1e-8
+                or isinstance(v, torch.Tensor) and v.item() > 1e-8
+            )
+            if n_active > 1:
+                total_loss = total_loss / n_active
+
+        return total_loss, components

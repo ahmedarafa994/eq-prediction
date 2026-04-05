@@ -1,0 +1,32 @@
+You are an expert machine learning engineer specializing in deep learning optimization and audio processing. I need comprehensive, actionable solutions for reducing dangerously high training loss values in my audio ML model, which is currently showing **train_loss: 32.65** and **val_loss: 16.19**.
+
+Address each of the following areas with technically precise, verified guidance. Where you make claims about techniques or expected behaviors, ground them in established ML literature or documented best practices rather than assumptions.
+
+**1. Root Cause Diagnostics**
+Identify the most common causes of loss values this high in neural network training. Provide concrete diagnostic methods (e.g., gradient flow checks, loss curve analysis, weight initialization inspection) to systematically identify which root cause applies.
+
+**2. Optimization Techniques**
+Cover learning rate scheduling strategies (warmup, cosine annealing, ReduceLROnPlateau), batch normalization placement and behavior, regularization methods (L1, L2, dropout — with guidance on appropriate strength), gradient clipping thresholds, and adaptive optimizers (Adam, AdamW, RAdam). Specify when each technique is appropriate.
+
+**3. Audio-Specific Preprocessing**
+Address mel-spectrogram parameter tuning (n_mels, hop_length, n_fft, frequency range), feature scaling methods (mu-law companding, z-score normalization, min-max scaling), audio augmentation strategies (time stretching, pitch shifting, SpecAugment, noise injection), and waveform-level preprocessing steps. Note which parameters are most sensitive to misconfiguration.
+
+**4. Loss Function Alternatives for Audio Tasks**
+Evaluate MSE, L1/Huber, perceptual loss, SI-SNR, and custom hybrid loss functions for audio classification and generation tasks. Explain the tradeoffs, and indicate which loss functions are better suited to reconstruction vs. classification objectives.
+
+**5. Model Architecture Considerations**
+Address attention mechanisms (self-attention, cross-attention placement), residual connections, appropriate layer sizing relative to dataset size, and architecture anti-patterns that could cause loss this high.
+
+**6. Training Dynamics**
+Cover proper train/validation/test splitting, class imbalance detection and correction, batch size effects on loss stability, and epoch management (early stopping criteria, learning rate warm-up schedules).
+
+**7. Overfitting vs. Underfitting Diagnosis**
+Interpret the specific pattern where train_loss (~32.65) is approximately **double** val_loss (~16.19). Explain what this ratio indicates — including whether this points to underfitting, data distribution mismatch, train/val leakage, incorrect loss aggregation, or normalization inconsistencies between splits — and provide a diagnostic checklist to confirm the cause.
+
+**8. Implementation Code Examples**
+Provide working PyTorch (preferred) or TensorFlow code examples demonstrating: a corrected training loop with proper loss computation, learning rate scheduling, gradient clipping, and at least one audio-specific preprocessing pipeline. Code should follow production-quality conventions with error handling where relevant.
+
+**9. Specific Recommendations for the ~2x Train/Val Loss Ratio**
+Given that train_loss ≈ 2× val_loss, provide prioritized, specific recommendations to investigate and fix this anomaly first — before general optimization — since it suggests a structural issue in how loss is being computed or how data is partitioned.
+
+Structure your response so that section 9 and section 7 come first as the highest-priority diagnostic steps, followed by the remaining sections. Be precise, cite established techniques by name, and avoid presenting speculation as fact.

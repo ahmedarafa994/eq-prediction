@@ -1,0 +1,9 @@
+{
+  "id": "1",
+  "subject": "Kill running training process",
+  "description": "Kill the currently running train.py process (PID 113157 and children)",
+  "activeForm": "Killing training process",
+  "status": "completed",
+  "blocks": [],
+  "blockedBy": []
+}

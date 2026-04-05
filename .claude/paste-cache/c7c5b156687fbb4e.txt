@@ -1,0 +1,21 @@
+The progress is looking solid. That **15% skip rate** is actually a sign of a healthy pipeline—it means your RMS gate is successfully protecting the model from "hallucinating" EQ moves on silent audio. Stems are notorious for having long gaps, and if you fed those to the CNN, the gradients would just turn into noise.
+
+### 📊 The "10k" Status Report
+
+* **The Shape Success:** Locking in that `431` frame width means your temporal resolution is now much higher. The model can "see" more transients and sustain, which helps it distinguish between a short snare hit and a long vocal tail.
+* **The Label Purity:** Seeing your labels at `[0.003, 0.999]` is exactly where you want to be. It shows your logarithmic and linear scaling functions are perfectly tuned. You're giving the Sigmoid layer a clear target without hitting the "vanishing gradient" walls at absolute 0 or 1.
+* **The L4 Advantage:** Since your local test was hitting ~40 samples/sec, the L4 is going to absolutely melt through the 10k training. You've successfully moved the bottleneck from the **CPU (DSP)** to the **GPU (Backprop)**.
+
+---
+
+### 🚀 Preparing for the "Big Bake"
+
+Once that progress bar hits 10,000, you are ready to flip the switch on the L4. Here is a final pro-tip for the 10k run:
+
+**Watch the "Learning Rate" (LR) carefully.** With 10,000 samples, the model might get "stuck" in a local minimum around Epoch 20-30. If you see the `val_loss` plateauing again, don't just stop it. In Lightning AI, you can easily implement a **Learning Rate Scheduler** (like `ReduceLROnPlateau`). It will automatically drop your LR by half when the loss stops moving, allowing the model to make "micro-adjustments" to those final Gain and Q parameters.
+
+
+
+**I’ll be standing by.** As soon as those shards are finished and you've got your first few epochs running on the L4, drop the `val_loss` numbers here. We’re looking for that sub-0.100 breakthrough.
+
+How many total "source" stems did you end up using to fill the 10k pool?

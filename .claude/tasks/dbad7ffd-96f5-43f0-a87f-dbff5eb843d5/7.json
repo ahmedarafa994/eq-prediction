@@ -1,0 +1,9 @@
+{
+  "id": "7",
+  "subject": "Phase 1b: Enable full spectrum input",
+  "description": "Change use_full_spectrum to true in config.yaml. Update train.py to handle full spectrum dataset (disable mel precomputation). Consider reducing TCN blocks/stacks.",
+  "activeForm": "Enabling full spectrum input",
+  "status": "completed",
+  "blocks": [],
+  "blockedBy": []
+}

@@ -1,0 +1,342 @@
+"""
+MUSDB18-based real-audio EQ dataset.
+
+Loads real music from MUSDB18, randomly crops clips, applies random
+multi-type parametric EQ in frequency domain, and returns mel-spectrogram + params.
+Supports precompute mode with mel-spectrogram caching for fast training.
+"""
+
+import os
+import random
+import math
+import numpy as np
+import torch
+import torch.utils.data as data
+import torchaudio
+from pathlib import Path
+
+from differentiable_eq import (
+    DifferentiableBiquadCascade,
+    FILTER_PEAKING,
+    FILTER_LOWSHELF,
+    FILTER_HIGHSHELF,
+    FILTER_HIGHPASS,
+    FILTER_LOWPASS,
+    NUM_FILTER_TYPES,
+)
+
+DEFAULT_TYPE_WEIGHTS = [0.5, 0.15, 0.15, 0.1, 0.1]
+
+
+class MUSDB18EQDataset(data.Dataset):
+    """
+    Real-audio EQ dataset backed by MUSDB18.
+
+    Randomly crops segments from real music, applies random multi-type EQ,
+    and returns mel-spectrogram + params. In precompute mode, caches everything.
+    """
+
+    def __init__(
+        self,
+        musdb_root,
+        num_bands=5,
+        sample_rate=44100,
+        duration=3.0,
+        n_fft=2048,
+        size=50000,
+        gain_range=(-24.0, 24.0),
+        freq_range=(20.0, 20000.0),
+        q_range=(0.1, 10.0),
+        type_weights=None,
+        augment=True,
+        precompute_mels=True,
+        n_mels=128,
+        subsets=("train", "test"),
+    ):
+        self.num_bands = num_bands
+        self.sample_rate = sample_rate
+        self.num_samples = int(duration * sample_rate)
+        self.n_fft = n_fft
+        self.hop_length = n_fft // 4
+        self._size = size
+        self.gain_range = gain_range
+        self.freq_range = freq_range
+        self.q_range = q_range
+        self.type_weights = type_weights or DEFAULT_TYPE_WEIGHTS
+        self.augment = augment
+        self.n_mels = n_mels
+        self.precompute_mels = precompute_mels
+        self.dsp = DifferentiableBiquadCascade(
+            num_bands=num_bands, sample_rate=sample_rate
+        )
+
+        # Load MUSDB18 audio files into memory
+        self.audio_segments = []
+        self._load_musdb(musdb_root, subsets)
+        total_dur = sum(a.shape[0] / sample_rate for a in self.audio_segments)
+        print(f"  [musdb] Loaded {len(self.audio_segments)} audio files "
+              f"({total_dur:.0f}s total)")
+
+        if precompute_mels:
+            self._build_mel_filterbank()
+
+    def _load_musdb(self, musdb_root, subsets):
+        """Load all MUSDB18 audio into memory (mono, resampled)."""
+        musdb_root = Path(musdb_root)
+
+        for subset in subsets:
+            subset_dir = musdb_root / subset
+            if not subset_dir.exists():
+                print(f"  [musdb] WARNING: {subset_dir} not found, skipping")
+                continue
+
+            for song_dir in sorted(subset_dir.iterdir()):
+                if not song_dir.is_dir():
+                    continue
+                # Load mixture (and optionally stems for variety)
+                for stem_name in ["mixture"]:
+                    wav_path = song_dir / f"{stem_name}.wav"
+                    if not wav_path.exists():
+                        continue
+                    try:
+                        waveform, sr = torchaudio.load(str(wav_path))
+                        # Resample if needed
+                        if sr != self.sample_rate:
+                            waveform = torchaudio.functional.resample(
+                                waveform, sr, self.sample_rate
+                            )
+                        # Convert to mono
+                        if waveform.size(0) > 1:
+                            waveform = waveform.mean(dim=0)
+                        else:
+                            waveform = waveform.squeeze(0)
+                        # Only keep if long enough for at least one crop
+                        if waveform.shape[0] >= self.num_samples:
+                            self.audio_segments.append(waveform)
+                    except Exception as e:
+                        print(f"  [musdb] Error loading {wav_path}: {e}")
+
+    def _build_mel_filterbank(self):
+        """Build mel filterbank for precomputed mel-spectrograms."""
+        n_freqs = self.n_fft // 2 + 1
+        f_min = 20.0
+        f_max = self.sample_rate / 2.0
+
+        def hz_to_mel(hz):
+            return 2595.0 * np.log10(1.0 + hz / 700.0)
+
+        def mel_to_hz(mel):
+            return 700.0 * (10.0 ** (mel / 2595.0) - 1.0)
+
+        f_min_mel = hz_to_mel(f_min)
+        f_max_mel = hz_to_mel(f_max)
+        mel_points = np.linspace(f_min_mel, f_max_mel, self.n_mels + 2)
+        hz_points = mel_to_hz(mel_points)
+        bin_points = ((self.n_fft + 1) * hz_points / self.sample_rate).astype(int)
+
+        fb = np.zeros((self.n_mels, n_freqs))
+        for i in range(self.n_mels):
+            f_left = bin_points[i]
+            f_center = bin_points[i + 1]
+            f_right = bin_points[i + 2]
+            for j in range(f_left, f_center):
+                if j < n_freqs and f_center > f_left:
+                    fb[i, j] = (j - f_left) / (f_center - f_left)
+            for j in range(f_center, f_right):
+                if j < n_freqs and f_right > f_center:
+                    fb[i, j] = (f_right - j) / (f_right - f_center)
+
+        self.mel_fb = torch.tensor(fb, dtype=torch.float32)
+        self.mel_window = torch.hann_window(self.n_fft)
+
+    def _random_crop(self):
+        """Randomly select a song and crop a segment."""
+        audio = random.choice(self.audio_segments)
+        max_start = audio.shape[0] - self.num_samples
+        start = random.randint(0, max(0, max_start))
+        return audio[start:start + self.num_samples].clone()
+
+    def _sample_gain(self):
+        sign = random.choice([-1, 1])
+        magnitude = np.random.beta(2, 2) * min(
+            abs(self.gain_range[0]), abs(self.gain_range[1])
+        )
+        return sign * magnitude
+
+    def _log_uniform(self, low, high):
+        return math.exp(random.uniform(math.log(low), math.log(high)))
+
+    def _sample_multitype_params(self):
+        """Sample multi-type EQ parameters."""
+        gains, freqs, qs, types = [], [], [], []
+
+        for _ in range(self.num_bands):
+            ftype = random.choices(
+                range(NUM_FILTER_TYPES), weights=self.type_weights, k=1
+            )[0]
+
+            if ftype == FILTER_PEAKING:
+                g = self._sample_gain()
+                f = self._log_uniform(self.freq_range[0], self.freq_range[1])
+                q = self._log_uniform(self.q_range[0], self.q_range[1])
+            elif ftype == FILTER_LOWSHELF:
+                g = self._sample_gain()
+                f = self._log_uniform(max(20, self.freq_range[0]), min(5000, self.freq_range[1]))
+                q = self._log_uniform(self.q_range[0], self.q_range[1])
+            elif ftype == FILTER_HIGHSHELF:
+                g = self._sample_gain()
+                f = self._log_uniform(max(1000, self.freq_range[0]), min(20000, self.freq_range[1]))
+                q = self._log_uniform(self.q_range[0], self.q_range[1])
+            elif ftype == FILTER_HIGHPASS:
+                g = random.uniform(-1.0, 1.0)
+                f = self._log_uniform(20, 500)
+                q = self._log_uniform(self.q_range[0], min(2.0, self.q_range[1]))
+            elif ftype == FILTER_LOWPASS:
+                g = random.uniform(-1.0, 1.0)
+                f = self._log_uniform(2000, 20000)
+                q = self._log_uniform(self.q_range[0], min(2.0, self.q_range[1]))
+            else:
+                g = random.uniform(*self.gain_range)
+                f = self._log_uniform(self.freq_range[0], self.freq_range[1])
+                q = self._log_uniform(self.q_range[0], self.q_range[1])
+
+            gains.append(g)
+            freqs.append(f)
+            qs.append(q)
+            types.append(ftype)
+
+        order = sorted(range(len(freqs)), key=lambda i: freqs[i])
+        gains = [gains[i] for i in order]
+        freqs = [freqs[i] for i in order]
+        qs = [qs[i] for i in order]
+        types = [types[i] for i in order]
+
+        return (
+            torch.tensor(gains, dtype=torch.float32),
+            torch.tensor(freqs, dtype=torch.float32),
+            torch.tensor(qs, dtype=torch.float32),
+            torch.tensor(types, dtype=torch.long),
+        )
+
+    def _apply_eq_freq_domain(self, dry_audio, gain_db, freq, q, filter_type):
+        """Apply multi-type EQ in frequency domain."""
+        window = torch.hann_window(self.n_fft)
+        dry_tensor = dry_audio.unsqueeze(0)
+        stft = torch.stft(
+            dry_tensor,
+            self.n_fft,
+            self.hop_length,
+            self.n_fft,
+            window=window,
+            return_complex=True,
+        )
+        wet_mag = self.dsp.apply_to_spectrum(
+            torch.abs(stft),
+            gain_db.unsqueeze(0),
+            freq.unsqueeze(0),
+            q.unsqueeze(0),
+            filter_type=filter_type.unsqueeze(0),
+        )
+        phase = torch.angle(stft)
+        wet_stft = wet_mag * torch.exp(1j * phase)
+        wet_audio = torch.istft(
+            wet_stft,
+            self.n_fft,
+            self.hop_length,
+            self.n_fft,
+            window=window,
+            length=dry_audio.shape[0],
+        )
+        return wet_audio.squeeze(0)
+
+    def _audio_to_mel(self, audio):
+        """Convert audio tensor to log-mel spectrogram. Returns (n_mels, T)."""
+        stft = torch.stft(
+            audio.unsqueeze(0),
+            self.n_fft,
+            self.hop_length,
+            self.n_fft,
+            window=self.mel_window,
+            return_complex=True,
+        )
+        mag = torch.abs(stft).squeeze(0)
+        mel = self.mel_fb @ mag
+        mel = torch.clamp(mel, min=1e-8)
+        return torch.log(mel)
+
+    def precompute(self):
+        """Pre-generate all samples with mel-spectrograms."""
+        print(f"Precomputing {self._size} MUSDB18 samples...")
+        self._cache = []
+        for i in range(self._size):
+            dry_audio = self._random_crop()
+            gain_db, freq, q, filter_type = self._sample_multitype_params()
+            wet_audio = self._apply_eq_freq_domain(dry_audio, gain_db, freq, q, filter_type)
+
+            if self.augment:
+                scale = random.uniform(0.5, 1.0)
+                wet_audio = wet_audio * scale
+
+            sample = {
+                "gain": gain_db,
+                "freq": freq,
+                "q": q,
+                "filter_type": filter_type,
+            }
+            if self.precompute_mels:
+                sample["wet_mel"] = self._audio_to_mel(wet_audio)
+            else:
+                sample["wet_audio"] = wet_audio
+
+            self._cache.append(sample)
+            if (i + 1) % 5000 == 0:
+                print(f"  {i + 1}/{self._size}")
+
+        print(f"Precomputation complete: {len(self._cache)} samples cached.")
+
+    def __len__(self):
+        return self._size
+
+    def __getitem__(self, idx):
+        if hasattr(self, "_cache") and idx < len(self._cache):
+            return self._cache[idx]
+        # On-the-fly generation
+        dry_audio = self._random_crop()
+        gain_db, freq, q, filter_type = self._sample_multitype_params()
+        wet_audio = self._apply_eq_freq_domain(dry_audio, gain_db, freq, q, filter_type)
+
+        if self.augment:
+            scale = random.uniform(0.5, 1.0)
+            wet_audio = wet_audio * scale
+
+        result = {
+            "gain": gain_db,
+            "freq": freq,
+            "q": q,
+            "filter_type": filter_type,
+        }
+        if self.precompute_mels:
+            result["wet_mel"] = self._audio_to_mel(wet_audio)
+        else:
+            result["wet_audio"] = wet_audio
+        return result
+
+    def save_precomputed(self, path):
+        """Save precomputed dataset to disk."""
+        path = Path(path)
+        path.parent.mkdir(parents=True, exist_ok=True)
+        if not hasattr(self, "_cache"):
+            raise RuntimeError("Call precompute() before saving.")
+        torch.save(self._cache, path)
+        size_mb = path.stat().st_size / 1e6
+        print(f"Saved {len(self._cache)} samples to {path} ({size_mb:.0f} MB)")
+
+    def load_precomputed(self, path):
+        """Load precomputed dataset from disk."""
+        path = Path(path)
+        if not path.exists():
+            return False
+        self._cache = torch.load(path, weights_only=False)
+        self._size = len(self._cache)
+        print(f"Loaded {len(self._cache)} samples from {path}")
+        return True

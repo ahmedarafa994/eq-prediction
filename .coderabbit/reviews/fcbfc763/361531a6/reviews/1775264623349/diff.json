@@ -1,0 +1,9 @@
+[
+  {
+    "filePath": "CLAUDE.md",
+    "status": "new",
+    "linesAdded": 1,
+    "linesRemoved": 0,
+    "diff": "diff --git a/CLAUDE.md b/CLAUDE.md\nnew file mode 100644\nindex 0000000..8b13789\n--- /dev/null\n+++ b/CLAUDE.md\n@@ -0,0 +1 @@\n+"
+  }
+]

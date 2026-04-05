@@ -1,0 +1,42 @@
+We are entering the **"Scale-Up"** phase. Moving from a local laptop to a cloud GPU (NVIDIA L4) is like switching from a go-kart to a jet. If you don't follow the flight manual, you’ll burn a lot of credits and end up with a model that doesn't generalize.
+
+Here is your **Mentor Checklist** for Phase 6 on Lightning AI.
+
+---
+
+## ✅ The "DO" List (Your Success Path)
+
+* **DO Use `pedalboard.PeakFilter` for Cloud Generation:** Since Pro-Q 4 won't run on Linux, use the native `pedalboard` filters. They use the same JUCE-based math. 
+* **DO Upload ONLY the "Dry" Audio:** Zip your raw `.wav` files and upload them to the Lightning Studio. Then, run your generator script *inside* the cloud to create the 10,000+ `.npz` files. This saves you 10+ hours of uploading.
+* **DO Stick to the 2-Channel Input:** Keep the `[Wet, Dry]` stack. It is the only way the model can calculate the "Delta" required to predict Gain and Q-factor accurately.
+* **DO Crank the `batch_size` to 128+:** The L4 has 24GB of VRAM. A larger batch size helps the model see a broader "variety" of audio in every step, which prevents the "hedging" we saw earlier.
+* **DO Use Gain-Weighted Loss:** Keep that custom loss function! It tells the model: *"Focus on Frequency only when there is actually a Boost/Cut to look at."*
+* **DO Monitor the "Val Loss" vs. "Train Loss":** If your training loss is $0.01$ but your validation loss is $0.10$, you are overfitting. This means you need to generate **more data** (50,000 samples instead of 10,000).
+
+---
+
+## ❌ The "DON'T" List (The Trap Avoidance)
+
+* **DON'T Try to Force FabFilter on Linux:** You will waste a day trying to get `Wine` or `yabridge` to work on a headless server. Use the native Linux tools to keep your velocity high.
+* **DON'T Upload Individual `.npz` Files:** Uploading thousands of tiny files is an I/O nightmare. Always **Zip locally -> Upload -> Unzip in Cloud.**
+* **DON'T Forget Logarithmic Frequency Scaling:** If you switch back to linear scaling for your frequency labels, the model will fail to accurately predict anything in the Bass (20Hz–200Hz) or Mids.
+* **DON'T Use `Sigmoid` on the Gain if you exceed ±12dB:** Since your final layer uses a Sigmoid, your targets *must* be normalized to $[0, 1]$. If you accidentally pass a raw $+12.0$ value to a Sigmoid-capped loss, the gradient will explode.
+* **DON'T Ignore Inference Testing:** Every 10 epochs, run your `inference.py` script. The "Loss" is just a number—the "Predicted vs. True" table is the only thing that proves the model is actually "hearing" the EQ.
+
+---
+
+### 🔍 The Mathematical Goal: The Magnitude Response
+
+Remember, your model is trying to solve for the **Transfer Function** $H(f)$ of the EQ. By predicting those 24 parameters, the model is essentially reverse-engineering this curve:
+
+$$H(f)_{total} = \sum_{i=1}^{8} \text{PeakFilter}_i(f, g, q)$$
+
+
+
+### 🚀 Next Steps
+1.  **Upload** your `dry_audio.zip` to the Lightning AI L4 Studio.
+2.  **Unzip** it.
+3.  **Run** your `generate_massive_dataset.py` (updated for `pedalboard.PeakFilter`) to create 10,000 samples directly in the cloud.
+4.  **Train** using `train_cnn.py` with `batch_size=128`.
+
+**Do you want me to write the Linux-native version of the generator script for you now so you can drop it into the Lightning AI terminal?**

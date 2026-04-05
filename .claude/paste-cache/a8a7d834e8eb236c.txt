@@ -1,0 +1,35 @@
+Results: epoch_070.pt (stage: full_difficulty)                                                              
+                                                                                                                     
+  Significant improvement over best.pt (epoch 13):                                                                   
+                                                                                                                     
+  ┌──────────────┬────────────────┬───────────┬─────────────┐                                                        
+  │    Metric    │ best.pt (ep13) │ epoch_070 │ Improvement │                                                        
+  ├──────────────┼────────────────┼───────────┼─────────────┤                                                        
+  │ Gain MAE     │ 6.31 dB        │ 1.36 dB   │ 5x better   │
+  ├──────────────┼────────────────┼───────────┼─────────────┤
+  │ Freq MAE     │ 1.88 oct       │ 1.57 oct  │ modest      │
+  ├──────────────┼────────────────┼───────────┼─────────────┤
+  │ Q MAE        │ 0.22           │ 0.26      │ similar     │
+  ├──────────────┼────────────────┼───────────┼─────────────┤
+  │ Freq resp L1 │ 0.167          │ 0.147     │ better      │
+  └──────────────┴────────────────┴───────────┴─────────────┘                                                        
+   
+  Per-band detail:                                                                                                   
+                                                                  
+  ┌──────┬──────────────────┬──────────────────┬──────────┬──────────┐
+  │ Band │        GT        │    Predicted     │ Gain Err │ Freq Err │
+  ├──────┼──────────────────┼──────────────────┼──────────┼──────────┤
+  │ 1    │ +8.0 dB, 500 Hz  │ +9.4 dB, 333 Hz  │ 1.4 dB   │ 0.59 oct │
+  ├──────┼──────────────────┼──────────────────┼──────────┼──────────┤
+  │ 2    │ -6.0 dB, 3000 Hz │ -5.2 dB, 621 Hz  │ 0.8 dB   │ 2.27 oct │
+  ├──────┼──────────────────┼──────────────────┼──────────┼──────────┤
+  │ 3    │ +4.0 dB, 8000 Hz │ +2.1 dB, 2241 Hz │ 2.0 dB   │ 1.84 oct │
+  └──────┴──────────────────┴──────────────────┴──────────┴──────────┘                                               
+   
+  Takeaway: Gains are now well-estimated (~1.4 dB mean error), but frequency localization is still off — the model   
+  compresses predicted frequencies toward the low-mid range. Bands 2 and 3 have large frequency errors (2+ octaves).
+  The model is learning gain direction/magnitude well but needs more training or architecture changes for precise
+  frequency estimation.
+
+  Audio files saved to insight/test_output/ (dry.wav, wet.wav, reconstructed.wav).                                   
+   

@@ -1,0 +1,52 @@
+import torch
+import pytorch_lightning as pl
+from pytorch_lightning.callbacks import ModelCheckpoint, LearningRateMonitor, EarlyStopping
+from pytorch_lightning.loggers import CSVLogger
+from pathlib import Path
+
+from data_module import EQDataModule
+from model_cnn import EQRegressor
+
+MAX_EPOCHS = 100
+
+
+def main():
+    torch.set_float32_matmul_precision('high')
+
+    dm = EQDataModule(data_dir=Path("dataset"), batch_size=64, num_workers=8)
+    model = EQRegressor(lr=1e-3, warmup_epochs=2, max_epochs=MAX_EPOCHS)
+
+    checkpoint_callback = ModelCheckpoint(
+        dirpath="checkpoints",
+        filename="eq-cnn-{epoch:02d}-{val_loss:.4f}",
+        save_top_k=5,
+        monitor="val_loss",
+        mode="min",
+    )
+    early_stop = EarlyStopping(monitor="val_loss", patience=15, mode="min", verbose=True)
+    lr_monitor = LearningRateMonitor(logging_interval='epoch')
+
+    trainer = pl.Trainer(
+        max_epochs=MAX_EPOCHS,
+        accelerator="auto",
+        devices=1,
+        precision="16-mixed",
+        gradient_clip_val=1.0,
+        callbacks=[checkpoint_callback, early_stop, lr_monitor],
+        logger=CSVLogger("logs", name="eq_cnn"),
+        log_every_n_steps=10,
+        enable_progress_bar=False,
+    )
+
+    # NOTE: If model architecture has changed, delete checkpoints/ before running.
+    ckpt_dir = Path("checkpoints")
+    ckpts = sorted(ckpt_dir.glob("*.ckpt"), key=lambda f: float(f.stem.split("val_loss=")[-1]))
+    resume = str(ckpts[0]) if ckpts else None
+    if resume:
+        print(f"=== Resuming from: {resume} ===")
+
+    trainer.fit(model, datamodule=dm, ckpt_path=resume)
+
+
+if __name__ == "__main__":
+    main()

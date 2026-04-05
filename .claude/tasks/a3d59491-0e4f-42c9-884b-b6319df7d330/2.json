@@ -1,0 +1,9 @@
+{
+  "id": "2",
+  "subject": "Fix config.yaml - loss weights, val size, precision, curriculum",
+  "description": "Fix loss weights (lambda_gain 3.0→1.0, lambda_hmag 0.1→0.3, lambda_spectral 1.0→0.0, lambda_type 2.0→1.5), increase val_dataset_size 500→2000, switch precision to bf16-mixed, fix curriculum gumbel temperatures",
+  "activeForm": "Fixing config.yaml",
+  "status": "completed",
+  "blocks": [],
+  "blockedBy": []
+}

@@ -1,0 +1,11 @@
+{
+  "id": "3",
+  "subject": "Add dilated convolution path to parameter head CNN",
+  "description": "In differentiable_eq.py MultiTypeEQParameterHead, add a dilated conv path alongside the existing CNN to expand receptive field over mel bins from 11 to cover the full spectrum. This directly improves frequency prediction.",
+  "activeForm": "Improving parameter head frequency CNN",
+  "status": "completed",
+  "blocks": [
+    "1"
+  ],
+  "blockedBy": []
+}

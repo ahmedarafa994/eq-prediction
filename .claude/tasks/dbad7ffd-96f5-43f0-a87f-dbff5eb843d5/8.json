@@ -1,0 +1,9 @@
+{
+  "id": "8",
+  "subject": "Phase 2a: Frequency-dependent loss weighting",
+  "description": "Add octave-position weight ramp (1.0→2.0) to frequency Huber loss. Use reduction='none' for freq loss only.",
+  "activeForm": "Adding frequency-dependent loss weighting",
+  "status": "completed",
+  "blocks": [],
+  "blockedBy": []
+}

@@ -1,0 +1,236 @@
+"""Run multi-sample evaluation of the best checkpoint."""
+import sys
+import random
+import math
+import numpy as np
+import torch
+import torchaudio
+from pathlib import Path
+from scipy.signal import lfilter
+
+sys.path.append(str(Path(__file__).parent))
+
+from model_tcn import StreamingTCNModel
+from dsp_frontend import STFTFrontend
+
+FILTER_NAMES = ["peaking", "lowshelf", "highshelf", "highpass", "lowpass"]
+SR = 44100
+N_FFT = 2048
+HOP = 512
+N_MELS = 128
+DURATION = 3.0
+N_BANDS = 5
+
+
+def apply_eq_band(audio, gain_db, freq, q, ftype, sr):
+    A = 10.0 ** (gain_db / 40.0) if ftype != 3 and ftype != 4 else 1.0
+    w0 = 2 * math.pi * freq / sr
+    alpha = math.sin(w0) / (2 * q)
+    sqA = math.sqrt(A) if A > 0 else 1.0
+
+    if ftype == 0:  # peaking
+        b0, b1, b2 = 1+alpha*A, -2*math.cos(w0), 1-alpha*A
+        a0, a1, a2 = 1+alpha/A, -2*math.cos(w0), 1-alpha/A
+    elif ftype == 1:  # lowshelf
+        b0 = A*((A+1)-(A-1)*math.cos(w0)+2*sqA*alpha)
+        b1 = 2*A*((A-1)-(A+1)*math.cos(w0))
+        b2 = A*((A+1)-(A-1)*math.cos(w0)-2*sqA*alpha)
+        a0 = (A+1)+(A-1)*math.cos(w0)+2*sqA*alpha
+        a1 = -2*((A-1)+(A+1)*math.cos(w0))
+        a2 = (A+1)+(A-1)*math.cos(w0)-2*sqA*alpha
+    elif ftype == 2:  # highshelf
+        b0 = A*((A+1)+(A-1)*math.cos(w0)+2*sqA*alpha)
+        b1 = -2*A*((A-1)+(A+1)*math.cos(w0))
+        b2 = A*((A+1)+(A-1)*math.cos(w0)-2*sqA*alpha)
+        a0 = (A+1)-(A-1)*math.cos(w0)+2*sqA*alpha
+        a1 = 2*((A-1)-(A+1)*math.cos(w0))
+        a2 = (A+1)-(A-1)*math.cos(w0)-2*sqA*alpha
+    elif ftype == 3:  # highpass
+        b0 = (1+math.cos(w0))/2; b1 = -(1+math.cos(w0)); b2 = (1+math.cos(w0))/2
+        a0 = 1+alpha; a1 = -2*math.cos(w0); a2 = 1-alpha
+    else:  # lowpass
+        b0 = (1-math.cos(w0))/2; b1 = 1-math.cos(w0); b2 = (1-math.cos(w0))/2
+        a0 = 1+alpha; a1 = -2*math.cos(w0); a2 = 1-alpha
+
+    b = np.array([b0/a0, b1/a0, b2/a0])
+    a = np.array([1.0, a1/a0, a2/a0])
+    return lfilter(b, a, audio)
+
+
+def apply_cascade(audio, params, sr):
+    wet = audio.copy()
+    for p in params:
+        wet = apply_eq_band(wet, p["gain"], p["freq"], p["q"], p["type"], sr)
+    return wet
+
+
+def build_mel_fb():
+    n_freqs = N_FFT // 2 + 1
+    f_min, f_max = 20.0, SR / 2.0
+    def hz2m(h): return 2595.0 * np.log10(1 + h / 700)
+    def m2hz(m): return 700 * (10 ** (m / 2595) - 1)
+    pts = np.linspace(hz2m(f_min), hz2m(f_max), N_MELS + 2)
+    hz = m2hz(pts)
+    bins = ((N_FFT + 1) * hz / SR).astype(int)
+    fb = np.zeros((N_MELS, n_freqs))
+    for i in range(N_MELS):
+        for j in range(bins[i], bins[i+1]):
+            if j < n_freqs and bins[i+1] > bins[i]:
+                fb[i, j] = (j - bins[i]) / (bins[i+1] - bins[i])
+        for j in range(bins[i+1], bins[i+2]):
+            if j < n_freqs and bins[i+2] > bins[i+1]:
+                fb[i, j] = (bins[i+2] - j) / (bins[i+2] - bins[i+1])
+    return torch.tensor(fb, dtype=torch.float32)
+
+
+MEL_FB = build_mel_fb()
+
+
+def audio_to_mel(audio_t):
+    win = torch.hann_window(N_FFT)
+    stft = torch.stft(audio_t.unsqueeze(0), N_FFT, HOP, N_FFT, window=win, return_complex=True)
+    mel = MEL_FB @ torch.abs(stft).squeeze(0)
+    return torch.log(torch.clamp(mel, min=1e-8))
+
+
+def random_eq_params():
+    params = []
+    weights = [0.5, 0.15, 0.15, 0.1, 0.1]
+    for _ in range(N_BANDS):
+        ft = random.choices(range(5), weights=weights, k=1)[0]
+        if ft == 0:
+            g = random.choice([-1,1]) * random.uniform(1, 18)
+            f = math.exp(random.uniform(math.log(50), math.log(18000)))
+            q = math.exp(random.uniform(math.log(0.2), math.log(8)))
+        elif ft == 1:
+            g = random.choice([-1,1]) * random.uniform(1, 18)
+            f = math.exp(random.uniform(math.log(50), math.log(3000)))
+            q = math.exp(random.uniform(math.log(0.2), math.log(5)))
+        elif ft == 2:
+            g = random.choice([-1,1]) * random.uniform(1, 18)
+            f = math.exp(random.uniform(math.log(1500), math.log(18000)))
+            q = math.exp(random.uniform(math.log(0.2), math.log(5)))
+        elif ft == 3:
+            g = 0; f = math.exp(random.uniform(math.log(30), math.log(400)))
+            q = math.exp(random.uniform(math.log(0.2), math.log(1.5)))
+        else:
+            g = 0; f = math.exp(random.uniform(math.log(3000), math.log(18000)))
+            q = math.exp(random.uniform(math.log(0.2), math.log(1.5)))
+        params.append({"gain": g, "freq": f, "q": q, "type": ft})
+    params.sort(key=lambda p: p["freq"])
+    return params
+
+
+def main():
+    import yaml
+    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+
+    ckpt = torch.load("checkpoints/best.pt", map_location=device, weights_only=False)
+    with open("conf/config_musdb_50k.yaml") as f:
+        cfg = yaml.safe_load(f)
+
+    model = StreamingTCNModel(
+        n_mels=N_MELS, num_bands=N_BANDS,
+        embedding_dim=cfg["model"]["encoder"].get("embedding_dim", 128),
+        channels=cfg["model"]["encoder"].get("channels", 128),
+        num_blocks=cfg["model"]["encoder"].get("num_blocks", 4),
+        num_stacks=cfg["model"]["encoder"].get("num_stacks", 2),
+        sample_rate=SR, n_fft=N_FFT,
+    ).to(device)
+    model.load_state_dict(ckpt.get("model_state_dict", ckpt))
+    model.eval()
+
+    # Load a few MUSDB18 test songs
+    musdb = Path(cfg["data"]["musdb_root"]) / "test"
+    songs = sorted([d for d in musdb.iterdir() if d.is_dir()])[:5]
+    num_samples = int(DURATION * SR)
+
+    # Load audio segments from each song
+    audio_pool = []
+    for song in songs:
+        wav = song / "mixture.wav"
+        if wav.exists():
+            wf, sr = torchaudio.load(str(wav))
+            if sr != SR:
+                wf = torchaudio.functional.resample(wf, sr, SR)
+            if wf.size(0) > 1:
+                wf = wf.mean(dim=0)
+            audio_pool.append(wf.numpy())
+    print(f"Loaded {len(audio_pool)} songs for evaluation")
+
+    N_TRIALS = 50
+    results = {"gain": [], "freq": [], "q": [], "type": [], "spectral": []}
+
+    for trial in range(N_TRIALS):
+        # Pick random audio and crop
+        audio = random.choice(audio_pool)
+        start = random.randint(0, max(0, len(audio) - num_samples))
+        dry = audio[start:start + num_samples]
+
+        # Random EQ
+        gt = random_eq_params()
+        wet = apply_cascade(dry, gt, SR)
+
+        # Inference
+        mel = audio_to_mel(torch.from_numpy(wet).float()).unsqueeze(0).to(device)
+        with torch.no_grad():
+            out = model(mel)
+
+        pg = out["params"][0].cpu().squeeze(0)
+        pf = out["params"][1].cpu().squeeze(0)
+        pq = out["params"][2].cpu().squeeze(0)
+        pft = out["filter_type"].cpu().squeeze(0)
+
+        gg = torch.tensor([p["gain"] for p in gt])
+        gf = torch.tensor([p["freq"] for p in gt])
+        gq = torch.tensor([p["q"] for p in gt])
+        gft = torch.tensor([p["type"] for p in gt])
+
+        # Hungarian matching for fair band comparison (same as training validation)
+        from loss_multitype import HungarianBandMatcher
+        matcher = HungarianBandMatcher(lambda_freq=1.0, lambda_q=0.5, lambda_type_match=0.5)
+        pred_type_logits = out["type_logits"].cpu().squeeze(0)
+        mg, mf, mq, mft = matcher(
+            pg.unsqueeze(0), pf.unsqueeze(0), pq.unsqueeze(0),
+            gg.unsqueeze(0), gf.unsqueeze(0), gq.unsqueeze(0),
+            target_filter_type=gft.unsqueeze(0),
+            pred_type_logits=pred_type_logits.unsqueeze(0),
+        )
+        mg, mf, mq, mft = mg.squeeze(0), mf.squeeze(0), mq.squeeze(0), mft.squeeze(0)
+
+        results["gain"].append((pg - mg).abs().mean().item())
+        results["freq"].append(torch.log2(pf / (mf + 1e-8)).abs().mean().item())
+        results["q"].append(torch.log10(pq / (mq + 1e-8)).abs().mean().item())
+        results["type"].append((pft == mft).float().mean().item())
+
+        # Spectral error
+        with torch.no_grad():
+            H_gt = model.dsp_cascade(
+                gg.unsqueeze(0).to(device), gf.unsqueeze(0).to(device),
+                gq.unsqueeze(0).to(device), N_FFT,
+                filter_type=gft.unsqueeze(0).to(device)
+            ).cpu().squeeze(0)
+        H_pred = out["H_mag"].cpu().squeeze(0)
+        spec_err = (20*torch.log10(H_pred+1e-8) - 20*torch.log10(H_gt+1e-8)).abs().mean().item()
+        results["spectral"].append(spec_err)
+
+        if (trial + 1) % 10 == 0:
+            print(f"  Trial {trial+1}/{N_TRIALS}: "
+                  f"gain={np.mean(results['gain'][-10:]):.2f}dB "
+                  f"freq={np.mean(results['freq'][-10:]):.3f}oct "
+                  f"q={np.mean(results['q'][-10:]):.3f}dec "
+                  f"type={np.mean(results['type'][-10:]):.0%} "
+                  f"spec={np.mean(results['spectral'][-10:]):.2f}dB")
+
+    print(f"\n{'='*60}")
+    print(f"MULTI-SAMPLE EVALUATION ({N_TRIALS} trials, {len(audio_pool)} songs)")
+    print(f"{'='*60}")
+    for k in ["gain", "freq", "q", "spectral"]:
+        vals = results[k]
+        print(f"  {k:>12} MAE: {np.mean(vals):.3f} +/- {np.std(vals):.3f}")
+    print(f"  {'type':>12} acc: {np.mean(results['type']):.1%}")
+    print(f"{'='*60}")
+
+
+if __name__ == "__main__":
+    main()

@@ -1,0 +1,9 @@
+{
+  "id": "1",
+  "subject": "Explore project context for frequency localization diagnosis",
+  "description": "Read the key files: differentiable_eq.py, loss_multitype.py, model_tcn.py, dsp_frontend.py, train.py, config.yaml to understand current frequency parameterization, loss weighting, and architecture.",
+  "activeForm": "Exploring project context",
+  "status": "completed",
+  "blocks": [],
+  "blockedBy": []
+}

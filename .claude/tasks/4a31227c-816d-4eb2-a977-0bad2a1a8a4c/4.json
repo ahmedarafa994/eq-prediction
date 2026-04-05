@@ -1,0 +1,11 @@
+{
+  "id": "4",
+  "subject": "Add spectral reconstruction loss (wet_mel vs dry_mel*H)",
+  "description": "Add a reconstruction loss term to MultiTypeEQLoss that applies predicted H_mag to dry_mel and compares to wet_mel. This is the key missing blind-estimation signal. Modify loss_multitype.py and train.py to pass wet_mel/dry_mel to the loss function.",
+  "activeForm": "Adding spectral reconstruction loss",
+  "status": "completed",
+  "blocks": [
+    "1"
+  ],
+  "blockedBy": []
+}

@@ -1,0 +1,9 @@
+{
+  "id": "11",
+  "subject": "Make attention temperature learnable",
+  "description": "Change attn_temperature from buffer to nn.Parameter, init at 0.5 instead of 0.1.",
+  "activeForm": "Making attention temperature learnable",
+  "status": "completed",
+  "blocks": [],
+  "blockedBy": []
+}

@@ -1,0 +1,42 @@
+import torch
+import pytorch_lightning as pl
+from pytorch_lightning.callbacks import ModelCheckpoint
+from pytorch_lightning.loggers import CSVLogger
+from pathlib import Path
+
+from data_module import EQDataModule
+from model_cnn import EQRegressor
+
+def main():
+    torch.set_float32_matmul_precision('high')
+
+    print("=== Step 1: Initialize Data ===")
+    dm = EQDataModule(data_dir=Path("dataset"), batch_size=128, num_workers=8)
+
+    print("=== Step 2: Initialize Model ===")
+    model = EQRegressor()
+
+    print("=== Step 3: Configure Trainer ===")
+    checkpoint_callback = ModelCheckpoint(
+        dirpath="checkpoints",
+        filename="eq-cnn-{epoch:02d}-{val_loss:.4f}",
+        save_top_k=3,
+        monitor="val_loss",
+        mode="min",
+    )
+
+    trainer = pl.Trainer(
+        max_epochs=50,
+        accelerator="auto",
+        devices=1,
+        callbacks=[checkpoint_callback],
+        logger=CSVLogger("logs", name="eq_cnn"),
+        log_every_n_steps=10,
+        enable_progress_bar=False,   # clean nohup log
+    )
+
+    print("=== Step 4: Training Start ===")
+    trainer.fit(model, datamodule=dm)
+
+if __name__ == "__main__":
+    main()

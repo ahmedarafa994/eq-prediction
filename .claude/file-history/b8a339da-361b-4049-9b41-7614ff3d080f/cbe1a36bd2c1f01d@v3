@@ -1,0 +1,133 @@
+"""
+Metrics: classification, regression, custom business metrics, calibration metrics,
+statistical significance testing, bootstrap confidence intervals.
+"""
+
+import numpy as np
+from sklearn.metrics import (
+    accuracy_score,
+    precision_score,
+    recall_score,
+    f1_score,
+    roc_auc_score,
+    average_precision_score,
+    confusion_matrix,
+    classification_report,
+    mean_squared_error,
+    mean_absolute_error,
+    mean_absolute_percentage_error,
+    r2_score,
+    brier_score_loss,
+    make_scorer,
+)
+from sklearn.calibration import calibration_curve
+
+
+# --- Classification metrics helpers ---
+
+def classification_metrics(y_true, y_pred, y_proba=None):
+    """Compute comprehensive classification metrics. Returns dict."""
+    metrics = {
+        "accuracy": accuracy_score(y_true, y_pred),
+        "precision": precision_score(y_true, y_pred, zero_division=0),
+        "recall": recall_score(y_true, y_pred, zero_division=0),
+        "f1": f1_score(y_true, y_pred, zero_division=0),
+    }
+    if y_proba is not None:
+        metrics["roc_auc"] = roc_auc_score(y_true, y_proba)
+        metrics["pr_auc"] = average_precision_score(y_true, y_proba)
+        metrics["brier_score"] = brier_score_loss(y_true, y_proba)
+    return metrics
+
+
+def classification_report_dict(y_true, y_pred):
+    """Return sklearn classification report as dict."""
+    return classification_report(y_true, y_pred, output_dict=True)
+
+
+def confusion_matrix_metrics(y_true, y_pred):
+    """Return TN, FP, FN, TP from confusion matrix."""
+    cm = confusion_matrix(y_true, y_pred)
+    if cm.shape == (2, 2):
+        tn, fp, fn, tp = cm.ravel()
+        return {"tn": tn, "fp": fp, "fn": fn, "tp": tp}
+    return {"confusion_matrix": cm}
+
+
+# --- Regression metrics helpers ---
+
+def regression_metrics(y_true, y_pred):
+    """Compute comprehensive regression metrics. Returns dict."""
+    return {
+        "rmse": np.sqrt(mean_squared_error(y_true, y_pred)),
+        "mae": mean_absolute_error(y_true, y_pred),
+        "mape": mean_absolute_percentage_error(y_true, y_pred),
+        "r2": r2_score(y_true, y_pred),
+    }
+
+
+def max_error_normalized(y_true, y_pred):
+    """Max error normalized by range. Returns float in [0, 1]."""
+    return np.max(np.abs(y_true - y_pred)) / (np.max(y_true) - np.min(y_true) + 1e-10)
+
+
+# --- Custom / business metrics ---
+
+def business_cost_metric(y_true, y_pred, cost_fp=10, cost_fn=1000):
+    """Cost-sensitive metric for asymmetric error costs. Returns negative total cost."""
+    tp = np.sum((y_true == 1) & (y_pred == 1))
+    fp = np.sum((y_true == 0) & (y_pred == 1))
+    fn = np.sum((y_true == 1) & (y_pred == 0))
+    return -(fp * cost_fp + fn * cost_fn)
+
+
+def make_business_scorer(cost_fp=10, cost_fn=1000):
+    """Create an sklearn-compatible scorer from business costs."""
+    return make_scorer(business_cost_metric, cost_fp=cost_fp, cost_fn=cost_fn)
+
+
+# --- Calibration metrics ---
+
+def expected_calibration_error(y_true, y_proba, n_bins=10):
+    """Compute Expected Calibration Error (ECE)."""
+    prob_true, prob_pred = calibration_curve(y_true, y_proba, n_bins=n_bins, strategy="uniform")
+    bin_counts = np.histogram(y_proba, bins=np.linspace(0, 1, n_bins + 1))[0]
+    bin_weights = bin_counts / len(y_true)
+    # prob_true/prob_pred may have fewer entries if bins are empty
+    if len(prob_true) < n_bins:
+        nonempty = bin_counts[bin_counts > 0]
+        weights = nonempty / len(y_true)
+        return np.sum(weights * np.abs(prob_true - prob_pred))
+    return np.sum(bin_weights[:len(prob_true)] * np.abs(prob_true - prob_pred))
+
+
+def brier_score(y_true, y_proba):
+    """Compute Brier score (lower is better)."""
+    return brier_score_loss(y_true, y_proba)
+
+
+# --- Statistical significance ---
+
+def paired_ttest(scores_a, scores_b):
+    """Paired t-test on CV scores from same folds. Returns (t_stat, p_value)."""
+    from scipy import stats
+    return stats.ttest_rel(scores_a, scores_b)
+
+
+def bootstrap_ci(scores, n_bootstrap=10000, alpha=0.05):
+    """Bootstrap confidence interval. Returns (mean, lower, upper)."""
+    n = len(scores)
+    boot_means = []
+    for _ in range(n_bootstrap):
+        sample = np.random.choice(scores, size=n, replace=True)
+        boot_means.append(sample.mean())
+    lower = np.percentile(boot_means, 100 * alpha / 2)
+    upper = np.percentile(boot_means, 100 * (1 - alpha / 2))
+    return np.mean(scores), lower, upper
+
+
+def multiple_comparison_correction(p_values, method="holm"):
+    """Correct p-values for multiple comparisons. Returns (rejected, corrected_p)."""
+    from statsmodels.stats.multitest import multipletests
+    rejected, p_corrected, _, _ = multipletests(p_values, method=method)
+    return rejected, p_corrected

@@ -1,0 +1,9 @@
+{
+  "id": "14",
+  "subject": "Verify: Run tests after all changes",
+  "description": "Run test_model.py and test_eq.py to verify all changes work correctly.",
+  "activeForm": "Running tests",
+  "status": "completed",
+  "blocks": [],
+  "blockedBy": []
+}

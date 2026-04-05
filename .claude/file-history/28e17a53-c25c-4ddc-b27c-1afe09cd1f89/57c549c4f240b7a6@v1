@@ -1,0 +1,89 @@
+# CLAUDE.md
+
+This file provides guidance to Claude Code (claude.ai/code) when working with code in this repository.
+
+## Project Overview
+
+This is a **differentiable DSP (IDSP) system for blind parametric EQ parameter estimation**. Given an audio signal that has been processed through a multi-band parametric EQ, the model estimates the EQ parameters (gain, frequency, Q, filter type) without access to the original dry signal.
+
+The main project lives in `insight/`. The rest of this studio directory contains Lightning AI environment files, plugin caches, and template apps unrelated to the core work.
+
+## Commands
+
+### Running Tests
+
+Tests are standalone Python scripts (no pytest). Run from `insight/`:
+
+```bash
+cd insight
+python test_eq.py              # Differentiable biquad gradient flow
+python test_model.py           # CNN model forward/inverse/cycle/gradient
+python test_streaming.py       # TCN streaming mode, batch-vs-streaming consistency
+python test_multitype_eq.py    # Multi-type filters (HP/LP/shelf) + parameter head
+python test_lightning_dummy.py # PyTorch Lightning fast_dev_run smoke test
+```
+
+### Training
+
+```bash
+cd insight
+python train.py                # Full training with config from conf/config.yaml
+```
+
+### ONNX Export
+
+```bash
+cd insight
+python export.py --checkpoint checkpoints/best.pt --output eq_estimator.onnx
+```
+
+## Architecture
+
+### Core DSP Layer
+
+- **`differentiable_eq.py`** — The foundation. `DifferentiableBiquadCascade` computes biquad filter coefficients from (gain, freq, Q, filter_type) tensors and evaluates frequency responses entirely in PyTorch for gradient flow. Coefficient formulas from the Robert Bristow-Johnson Audio EQ Cookbook. Supports 5 filter types: peaking, lowshelf, highshelf, highpass, lowpass. Uses `torch.where` for differentiable type selection and Gumbel-Softmax for soft type probabilities during training.
+
+- **`dsp_frontend.py`** — `STFTFrontend`: differentiable STFT/iSTFT with a manually-built mel filterbank (no torchaudio dependency). Supports causal mode for streaming.
+
+### Models
+
+- **`model_tcn.py`** (primary) — `StreamingTCNModel`: causal 1D TCN encoder (WaveNet-style gated activations with dilated convolutions) → `MultiTypeEQParameterHead` → `DifferentiableBiquadCascade`. Supports both batch training and frame-by-frame streaming inference via `init_streaming()` / `process_frame()`. Cumulative mean of skip connections produces a stable embedding.
+
+- **`model_cnn.py`** (earlier variant) — `EQEstimatorCNN`: 2D CNN on mel-spectrograms with `EQParameterHead` (peaking-only). Kept for backward compatibility.
+
+### Parameter Heads
+
+- `EQParameterHead` — peaking-only: tanh/sigmoid activation for constrained gain/freq/Q output.
+- `MultiTypeEQParameterHead` — adds filter type classification via Gumbel-Softmax, log-frequency parameterization for perceptually uniform resolution.
+
+### Loss Functions
+
+- **`loss.py`** — `MultiResolutionSTFTLoss`, `FreqResponseLoss`, `CycleConsistencyLoss`, `EQParameterPriorLoss`, `CombinedIDSPLoss` (for the CNN variant).
+- **`loss_multitype.py`** (primary) — `HungarianBandMatcher` solves the band permutation problem (DETR-style). `MultiTypeEQLoss` combines: parameter regression (Huber), type classification (cross-entropy), frequency response L1, band activity regularization, and frequency spread regularization.
+
+### Data
+
+- **`dataset.py`** — `SyntheticEQDataset`: generates (dry, wet, params) tuples on-the-fly using synthetic signals (noise, sweep, harmonic, speech_like) with random multi-type EQ applied in frequency domain. Supports `precompute()` mode that caches mel-spectrograms in memory.
+
+### Training
+
+- **`train.py`** — Custom `Trainer` class (no Lightning dependency). Uses `StreamingTCNModel` with `MultiTypeEQLoss`. AdamW + CosineAnnealing. Precomputes mel-spectrograms for speed.
+- **`training/`** — PyTorch Lightning alternative (`lightning_module.py`, `train.py`) with curriculum learning (`curriculum.py`) and evaluation (`evaluate.py`).
+- **`conf/config.yaml`** — All hyperparameters, model architecture, loss weights, and curriculum stages.
+
+### Export
+
+- **`export.py`** — ONNX export of TCN model with PyTorch/ONNX benchmarking and numerical verification.
+
+## Key Design Decisions
+
+- All DSP is differentiable in PyTorch (no external audio processing in the training loop).
+- Hungarian matching makes the loss permutation-invariant to band ordering.
+- Log-frequency parameterization gives equal resolution per octave.
+- Gumbel-Softmax enables differentiable filter type selection; hard argmax at inference.
+- The streaming mode uses a rolling buffer and cumulative skip-connection mean for frame-by-frame inference.
+- No external audio files needed — all training data is synthetic.
+
+## Dependencies
+
+PyTorch, torchaudio, scipy (for Hungarian matching), pyyaml. Optional: pytorch-lightning, onnxruntime, wandb.

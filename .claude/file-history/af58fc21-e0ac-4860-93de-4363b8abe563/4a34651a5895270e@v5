@@ -1,0 +1,88 @@
+# Fix: Gain MAE stuck at ~7 dB despite 23 epochs of training
+
+## Context
+
+The Gaussian readout gain mechanism (`mel_residual * gain_cal_scale + gain_cal_bias`) **does not learn**. After 23 epochs:
+- `gain_cal_scale` stays at 8.0 (initial value) for all 5 bands
+- `gain_cal_bias` stays at 0.0 for all 5 bands  
+- Predicted gains cluster near 0 dB regardless of target (range [-0.05, 0.05])
+- **Gain MAE = 6.81 dB** — essentially predicting 0 for everything
+- **Mel residual range: [-0.001, 0.001]** — the signal is 1000x too small to drive learning
+
+The mel residual (mel_profile - smooth(mel_profile)) has magnitude ~0.001 while gains are 0-12 dB. The `gain_cal_scale=8.0` only amplifies this to ~0.008 — nowhere near the 6-12 dB range needed. The gradient from `param_loss` through `gain_cal_scale` and `gain_cal_bias` cannot overcome this massive scale mismatch.
+
+The v6 training uses a **modified `train.py`** with extra losses (`coverage_loss`, `freq_anchor_loss`, `attn_entropy_loss`, `recon_loss`) not present in the current `loss_multitype.py`. These were from a previous session's patches that have since been reverted. The current on-disk `loss_multitype.py` only has 7 original losses.
+
+## Root Cause
+
+The Gaussian readout architecture is fundamentally broken:
+1. Mel residual ≈ 0.001 (too small)
+2. `gain_cal_scale` = 8.0 (amplifies to 0.008, still 1000x too small)
+3. `gain_cal_bias` = 0.0 (no baseline shift mechanism)
+4. Gradients from `param_loss` try to push `gain_cal_scale` higher, but the mel residual is so small that even scale=1000 wouldn't produce meaningful gains
+5. The residual depends on predicted frequency, creating a circular dependency: frequency must be correct for gain readout to work, but gain learning is blocked
+
+## Fix: Replace Gaussian Readout with Direct Gain MLP
+
+Replace the `gain_cal_scale/gain_cal_bias` linear calibration with a proper 2-layer MLP that maps (trunk_features, mel_features_at_predicted_freq) → gain_db. This bypasses the mel residual scale problem entirely.
+
+### Changes
+
+#### 1. Replace gain calibration with gain MLP in `differentiable_eq.py`
+
+**File**: `insight/differentiable_eq.py` — `MultiTypeEQParameterHead.__init__` and `forward`
+
+In `__init__`, replace:
+```python
+self.gain_cal_scale = nn.Parameter(torch.ones(num_bands) * 8.0)
+self.gain_cal_bias = nn.Parameter(torch.zeros(num_bands))
+```
+
+With a gain MLP that takes concatenated [trunk_features, mel_readout, log_freq] → gain_db:
+```python
+# Gain MLP: trunk features + mel readout + log_freq → gain_db
+# Input: 64 (trunk) + 1 (mel readout) + 1 (log_freq) = 66
+self.gain_mlp = nn.Sequential(
+    nn.Linear(hidden_dim + 2, 32),
+    nn.ReLU(),
+    nn.Linear(32, 1),
+)
+```
+
+In `forward`, replace the Gaussian readout + calibration:
+```python
+# OLD: gain_db = gain_readout * self.gain_cal_scale + self.gain_cal_bias
+# NEW:
+gain_input = torch.cat([trunk_out, gain_readout.unsqueeze(-1), log_freq_pred.unsqueeze(-1)], dim=-1)
+gain_db = self.gain_mlp(gain_input).squeeze(-1)
+gain_db = torch.tanh(gain_db / 12.0) * 24.0  # soft clamp to [-24, 24]
+```
+
+This gives the model 3 information sources for gain prediction:
+1. **trunk_out** (64-dim): encoder embedding features (already learned for freq/Q)
+2. **gain_readout**: mel residual at predicted frequency (physical signal, even if small)
+3. **log_freq_pred**: predicted log-frequency (gain depends on frequency context)
+
+#### 2. Add NaN/inf guards to loss computation (`loss_multitype.py`)
+
+Already done: the `nan_to_num` guard in `HungarianBandMatcher.match()` is in place.
+
+#### 3. Add NaN skip in training loop (`train.py`)
+
+Already done: the `if not torch.isfinite(total_loss): continue` guard is in place.
+
+### Files to modify
+
+1. `insight/differentiable_eq.py` — Replace `gain_cal_scale`/`gain_cal_bias` with `gain_mlp` in `MultiTypeEQParameterHead`
+2. (No other files need changes — loss and train.py already have NaN guards)
+
+### Verification
+
+1. `python test_multitype_eq.py` — all tests must pass (parameter shapes, bounds, gradient flow)
+2. Start training: `python train.py 2>&1 | tee training_v7.log`
+3. After 5 epochs:
+   - Gain MAE should be < 6 dB (vs 7.4 before)
+   - `gain_mlp` weights should be non-trivial (not stuck at init)
+4. After 20 epochs:
+   - Gain MAE should be < 5 dB
+   - No NaN divergence

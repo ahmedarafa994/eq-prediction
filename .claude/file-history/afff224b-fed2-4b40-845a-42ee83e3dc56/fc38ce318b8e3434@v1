@@ -1,0 +1,83 @@
+# Simplified configuration for INITIAL VERIFICATION of the IDSP EQ Estimator.
+#
+# Purpose: Verify the model can learn on a simpler problem before scaling up.
+# - Peaking-only (1 filter type — no type classification needed)
+# - 3 bands instead of 5 (simpler permutation matching)
+# - Smaller TCN: 2 blocks × 1 stack (fewer parameters, faster iteration)
+# - Shorter audio (1.5s) for quicker data generation
+# - 2-stage curriculum for gradual difficulty
+#
+# Once this converges, graduate to config.yaml for the full multi-type model.
+
+experiment_name: "idsp-eq-simple-peaking"
+seed: 42
+
+data:
+  num_bands: 3
+  sample_rate: 44100
+  audio_duration: 1.5
+  n_fft: 2048
+  hop_length: 256
+  n_mels: 128
+  gain_bounds: [-18.0, 18.0]
+  freq_bounds: [100.0, 16000.0]
+  q_bounds: [0.3, 6.0]
+  filter_types: ["peaking"]           # Single type — no classification needed
+  type_weights: [1.0]
+  train_split: 0.8
+  val_split: 0.1
+  test_split: 0.1
+  batch_size: 32
+  num_workers: 4
+  dataset_size: 20000
+
+model:
+  encoder:
+    type: "tcn"
+    n_mels: 128
+    embedding_dim: 64              # Smaller embedding
+    channels: 64                   # Fewer channels
+    num_blocks: 2                  # Fewer blocks → smaller receptive field but faster
+    num_stacks: 1                  # Single stack
+    kernel_size: 5                 # Wider kernel for larger receptive field per block
+  num_bands: 3
+  learning_rate: 0.001             # Higher LR — simpler problem converges faster
+  weight_decay: 0.00001
+
+loss:
+  lambda_param: 1.0
+  lambda_type: 0.0                 # No type loss — single type
+  lambda_spectral: 0.5             # Lighter spectral loss
+  lambda_hmag: 1.0                 # Emphasize frequency response matching
+  lambda_activity: 0.0             # No activity regularization needed
+  lambda_spread: 0.02
+  lambda_freq_match: 1.0
+  lambda_q_match: 0.5
+
+trainer:
+  max_epochs: 40
+  accelerator: "auto"
+  devices: 1
+  precision: "16-mixed"
+  log_every_n_steps: 10
+  fast_dev_run: false
+
+curriculum:
+  stages:
+    - name: "easy_peaking"
+      epochs: 15
+      filter_types: ["peaking"]
+      param_ranges:
+        gain: [-6.0, 6.0]
+        q: [0.5, 3.0]
+      lambda_type: 0.0
+      gumbel_temperature: 1.0
+
+    - name: "full_peaking"
+      epochs: 25
+      filter_types: ["peaking"]
+      param_ranges:
+        gain: [-18.0, 18.0]
+        q: [0.3, 6.0]
+      lambda_type: 0.0
+      gumbel_temperature: 0.5

@@ -1,0 +1,83 @@
+"""
+Precompute all curriculum stage datasets in parallel.
+Run once before training to avoid precomputation pauses at stage transitions.
+"""
+import sys
+import yaml
+import multiprocessing as mp
+from pathlib import Path
+
+sys.path.append(str(Path(__file__).parent))
+
+from dataset import SyntheticEQDataset
+
+FILTER_NAMES = ["peaking", "lowshelf", "highshelf", "highpass", "lowpass"]
+FILTER_TYPE_TO_IDX = {name: idx for idx, name in enumerate(FILTER_NAMES)}
+
+
+def build_type_weights(filter_types):
+    weights = [0.0] * len(FILTER_NAMES)
+    for ft in filter_types:
+        weights[FILTER_TYPE_TO_IDX[ft]] = 1.0 / len(filter_types)
+    return weights
+
+
+def precompute_stage(args):
+    name, data_cfg, stage_cfg = args
+    print(f"[{name}] starting...")
+
+    param_ranges = stage_cfg.get("param_ranges", {})
+    gain_lo, gain_hi = param_ranges.get("gain", data_cfg["gain_bounds"])
+    q_lo, q_hi = param_ranges.get("q", data_cfg["q_bounds"])
+    filter_types = stage_cfg.get("filter_types", data_cfg["filter_types"])
+    min_gain_db = stage_cfg.get("min_gain_db", 0.0)
+
+    dataset = SyntheticEQDataset(
+        num_bands=data_cfg["num_bands"],
+        sample_rate=data_cfg["sample_rate"],
+        duration=data_cfg["audio_duration"],
+        n_fft=data_cfg["n_fft"],
+        size=data_cfg["dataset_size"],
+        gain_range=(gain_lo, gain_hi),
+        freq_range=tuple(data_cfg["freq_bounds"]),
+        q_range=(q_lo, q_hi),
+        type_weights=build_type_weights(filter_types),
+        precompute_mels=True,
+        n_mels=data_cfg["n_mels"],
+        min_gain_db=min_gain_db,
+    )
+    dataset.precompute()
+    print(f"[{name}] done.")
+
+
+if __name__ == "__main__":
+    with open("conf/config.yaml") as f:
+        config = yaml.safe_load(f)
+
+    data_cfg = config["data"]
+    stages = config["curriculum"]["stages"]
+
+    # Also precompute the base (no-stage) dataset
+    all_stages = [("base", data_cfg, {})] + [(s["name"], data_cfg, s) for s in stages]
+
+    # Deduplicate by effective params (some stages share the same dataset)
+    seen = set()
+    unique_stages = []
+    for name, dcfg, scfg in all_stages:
+        param_ranges = scfg.get("param_ranges", {})
+        key = (
+            tuple(param_ranges.get("gain", dcfg["gain_bounds"])),
+            tuple(param_ranges.get("q", dcfg["q_bounds"])),
+            tuple(scfg.get("filter_types", dcfg["filter_types"])),
+            scfg.get("min_gain_db", 0.0),
+        )
+        if key not in seen:
+            seen.add(key)
+            unique_stages.append((name, dcfg, scfg))
+
+    print(f"Precomputing {len(unique_stages)} unique stage datasets in parallel...")
+
+    with mp.Pool(processes=len(unique_stages)) as pool:
+        pool.map(precompute_stage, unique_stages)
+
+    print("All stages precomputed and cached.")

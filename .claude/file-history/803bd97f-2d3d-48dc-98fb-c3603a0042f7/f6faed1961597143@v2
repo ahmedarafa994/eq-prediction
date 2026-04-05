@@ -1,0 +1,97 @@
+"""Test NaN guards in the Hungarian matcher and Gumbel-Softmax."""
+import torch
+from loss_multitype import HungarianBandMatcher
+
+
+def test_clean_inputs():
+    """Clean inputs should produce finite cost matrix."""
+    matcher = HungarianBandMatcher(lambda_freq=1.0, lambda_q=0.5)
+    B, N = 4, 3
+    pred_gain = torch.randn(B, N)
+    pred_freq = 100 + 19000 * torch.rand(B, N)
+    pred_q = 0.1 + 9.9 * torch.rand(B, N)
+    target_gain = torch.randn(B, N)
+    target_freq = 100 + 19000 * torch.rand(B, N)
+    target_q = 0.1 + 9.9 * torch.rand(B, N)
+    cost = matcher.compute_cost_matrix(
+        pred_gain, pred_freq, pred_q, target_gain, target_freq, target_q
+    )
+    assert torch.isfinite(cost).all(), f"NaN in clean cost matrix!"
+    print("  PASS: clean inputs → finite cost matrix")
+
+
+def test_nan_in_pred_freq():
+    """NaN in pred_freq should be sanitized."""
+    matcher = HungarianBandMatcher()
+    B, N = 4, 3
+    pred_gain = torch.randn(B, N)
+    pred_freq = torch.tensor([
+        [float('nan'), 1000.0, 2000.0],
+        [500.0, float('nan'), 3000.0],
+        [400.0, 800.0, float('inf')],
+        [float('-inf'), 600.0, 1500.0],
+    ])
+    pred_q = 0.5 + torch.rand(B, N)
+    target_gain = torch.randn(B, N)
+    target_freq = 100 + 19000 * torch.rand(B, N)
+    target_q = 0.1 + 9.9 * torch.rand(B, N)
+    cost = matcher.compute_cost_matrix(
+        pred_gain, pred_freq, pred_q, target_gain, target_freq, target_q
+    )
+    assert torch.isfinite(cost).all(), f"NaN survived in cost matrix!"
+    print("  PASS: NaN/Inf in pred_freq → sanitized cost matrix")
+
+
+def test_nan_in_type_logits():
+    """NaN in type_logits should be sanitized before softmax."""
+    matcher = HungarianBandMatcher(lambda_type_match=2.0)
+    B, N = 2, 3
+    pred_gain = torch.randn(B, N)
+    pred_freq = 100 + 19000 * torch.rand(B, N)
+    pred_q = 0.5 + torch.rand(B, N)
+    target_gain = torch.randn(B, N)
+    target_freq = 100 + 19000 * torch.rand(B, N)
+    target_q = 0.5 + torch.rand(B, N)
+    # Inject NaN into type logits
+    type_logits = torch.randn(B, N, 5)
+    type_logits[0, 0, :] = float('nan')
+    type_logits[1, 2, :] = float('inf')
+    target_ft = torch.tensor([[0, 1, 2], [3, 4, 0]])
+    cost = matcher.compute_cost_matrix(
+        pred_gain, pred_freq, pred_q,
+        target_gain, target_freq, target_q,
+        pred_type_logits=type_logits,
+        target_filter_type=target_ft,
+    )
+    assert torch.isfinite(cost).all(), f"NaN from type_logits survived!"
+    print("  PASS: NaN/Inf in type_logits → sanitized cost matrix")
+
+
+def test_gumbel_softmax_no_nan():
+    """Manual Gumbel-Softmax should never produce NaN over many samples."""
+    from differentiable_eq import MultiTypeEQParameterHead
+    head = MultiTypeEQParameterHead(
+        embedding_dim=128, num_bands=3, num_filter_types=5, n_mels=256
+    )
+    head.train()
+
+    # Run 1000 forward passes to stress-test Gumbel noise
+    n_trials = 1000
+    n_nan = 0
+    for _ in range(n_trials):
+        embedding = torch.randn(64, 128)
+        mel_profile = torch.randn(64, 256)
+        _, _, _, _, type_probs, _ = head(embedding, mel_profile=mel_profile)
+        if not torch.isfinite(type_probs).all():
+            n_nan += 1
+    assert n_nan == 0, f"Gumbel-Softmax produced NaN in {n_nan}/{n_trials} trials!"
+    print(f"  PASS: Gumbel-Softmax NaN-free over {n_trials} trials (batch_size=64)")
+
+
+if __name__ == "__main__":
+    print("Testing NaN fixes...")
+    test_clean_inputs()
+    test_nan_in_pred_freq()
+    test_nan_in_type_logits()
+    test_gumbel_softmax_no_nan()
+    print("\nAll NaN fix tests passed!")

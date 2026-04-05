@@ -1,0 +1,9 @@
+{
+  "id": "2",
+  "subject": "Sharpen frequency attention in differentiable_eq.py",
+  "description": "Add attn_temperature annealing buffer, change freq_blend_weight init from 0.0 to 2.0",
+  "activeForm": "Updating differentiable_eq.py",
+  "status": "completed",
+  "blocks": [],
+  "blockedBy": []
+}

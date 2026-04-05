@@ -1,0 +1,458 @@
+"""
+Training script for the multi-type IDSP EQ Estimator.
+
+Uses StreamingTCNModel with MultiTypeEQLoss (Hungarian matching,
+permutation-invariant parameter regression, type classification).
+Implements curriculum learning from conf/config.yaml stages.
+"""
+import torch
+import torch.nn as nn
+from torch.utils.data import DataLoader
+from model_tcn import StreamingTCNModel
+from dsp_frontend import STFTFrontend
+from loss_multitype import MultiTypeEQLoss
+from dataset import SyntheticEQDataset, collate_fn, FILTER_NAMES
+import yaml
+from pathlib import Path
+import time
+import json
+
+
+def load_config(path="conf/config.yaml"):
+    with open(path, "r") as f:
+        return yaml.safe_load(f)
+
+
+# Map filter type names to indices used in dataset
+FILTER_TYPE_TO_IDX = {name: idx for idx, name in enumerate(FILTER_NAMES)}
+
+
+class Trainer:
+    def __init__(self, config_path="conf/config.yaml"):
+        self.cfg = load_config(config_path)
+        self.device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+
+        data_cfg = self.cfg["data"]
+        model_cfg = self.cfg["model"]
+        loss_cfg = self.cfg["loss"]
+        trainer_cfg = self.cfg["trainer"]
+
+        self.num_bands = data_cfg["num_bands"]
+        self.sample_rate = data_cfg["sample_rate"]
+        self.n_fft = data_cfg.get("n_fft", 2048)
+        self.log_every = trainer_cfg["log_every_n_steps"]
+
+        # Curriculum config
+        self.curriculum_cfg = self.cfg.get("curriculum", {})
+        self.stages = self.curriculum_cfg.get("stages", [])
+
+        # Compute total epochs from curriculum stages (or fall back to trainer.max_epochs)
+        if self.stages:
+            self.max_epochs = sum(s["epochs"] for s in self.stages)
+        else:
+            self.max_epochs = trainer_cfg["max_epochs"]
+
+        # Model
+        enc_cfg = model_cfg.get("encoder", {})
+        self.model = StreamingTCNModel(
+            n_mels=data_cfg.get("n_mels", 128),
+            embedding_dim=enc_cfg.get("embedding_dim", 128),
+            num_bands=self.num_bands,
+            channels=enc_cfg.get("channels", 128),
+            num_blocks=enc_cfg.get("num_blocks", 4),
+            num_stacks=enc_cfg.get("num_stacks", 2),
+            sample_rate=self.sample_rate,
+            n_fft=self.n_fft,
+        ).to(self.device)
+
+        # STFT frontend
+        self.frontend = STFTFrontend(
+            n_fft=self.n_fft,
+            hop_length=data_cfg.get("hop_length", 256),
+            win_length=self.n_fft,
+            mel_bins=data_cfg.get("n_mels", 128),
+            sample_rate=self.sample_rate,
+        ).to(self.device)
+
+        # Loss (base weights — curriculum stages can override)
+        self.base_loss_cfg = loss_cfg
+        self.criterion = MultiTypeEQLoss(
+            n_fft=self.n_fft,
+            sample_rate=self.sample_rate,
+            lambda_param=loss_cfg.get("lambda_param", 1.0),
+            lambda_type=loss_cfg.get("lambda_type", 2.0),
+            lambda_spectral=loss_cfg.get("lambda_spectral", 1.0),
+            lambda_hmag=loss_cfg.get("lambda_hmag", 0.3),
+            lambda_activity=loss_cfg.get("lambda_activity", 0.1),
+            lambda_spread=loss_cfg.get("lambda_spread", 0.05),
+        ).to(self.device)
+
+        self.optimizer = torch.optim.AdamW(
+            self.model.parameters(),
+            lr=model_cfg["learning_rate"],
+            weight_decay=model_cfg["weight_decay"],
+        )
+
+        self.data_cfg = data_cfg
+        self.global_step = 0
+        self.best_val_loss = float("inf")
+        self.history = []
+
+        # Data config for stage transitions
+        self.train_loader = None
+        self.val_loader = None
+        self.test_loader = None
+
+    def _build_stage_dataset(self, stage_cfg):
+        """Build a dataset for a specific curriculum stage."""
+        data_cfg = self.data_cfg
+
+        # Determine which filter types to include
+        filter_types = stage_cfg.get("filter_types", data_cfg["filter_types"])
+        # Build type_weights: uniform over active types, 0 for inactive
+        active_indices = [FILTER_TYPE_TO_IDX[ft] for ft in filter_types]
+        n_active = len(active_indices)
+        type_weights = [0.0] * len(FILTER_NAMES)
+        for idx in active_indices:
+            type_weights[idx] = 1.0 / n_active
+
+        # Get param ranges for this stage (or fall back to data config)
+        param_ranges = stage_cfg.get("param_ranges", {})
+        gain_lo, gain_hi = param_ranges.get("gain", data_cfg["gain_bounds"])
+        # q is a list of [lo, hi]
+        q_range = param_ranges.get("q", data_cfg["q_bounds"])
+
+        dataset = SyntheticEQDataset(
+            num_bands=self.num_bands,
+            sample_rate=self.sample_rate,
+            duration=1.5,
+            n_fft=self.n_fft,
+            size=50000,
+            gain_range=(gain_lo, gain_hi),
+            freq_range=tuple(data_cfg["freq_bounds"]),
+            q_range=tuple(q_range),
+            type_weights=type_weights,
+            precompute_mels=True,
+            n_mels=data_cfg.get("n_mels", 128),
+        )
+        dataset.precompute()
+        return dataset
+
+    def _setup_stage(self, stage_cfg):
+        """Prepare dataset and update loss weights for a curriculum stage."""
+        print(f"\n{'='*60}")
+        print(f"  Stage: {stage_cfg['name']}")
+        print(f"{'='*60}")
+
+        dataset = self._build_stage_dataset(stage_cfg)
+
+        n_train = int(len(dataset) * self.data_cfg["train_split"])
+        n_val = int(len(dataset) * self.data_cfg["val_split"])
+        n_test = len(dataset) - n_train - n_val
+        train_set, val_set, test_set = torch.utils.data.random_split(
+            dataset, [n_train, n_val, n_test]
+        )
+
+        self.train_loader = DataLoader(
+            train_set,
+            batch_size=self.data_cfg["batch_size"],
+            shuffle=True,
+            num_workers=0,
+            collate_fn=collate_fn,
+            pin_memory=False,
+            drop_last=True,
+        )
+        self.val_loader = DataLoader(
+            val_set,
+            batch_size=self.data_cfg["batch_size"],
+            shuffle=False,
+            num_workers=0,
+            collate_fn=collate_fn,
+            pin_memory=False,
+        )
+
+        # Update loss weights from stage config
+        if "lambda_type" in stage_cfg:
+            self.criterion.lambda_type = stage_cfg["lambda_type"]
+            print(f"  lambda_type = {stage_cfg['lambda_type']}")
+
+        # Update Gumbel temperature if model supports it
+        gumbel_temp = stage_cfg.get("gumbel_temperature", None)
+        if gumbel_temp is not None and hasattr(self.model, 'param_head'):
+            if hasattr(self.model.param_head, 'gumbel_temperature'):
+                self.model.param_head.gumbel_temperature = gumbel_temp
+                print(f"  gumbel_temperature = {gumbel_temp}")
+
+        # Update learning rate scale for fine-tuning stages
+        lr_scale = stage_cfg.get("learning_rate_scale", None)
+        if lr_scale is not None:
+            for pg in self.optimizer.param_groups:
+                pg['lr'] = self.cfg["model"]["learning_rate"] * lr_scale
+            print(f"  lr scaled to {self.optimizer.param_groups[0]['lr']:.2e}")
+
+        # Rebuild scheduler for this stage's epoch count
+        stage_epochs = stage_cfg["epochs"]
+        self.scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(
+            self.optimizer, T_max=stage_epochs, eta_min=1e-6
+        )
+
+    def _prepare_input(self, batch):
+        """Get mel-spectrogram from precomputed cache or compute on-the-fly."""
+        if "wet_mel" in batch:
+            return batch["wet_mel"].to(self.device)
+        wet_audio = batch["wet_audio"].to(self.device)
+        mel_spec = self.frontend.mel_spectrogram(wet_audio)
+        return mel_spec.squeeze(1)
+
+    def train_one_epoch(self, epoch):
+        self.model.train()
+        epoch_loss = 0.0
+        n_batches = 0
+
+        for batch_idx, batch in enumerate(self.train_loader):
+            mel_frames = self._prepare_input(batch)
+            target_gain = batch["gain"].to(self.device)
+            target_freq = batch["freq"].to(self.device)
+            target_q = batch["q"].to(self.device)
+            target_ft = batch["filter_type"].to(self.device)
+
+            self.optimizer.zero_grad()
+
+            output = self.model(mel_frames)
+            pred_gain, pred_freq, pred_q = output["params"]
+
+            target_H_mag = self.model.dsp_cascade(
+                target_gain, target_freq, target_q,
+                n_fft=self.n_fft, filter_type=target_ft
+            )
+
+            total_loss, components = self.criterion(
+                pred_gain, pred_freq, pred_q,
+                output["type_logits"], output["H_mag"],
+                target_gain, target_freq, target_q,
+                target_ft, target_H_mag,
+            )
+
+            total_loss.backward()
+            torch.nn.utils.clip_grad_norm_(self.model.parameters(), max_norm=1.0)
+            self.optimizer.step()
+
+            epoch_loss += total_loss.item()
+            n_batches += 1
+            self.global_step += 1
+
+            if self.global_step % self.log_every == 0:
+                lr = self.optimizer.param_groups[0]["lr"]
+                parts = [f"step={self.global_step} loss={total_loss.item():.4f} lr={lr:.2e}"]
+                for k, v in components.items():
+                    parts.append(f"{k}={v:.4f}")
+                print(f"  [train] " + " | ".join(parts))
+
+        return epoch_loss / max(n_batches, 1)
+
+    @torch.no_grad()
+    def validate(self, epoch):
+        self.model.eval()
+        val_loss = 0.0
+        n_batches = 0
+        param_maes = {"gain": [], "freq": [], "q": [], "type_acc": []}
+
+        for batch in self.val_loader:
+            mel_frames = self._prepare_input(batch)
+            target_gain = batch["gain"].to(self.device)
+            target_freq = batch["freq"].to(self.device)
+            target_q = batch["q"].to(self.device)
+            target_ft = batch["filter_type"].to(self.device)
+
+            output = self.model(mel_frames)
+            pred_gain, pred_freq, pred_q = output["params"]
+
+            target_H_mag = self.model.dsp_cascade(
+                target_gain, target_freq, target_q,
+                n_fft=self.n_fft, filter_type=target_ft
+            )
+
+            total_loss, _ = self.criterion(
+                pred_gain, pred_freq, pred_q,
+                output["type_logits"], output["H_mag"],
+                target_gain, target_freq, target_q,
+                target_ft, target_H_mag,
+            )
+
+            val_loss += total_loss.item()
+            n_batches += 1
+
+            param_maes["gain"].append(
+                (pred_gain - target_gain).abs().mean().item()
+            )
+            param_maes["freq"].append(
+                (torch.log2(pred_freq / (target_freq + 1e-8))).abs().mean().item()
+            )
+            param_maes["q"].append(
+                (torch.log10(pred_q / (target_q + 1e-8))).abs().mean().item()
+            )
+            param_maes["type_acc"].append(
+                (output["filter_type"] == target_ft).float().mean().item()
+            )
+
+        avg_val_loss = val_loss / max(n_batches, 1)
+        metrics = {k: sum(v) / len(v) for k, v in param_maes.items() if v}
+
+        print(
+            f"  [val] epoch={epoch} val_loss={avg_val_loss:.4f} "
+            f"gain_mae={metrics.get('gain', 0):.2f}dB "
+            f"freq_mae={metrics.get('freq', 0):.3f}oct "
+            f"q_mae={metrics.get('q', 0):.3f}dec "
+            f"type_acc={metrics.get('type_acc', 0):.1%}"
+        )
+        return avg_val_loss, metrics
+
+    def save_checkpoint(self, epoch, val_loss, is_best=False, stage_name=""):
+        ckpt_dir = Path("checkpoints")
+        ckpt_dir.mkdir(exist_ok=True)
+        state = {
+            "epoch": epoch,
+            "stage": stage_name,
+            "model_state_dict": self.model.state_dict(),
+            "optimizer_state_dict": self.optimizer.state_dict(),
+            "val_loss": val_loss,
+            "global_step": self.global_step,
+        }
+        path = ckpt_dir / f"epoch_{epoch:03d}.pt"
+        torch.save(state, path)
+        if is_best:
+            best_path = ckpt_dir / "best.pt"
+            torch.save(state, best_path)
+        print(f"  Saved checkpoint: {path}" + (" (best)" if is_best else ""))
+
+    def fit(self):
+        total_params = sum(p.numel() for p in self.model.parameters())
+        print(f"IDSP Multi-Type EQ Estimator Training")
+        print(f"  Device: {self.device}")
+        print(f"  Parameters: {total_params:,}")
+        print(f"  Max epochs: {self.max_epochs}")
+        print(f"  Receptive field: {self.model.receptive_field_frames} frames")
+
+        if self.stages:
+            print(f"  Curriculum: {len(self.stages)} stages")
+            for s in self.stages:
+                print(f"    - {s['name']}: {s['epochs']} epochs")
+
+        global_epoch = 0
+
+        if self.stages:
+            # Curriculum-based training
+            for stage in self.stages:
+                self._setup_stage(stage)
+
+                for local_epoch in range(1, stage["epochs"] + 1):
+                    global_epoch += 1
+                    t0 = time.time()
+                    train_loss = self.train_one_epoch(global_epoch)
+                    val_loss, metrics = self.validate(global_epoch)
+                    self.scheduler.step()
+                    elapsed = time.time() - t0
+
+                    is_best = val_loss < self.best_val_loss
+                    if is_best:
+                        self.best_val_loss = val_loss
+                    self.save_checkpoint(global_epoch, val_loss, is_best, stage["name"])
+
+                    self.history.append({
+                        "epoch": global_epoch,
+                        "stage": stage["name"],
+                        "train_loss": train_loss,
+                        "val_loss": val_loss,
+                        "metrics": metrics,
+                        "time_s": elapsed,
+                    })
+
+                    print(
+                        f"Epoch {global_epoch}/{self.max_epochs} [{stage['name']}] "
+                        f"({elapsed:.1f}s) train={train_loss:.4f} val={val_loss:.4f}"
+                    )
+        else:
+            # Flat training (no curriculum)
+            self._setup_flat_training()
+            self.scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(
+                self.optimizer, T_max=self.max_epochs, eta_min=1e-6
+            )
+
+            for epoch in range(1, self.max_epochs + 1):
+                t0 = time.time()
+                train_loss = self.train_one_epoch(epoch)
+                val_loss, metrics = self.validate(epoch)
+                self.scheduler.step()
+                elapsed = time.time() - t0
+
+                is_best = val_loss < self.best_val_loss
+                if is_best:
+                    self.best_val_loss = val_loss
+                self.save_checkpoint(epoch, val_loss, is_best)
+
+                self.history.append({
+                    "epoch": epoch,
+                    "train_loss": train_loss,
+                    "val_loss": val_loss,
+                    "metrics": metrics,
+                    "time_s": elapsed,
+                })
+
+                print(
+                    f"Epoch {epoch}/{self.max_epochs} ({elapsed:.1f}s) "
+                    f"train={train_loss:.4f} val={val_loss:.4f}"
+                )
+
+        hist_path = Path("checkpoints") / "training_history.json"
+        with open(hist_path, "w") as f:
+            json.dump(self.history, f, indent=2, default=str)
+        print(f"\nTraining complete. Best val loss: {self.best_val_loss:.4f}")
+        print(f"History saved to {hist_path}")
+
+    def _setup_flat_training(self):
+        """Setup single-stage training (no curriculum)."""
+        data_cfg = self.data_cfg
+        dataset = SyntheticEQDataset(
+            num_bands=self.num_bands,
+            sample_rate=self.sample_rate,
+            duration=1.5,
+            n_fft=self.n_fft,
+            size=50000,
+            gain_range=tuple(data_cfg["gain_bounds"]),
+            freq_range=tuple(data_cfg["freq_bounds"]),
+            q_range=tuple(data_cfg["q_bounds"]),
+            type_weights=data_cfg.get("type_weights", None),
+            precompute_mels=True,
+            n_mels=data_cfg.get("n_mels", 128),
+        )
+        dataset.precompute()
+
+        n_train = int(len(dataset) * data_cfg["train_split"])
+        n_val = int(len(dataset) * data_cfg["val_split"])
+        n_test = len(dataset) - n_train - n_val
+        train_set, val_set, test_set = torch.utils.data.random_split(
+            dataset, [n_train, n_val, n_test]
+        )
+
+        self.train_loader = DataLoader(
+            train_set,
+            batch_size=data_cfg["batch_size"],
+            shuffle=True,
+            num_workers=0,
+            collate_fn=collate_fn,
+            pin_memory=False,
+            drop_last=True,
+        )
+        self.val_loader = DataLoader(
+            val_set,
+            batch_size=data_cfg["batch_size"],
+            shuffle=False,
+            num_workers=0,
+            collate_fn=collate_fn,
+            pin_memory=False,
+        )
+
+
+if __name__ == "__main__":
+    trainer = Trainer()
+    trainer.fit()

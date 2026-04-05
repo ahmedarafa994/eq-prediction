@@ -1,0 +1,9 @@
+{
+  "id": "10",
+  "subject": "Tune config for better multi-type training",
+  "description": "Increase multi-type stage epochs, adjust loss weights for better type classification, tune curriculum progression.",
+  "activeForm": "Tuning config for better multi-type training",
+  "status": "completed",
+  "blocks": [],
+  "blockedBy": []
+}

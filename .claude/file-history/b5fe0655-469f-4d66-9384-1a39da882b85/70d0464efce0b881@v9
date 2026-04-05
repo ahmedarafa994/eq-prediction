@@ -1,0 +1,162 @@
+import torch
+import torch.nn as nn
+import torch.nn.functional as F
+import pytorch_lightning as pl
+
+def normalize_params(y: torch.Tensor) -> torch.Tensor:
+    """
+    Normalizes a tensor of shape (..., 24) to [0, 1].
+    Expected order: [f1, g1, q1, f2, g2, q2, ... f8, g8, q8]
+    """
+    y_norm = torch.zeros_like(y)
+    
+    # 1. Frequencies: Logarithmic Min-Max Scaling (20Hz to 20kHz)
+    freqs = y[..., 0::3]
+    f_min, f_max = 20.0, 20000.0
+    freqs_log = torch.log10(torch.clamp(freqs, min=f_min, max=f_max))
+    log_min, log_max = torch.log10(torch.tensor(f_min)), torch.log10(torch.tensor(f_max))
+    y_norm[..., 0::3] = (freqs_log - log_min) / (log_max - log_min)
+    
+    # 2. Gains: Linear Min-Max Scaling (-12 to +12 dB)
+    gains = y[..., 1::3]
+    g_min, g_max = -12.0, 12.0
+    y_norm[..., 1::3] = (torch.clamp(gains, min=g_min, max=g_max) - g_min) / (g_max - g_min)
+    
+    # 3. Q-Factors: Logarithmic Min-Max Scaling (0.3 to 10.0)
+    qs = y[..., 2::3]
+    q_min, q_max = 0.3, 10.0
+    qs_log = torch.log10(torch.clamp(qs, min=q_min, max=q_max))
+    log_q_min = torch.log10(torch.tensor(q_min))
+    log_q_max = torch.log10(torch.tensor(q_max))
+    y_norm[..., 2::3] = (qs_log - log_q_min) / (log_q_max - log_q_min)
+    
+    return y_norm
+
+def denormalize_params(y_norm: torch.Tensor) -> torch.Tensor:
+    """
+    Reverses the normalization to return real-world parameters.
+    """
+    y_real = torch.zeros_like(y_norm)
+    
+    # Frequencies
+    freqs_norm = y_norm[..., 0::3]
+    f_min, f_max = 20.0, 20000.0
+    log_min, log_max = torch.log10(torch.tensor(f_min)), torch.log10(torch.tensor(f_max))
+    y_real[..., 0::3] = 10 ** (freqs_norm * (log_max - log_min) + log_min)
+    
+    # Gains
+    gains_norm = y_norm[..., 1::3]
+    g_min, g_max = -12.0, 12.0
+    y_real[..., 1::3] = gains_norm * (g_max - g_min) + g_min
+    
+    # Q-Factors
+    qs_norm = y_norm[..., 2::3]
+    q_min, q_max = 0.3, 10.0
+    log_q_min = torch.log10(torch.tensor(q_min))
+    log_q_max = torch.log10(torch.tensor(q_max))
+    y_real[..., 2::3] = 10 ** (qs_norm * (log_q_max - log_q_min) + log_q_min)
+    
+    return y_real
+
+
+class EQRegressor(pl.LightningModule):
+    def __init__(self):
+        super().__init__()
+        
+        # 1. Convolutional Feature Extractor (Dual-Channel Input: Wet + Dry)
+        self.cnn = nn.Sequential(
+            nn.Conv2d(3,   32,  3, padding=1), nn.BatchNorm2d(32),  nn.ReLU(), nn.MaxPool2d(2),
+            nn.Conv2d(32,  64,  3, padding=1), nn.BatchNorm2d(64),  nn.ReLU(), nn.MaxPool2d(2),
+            nn.Conv2d(64,  128, 3, padding=1), nn.BatchNorm2d(128), nn.ReLU(), nn.MaxPool2d(2),
+            nn.Conv2d(128, 256, 3, padding=1), nn.BatchNorm2d(256), nn.ReLU(), nn.MaxPool2d(2),
+        )
+
+        # 5s clip @ 44100Hz, hop=512 → 431 frames → 4x MaxPool2d(2) → 26
+        # 128 mels → 4x MaxPool2d(2) → 8
+        self.flatten_dim = 256 * 8 * 26  # = 53248
+        
+        # 2. Fully Connected Head — kept proportional to CNN output to avoid
+        #    the "top-heavy" trap where the FC ignores CNN features entirely.
+        self.fc = nn.Sequential(
+            nn.Linear(self.flatten_dim, 512),
+            nn.ReLU(),
+            nn.Dropout(0.3),
+            nn.Linear(512, 256),
+            nn.ReLU(),
+            nn.Dropout(0.2),
+            nn.Linear(256, 24),
+            nn.Sigmoid()
+        )
+
+    def forward(self, x):
+        x = self.cnn(x)
+        x = torch.flatten(x, start_dim=1)
+        out_norm = self.fc(x)
+        return out_norm
+
+    def _compute_loss(self, y_hat_norm, y_norm):
+        # Labels arrive pre-normalized to [0,1] from the dataset.
+        # Gains are at indices 1::3, normalized so 0.5 = unity (no cut/boost).
+        # Weight = distance from 0.5, scaled to [0,1] — zero weight for flat bands.
+        gain_weight = torch.abs(y_norm[:, 1::3] - 0.5) * 2.0  # [0, 1]
+
+        loss_g = F.mse_loss(y_hat_norm[:, 1::3], y_norm[:, 1::3], reduction='mean')
+        loss_f = (F.mse_loss(y_hat_norm[:, 0::3], y_norm[:, 0::3], reduction='none') * gain_weight).mean()
+        loss_q = (F.mse_loss(y_hat_norm[:, 2::3], y_norm[:, 2::3], reduction='none') * gain_weight).mean()
+        return loss_g + loss_f + loss_q, loss_g, loss_f, loss_q
+
+    def training_step(self, batch, batch_idx):
+        x, y = batch  # y is already normalized [0,1] from the dataset
+        y_hat_norm = self(x)
+        loss, loss_g, loss_f, loss_q = self._compute_loss(y_hat_norm, y)
+        self.log('train_loss',   loss,   prog_bar=False)
+        self.log('train_loss_g', loss_g)
+        self.log('train_loss_f', loss_f)
+        self.log('train_loss_q', loss_q)
+        return loss
+
+    def validation_step(self, batch, batch_idx):
+        x, y = batch  # y is already normalized [0,1] from the dataset
+        y_hat_norm = self(x)
+        loss, loss_g, loss_f, loss_q = self._compute_loss(y_hat_norm, y)
+        self.log('val_loss',   loss,   prog_bar=True)
+        self.log('val_loss_g', loss_g)
+        self.log('val_loss_f', loss_f)
+        self.log('val_loss_q', loss_q)
+        return loss
+
+    def configure_optimizers(self):
+        optimizer = torch.optim.Adam(self.parameters(), lr=3e-4)
+        scheduler = torch.optim.lr_scheduler.ReduceLROnPlateau(
+            optimizer, mode="min", factor=0.5, patience=3
+        )
+        return {
+            "optimizer": optimizer,
+            "lr_scheduler": {"scheduler": scheduler, "monitor": "val_loss"},
+        }
+
+
+if __name__ == "__main__":
+    # Test the Normalization Implementation
+    print("Testing Parameter Normalization...")
+    
+    # Create the test dummy tensor provided by User
+    dummy_input = torch.tensor([[1083.3, 11.98, 3.398]])
+    print(f"Original Input:\n  Frequency: {dummy_input[0,0]:.1f} Hz\n  Gain: {dummy_input[0,1]:.2f} dB\n  Q: {dummy_input[0,2]:.3f}")
+    
+    normalized = normalize_params(dummy_input)
+    print(f"\nNormalized Output (Expected range [0, 1]):\n  Frequency: {normalized[0,0]:.4f}\n  Gain: {normalized[0,1]:.4f}\n  Q: {normalized[0,2]:.4f}")
+    
+    denormalized = denormalize_params(normalized)
+    print(f"\nDenormalized Validation (Should match Original):\n  Frequency: {denormalized[0,0]:.1f} Hz\n  Gain: {denormalized[0,1]:.2f} dB\n  Q: {denormalized[0,2]:.3f}")
+
+    print("\n" + "="*50)
+    print("Testing Dual-Channel EQRegressor Architecture...")
+    model = EQRegressor()
+    # Batch=1, Channels=2, Freq=128, Time=259
+    dummy_input = torch.randn(1, 2, 128, 431)
+    print(f"Feeding dummy input of shape: {dummy_input.shape}")
+    
+    output = model(dummy_input)
+    print(f"Success! Model output shape: {output.shape} (Expected: (1, 24))")
+    print("="*50)

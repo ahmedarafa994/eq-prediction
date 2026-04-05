@@ -1,0 +1,9 @@
+{
+  "id": "9",
+  "subject": "Phase 2b: Coverage loss",
+  "description": "Add coverage loss that penalizes insufficient frequency span of predicted bands. One-sided penalty when span < 80% of log-freq range.",
+  "activeForm": "Adding coverage loss",
+  "status": "completed",
+  "blocks": [],
+  "blockedBy": []
+}

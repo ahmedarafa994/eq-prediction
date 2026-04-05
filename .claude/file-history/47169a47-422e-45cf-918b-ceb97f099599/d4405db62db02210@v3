@@ -1,0 +1,1191 @@
+"""
+Training script for the multi-type IDSP EQ Estimator.
+
+Uses StreamingTCNModel with MultiTypeEQLoss (Hungarian matching,
+permutation-invariant parameter regression, type classification).
+Implements curriculum learning from conf/config.yaml stages.
+"""
+
+import math
+
+import torch
+from torch.utils.data import DataLoader
+from model_tcn import StreamingTCNModel
+from dsp_frontend import STFTFrontend
+from loss_multitype import MultiTypeEQLoss, HungarianBandMatcher
+from dataset import SyntheticEQDataset, collate_fn, FILTER_NAMES
+import yaml
+from pathlib import Path
+import time
+import json
+import gc
+import random
+import numpy as np
+
+
+def load_config(path="conf/config.yaml"):
+    with open(path, "r") as f:
+        return yaml.safe_load(f)
+
+
+FILTER_TYPE_TO_IDX = {name: idx for idx, name in enumerate(FILTER_NAMES)}
+
+
+class Trainer:
+    def __init__(self, config_path="conf/config.yaml", resume_from=None):
+        self.cfg = load_config(config_path)
+        seed = self.cfg.get("seed", 42)
+        torch.manual_seed(seed)
+        torch.cuda.manual_seed_all(seed)
+        np.random.seed(seed)
+        random.seed(seed)
+
+        self.device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+        self.resume_from = resume_from
+
+        data_cfg = self.cfg["data"]
+        model_cfg = self.cfg["model"]
+        loss_cfg = self.cfg["loss"]
+        trainer_cfg = self.cfg["trainer"]
+
+        torch.backends.cudnn.deterministic = trainer_cfg.get(
+            "cudnn_deterministic", False
+        )
+        torch.backends.cudnn.benchmark = trainer_cfg.get("cudnn_benchmark", True)
+
+        self.num_bands = data_cfg["num_bands"]
+        self.sample_rate = data_cfg["sample_rate"]
+        self.n_fft = data_cfg.get("n_fft", 2048)
+        self.num_samples = int(data_cfg.get("audio_duration", 1.5) * self.sample_rate)
+        self.log_every = trainer_cfg["log_every_n_steps"]
+
+        self.curriculum_cfg = self.cfg.get("curriculum", {})
+        self.stages = self.curriculum_cfg.get("stages", [])
+
+        if self.stages:
+            self.max_epochs = sum(s["epochs"] for s in self.stages)
+        else:
+            self.max_epochs = trainer_cfg["max_epochs"]
+
+        enc_cfg = model_cfg.get("encoder", {})
+        num_filter_types = len(
+            data_cfg.get(
+                "filter_types",
+                ["peaking", "lowshelf", "highshelf", "highpass", "lowpass"],
+            )
+        )
+
+        use_full_spectrum = model_cfg.get("use_full_spectrum", False)
+        input_bins = (
+            (self.n_fft // 2 + 1) if use_full_spectrum else data_cfg.get("n_mels", 128)
+        )
+        self.model = StreamingTCNModel(
+            n_mels=input_bins,
+            embedding_dim=enc_cfg.get("embedding_dim", 128),
+            num_bands=self.num_bands,
+            channels=enc_cfg.get("channels", 128),
+            num_blocks=enc_cfg.get("num_blocks", 4),
+            num_stacks=enc_cfg.get("num_stacks", 2),
+            sample_rate=self.sample_rate,
+            n_fft=self.n_fft,
+            num_filter_types=num_filter_types,
+            kernel_size=enc_cfg.get("kernel_size", 3),
+            use_full_spectrum=use_full_spectrum,
+        ).to(self.device)
+
+        self.frontend = STFTFrontend(
+            n_fft=self.n_fft,
+            hop_length=data_cfg.get("hop_length", 512),
+            win_length=self.n_fft,
+            mel_bins=data_cfg.get("n_mels", 128),
+            sample_rate=self.sample_rate,
+            filterbank_type=data_cfg.get("filterbank_type", "log"),
+        ).to(self.device)
+
+        self.base_loss_cfg = loss_cfg
+        self.criterion = MultiTypeEQLoss(
+            n_fft=self.n_fft,
+            sample_rate=self.sample_rate,
+            lambda_param=loss_cfg.get("lambda_param", 1.0),
+            lambda_type=loss_cfg.get("lambda_type", 2.0),
+            lambda_spectral=loss_cfg.get("lambda_spectral", 1.0),
+            lambda_hmag=loss_cfg.get("lambda_hmag", 0.3),
+            lambda_activity=loss_cfg.get("lambda_activity", 0.1),
+            lambda_spread=loss_cfg.get("lambda_spread", 0.05),
+            lambda_coverage=loss_cfg.get("lambda_coverage", 0.0),
+            lambda_freq_anchor=loss_cfg.get("lambda_freq_anchor", 0.0),
+            lambda_freq_match=loss_cfg.get("lambda_freq_match", 1.0),
+            lambda_q_match=loss_cfg.get("lambda_q_match", 0.5),
+        ).to(self.device)
+
+        self.optimizer = torch.optim.AdamW(
+            self.model.parameters(),
+            lr=model_cfg["learning_rate"],
+            weight_decay=model_cfg["weight_decay"],
+        )
+
+        self.val_matcher = HungarianBandMatcher(
+            lambda_freq=loss_cfg.get("lambda_freq_match", 1.0),
+            lambda_q=loss_cfg.get("lambda_q_match", 0.5),
+        )
+
+        self.data_cfg = data_cfg
+        self.global_step = 0
+        self.best_val_loss = float("inf")
+        self.history = []
+
+        exp_name = self.cfg.get("experiment_name", "default")
+        self.ckpt_dir = Path("checkpoints") / exp_name
+        self.ckpt_dir.mkdir(parents=True, exist_ok=True)
+
+        self.train_loader = None
+        self.val_loader = None
+        self.test_loader = None
+        self.test_set = None
+
+        self.scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(
+            self.optimizer, T_max=self.max_epochs, eta_min=1e-6
+        )
+
+        self.use_amp = self.device.type == "cuda" and torch.cuda.is_bf16_supported()
+        self.amp_dtype = torch.bfloat16 if self.use_amp else torch.float32
+        print(f"  AMP enabled: {self.use_amp} (dtype={self.amp_dtype})")
+
+        self.grad_accum_steps = trainer_cfg.get("accumulate_grad_batches", 1)
+        print(f"  Gradient accumulation steps: {self.grad_accum_steps}")
+
+        # EMA model weights for stable inference
+        self.ema_decay = trainer_cfg.get("ema_decay", 0.999)
+        self.ema_model = None  # # will be initialized after first forward pass
+        self.ema_step_count = 0
+
+        if trainer_cfg.get("torch_compile", False) and self.device.type == "cuda":
+            print("  Compiling encoder with torch.compile(mode='default')...")
+            self.model.encoder = torch.compile(
+                self.model.encoder,
+                mode="default",
+                fullgraph=False,
+            )
+            print("  Compilation complete.")
+
+        if self.resume_from is not None:
+            self._load_checkpoint(self.resume_from)
+
+    def _find_max_batch_size(self, dataset, initial_bs=None):
+        if not torch.cuda.is_available():
+            return initial_bs or self.data_cfg.get("batch_size", 1024)
+
+        if initial_bs is None:
+            initial_bs = self.data_cfg.get("batch_size", 1024)
+
+        sample = dataset[0]
+        B = initial_bs
+        last_good = B // 2 if B > 512 else 256
+        while True:
+            try:
+                fake_batch = {
+                    k: v.unsqueeze(0).expand(B, *v.shape)
+                    for k, v in sample.items()
+                    if isinstance(v, torch.Tensor)
+                }
+                wet = fake_batch["wet_audio"]
+                if wet.device != self.device:
+                    wet = wet.to(self.device)
+                mel_frames = self.frontend.mel_spectrogram(wet).squeeze(1)
+
+                with torch.amp.autocast(
+                    "cuda", dtype=self.amp_dtype, enabled=self.use_amp
+                ):
+                    embedding, skip_sum = self.model.encoder(mel_frames)
+
+                loss = embedding.sum()
+                loss.backward()
+
+                del (
+                    fake_batch,
+                    wet,
+                    mel_frames,
+                    embedding,
+                    skip_sum,
+                    loss,
+                )
+                torch.cuda.empty_cache()
+
+                last_good = B
+                B = B * 2
+                if B > 65536:
+                    break
+            except (RuntimeError, torch.cuda.OutOfMemoryError):
+                torch.cuda.empty_cache()
+                break
+
+        lo, hi = last_good, B
+        while hi - lo > lo // 4:
+            mid = (lo + hi) // 2
+            try:
+                fake_batch = {
+                    k: v.unsqueeze(0).expand(mid, *v.shape)
+                    for k, v in sample.items()
+                    if isinstance(v, torch.Tensor)
+                }
+                wet = fake_batch["wet_audio"].to(self.device)
+                mel = self.frontend.mel_spectrogram(wet).squeeze(1)
+                with torch.amp.autocast(
+                    "cuda", dtype=self.amp_dtype, enabled=self.use_amp
+                ):
+                    embedding, _ = self.model.encoder(mel)
+
+                loss = embedding.sum()
+                loss.backward()
+
+                del fake_batch, wet, mel, embedding, loss
+                torch.cuda.empty_cache()
+                lo = mid
+            except (RuntimeError, torch.cuda.OutOfMemoryError):
+                torch.cuda.empty_cache()
+                hi = mid
+
+        safe_bs = max(int(lo * 0.7), 256)
+        safe_bs = 2 ** int(math.log2(safe_bs))
+        if self.num_samples > 22050:
+            safe_bs = min(safe_bs, 2048)
+        return safe_bs
+
+    def _build_stage_dataset(self, stage_cfg):
+        data_cfg = self.data_cfg
+
+        filter_types = stage_cfg.get("filter_types", data_cfg["filter_types"])
+        active_indices = [FILTER_TYPE_TO_IDX[ft] for ft in filter_types]
+        n_active = len(active_indices)
+        type_weights = [0.0] * len(FILTER_NAMES)
+        for idx in active_indices:
+            type_weights[idx] = 1.0 / n_active
+
+        param_ranges = stage_cfg.get("param_ranges", {})
+        gain_lo, gain_hi = param_ranges.get("gain", data_cfg["gain_bounds"])
+        q_range = param_ranges.get("q", data_cfg["q_bounds"])
+
+        duration = data_cfg.get("audio_duration", 1.5)
+        size = data_cfg.get("dataset_size", 50000)
+
+        min_gain_db = stage_cfg.get("min_gain_db", 0.0)
+
+        dataset = SyntheticEQDataset(
+            num_bands=self.num_bands,
+            sample_rate=self.sample_rate,
+            duration=duration,
+            n_fft=self.n_fft,
+            size=size,
+            gain_range=(gain_lo, gain_hi),
+            freq_range=tuple(data_cfg["freq_bounds"]),
+            q_range=tuple(q_range),
+            type_weights=type_weights,
+            precompute_mels=False,
+            n_mels=data_cfg.get("n_mels", 128),
+            min_gain_db=min_gain_db,
+        )
+        dataset.precompute()
+
+        musdb_root = data_cfg.get(
+            "musdb_root", "/teamspace/lightning_storage/SNAP_DATA_SET/musdb18_hq"
+        )
+        musdb_size = data_cfg.get("musdb_size", size)
+        musdb_enabled = data_cfg.get("musdb_enabled", True)
+        if musdb_enabled and Path(musdb_root).exists():
+            print(f"  Augmenting with {musdb_size} MUSDB18-HQ samples...")
+            from dataset import MusDB18EQDataset
+
+            musdb_dataset = MusDB18EQDataset(
+                musdb_root=musdb_root,
+                num_bands=self.num_bands,
+                sample_rate=self.sample_rate,
+                duration=duration,
+                size=musdb_size,
+                gain_range=(gain_lo, gain_hi),
+                freq_range=tuple(data_cfg["freq_bounds"]),
+                q_range=tuple(q_range),
+                type_weights=type_weights,
+                min_gain_db=min_gain_db,
+                use_train_split=True,
+                precompute=True,
+            )
+            dataset = torch.utils.data.ConcatDataset([dataset, musdb_dataset])
+            print(f"  Total dataset size: {len(dataset)} (synthetic + real music)")
+        else:
+            print(f"  Dataset size: {len(dataset)} samples (synthetic only)")
+
+        return dataset
+
+    def _setup_stage(self, stage_cfg):
+        print(f"\n{'=' * 60}")
+        print(f"  Stage: {stage_cfg['name']}")
+        print(f"{'=' * 60}")
+
+        if self.train_loader is not None:
+            print("  Freeing previous stage data loaders...")
+            del self.train_loader
+            del self.val_loader
+            del self.test_loader
+            del self.test_set
+            if hasattr(self, "_stage_dataset") and self._stage_dataset is not None:
+                ds = self._stage_dataset
+                if isinstance(ds, torch.utils.data.ConcatDataset):
+                    for sub_ds in ds.datasets:
+                        if hasattr(sub_ds, "_npz_cache"):
+                            del sub_ds._npz_cache
+                elif hasattr(ds, "_npz_cache"):
+                    del ds._npz_cache
+                del self._stage_dataset
+            gc.collect()
+            if torch.cuda.is_available():
+                torch.cuda.empty_cache()
+
+        dataset = self._build_stage_dataset(stage_cfg)
+        self._stage_dataset = dataset
+
+        if not hasattr(self, "_calibrated_bs") and self.device.type == "cuda":
+            print("  Calibrating batch size for VRAM...")
+            max_bs = self._find_max_batch_size(dataset)
+            self._calibrated_bs = max_bs
+            print(f"  Max batch size for this GPU: {max_bs}")
+            config_bs = self.data_cfg.get("batch_size", 1024)
+            if max_bs != config_bs:
+                print(f"  Adjusting batch_size from {config_bs} to {max_bs}")
+            self.data_cfg["batch_size"] = max_bs
+
+        param_ranges = stage_cfg.get("param_ranges", {})
+        if "gain" in param_ranges:
+            print(f"  Stage gain range: {param_ranges['gain']}")
+        if "q" in param_ranges:
+            print(f"  Stage Q range: {param_ranges['q']}")
+        print(f"  Dataset size: {len(dataset)} samples")
+
+        n_train = int(len(dataset) * self.data_cfg["train_split"])
+        n_val = int(len(dataset) * self.data_cfg["val_split"])
+        n_test = len(dataset) - n_train - n_val
+
+        gen = torch.Generator().manual_seed(self.cfg.get("seed", 42))
+        train_set, val_set, test_set = torch.utils.data.random_split(
+            dataset, [n_train, n_val, n_test], generator=gen
+        )
+
+        num_workers = 0
+        pin_memory = False
+
+        self.train_loader = DataLoader(
+            train_set,
+            batch_size=self.data_cfg["batch_size"],
+            shuffle=True,
+            num_workers=num_workers,
+            collate_fn=collate_fn,
+            pin_memory=pin_memory,
+            drop_last=True,
+            prefetch_factor=2 if num_workers > 0 else None,
+            persistent_workers=num_workers > 0,
+        )
+        self.val_loader = DataLoader(
+            val_set,
+            batch_size=self.data_cfg["batch_size"],
+            shuffle=False,
+            num_workers=num_workers,
+            collate_fn=collate_fn,
+            pin_memory=pin_memory,
+            prefetch_factor=2 if num_workers > 0 else None,
+            persistent_workers=num_workers > 0,
+        )
+        self.test_loader = DataLoader(
+            test_set,
+            batch_size=self.data_cfg["batch_size"],
+            shuffle=False,
+            num_workers=num_workers,
+            collate_fn=collate_fn,
+            pin_memory=pin_memory,
+            prefetch_factor=2 if num_workers > 0 else None,
+            persistent_workers=num_workers > 0,
+        )
+        self.test_set = test_set
+
+        if "lambda_type" in stage_cfg:
+            self.criterion.lambda_type = stage_cfg["lambda_type"]
+            print(f"  lambda_type = {stage_cfg['lambda_type']}")
+        if "lambda_spread" in stage_cfg:
+            self.criterion.lambda_spread = stage_cfg["lambda_spread"]
+            print(f"  lambda_spread = {stage_cfg['lambda_spread']}")
+        if "lambda_coverage" in stage_cfg:
+            self.criterion.lambda_coverage = stage_cfg["lambda_coverage"]
+            print(f"  lambda_coverage = {stage_cfg['lambda_coverage']}")
+        if "lambda_freq_anchor" in stage_cfg:
+            self.criterion.lambda_freq_anchor = stage_cfg["lambda_freq_anchor"]
+            print(f"  lambda_freq_anchor = {stage_cfg['lambda_freq_anchor']}")
+        if "lambda_freq_match" in stage_cfg:
+            self.criterion.param_loss.matcher.lambda_freq = stage_cfg[
+                "lambda_freq_match"
+            ]
+            self.val_matcher.lambda_freq = stage_cfg["lambda_freq_match"]
+            print(f"  lambda_freq_match = {stage_cfg['lambda_freq_match']}")
+        if "lambda_q_match" in stage_cfg:
+            self.criterion.param_loss.matcher.lambda_q = stage_cfg["lambda_q_match"]
+            self.val_matcher.lambda_q = stage_cfg["lambda_q_match"]
+            print(f"  lambda_q_match = {stage_cfg['lambda_q_match']}")
+
+        gumbel_temp = stage_cfg.get("gumbel_temperature", None)
+        if gumbel_temp is not None and hasattr(self.model, "dsp_cascade"):
+            if hasattr(self.model.dsp_cascade, "gumbel_temperature"):
+                safe_temp = max(gumbel_temp, 0.3)  # Floor to prevent extreme sharpness
+                self.model.dsp_cascade.gumbel_temperature.fill_(safe_temp)
+                print(f"  gumbel_temperature = {safe_temp} (requested={gumbel_temp})")
+
+        # Attention temperature: sharper attention = more precise frequency localization.
+        attn_temp = stage_cfg.get("attn_temperature", None)
+        if attn_temp is not None and hasattr(self.model, "param_head"):
+            if hasattr(self.model.param_head, "attn_temperature"):
+                self.model.param_head.attn_temperature.fill_(attn_temp)
+                print(f"  attn_temperature = {attn_temp}")
+        elif hasattr(self.model, "dsp_cascade"):
+            # fallback: check inside dsp_cascade
+            dsp = self.model.dsp_cascade
+            if hasattr(dsp, "param_head") and hasattr(dsp.param_head, "attn_temperature"):
+                dsp.param_head.attn_temperature.fill_(attn_temp)
+                print(f"  attn_temperature = {attn_temp} (via dsp_cascade)")
+        lr_scale = stage_cfg.get("learning_rate_scale", 1.0)
+        base_lr = self.cfg["model"]["learning_rate"] * lr_scale
+        for pg in self.optimizer.param_groups:
+            pg["lr"] = base_lr
+        print(f"  lr = {base_lr:.2e}")
+
+        stage_epochs = stage_cfg["epochs"]
+        lr_schedule = self.cfg["trainer"].get("lr_schedule", "cosine")
+
+        if lr_schedule == "onecycle":
+            # OneCycleLR (Smith & Topin, 2019): fast basin finding from high-loss
+            from torch.optim.lr_scheduler import LinearLR, OneCycleLR, SequentialLR
+
+            warmup_steps = max(int(stage_epochs * 0.05), 2)
+            cycle_steps = max(stage_epochs - warmup_steps, 1)
+            warmup_sched = LinearLR(
+                self.optimizer, start_factor=0.1, end_factor=1.0,
+                total_iters=warmup_steps,
+            )
+            onecycle_sched = OneCycleLR(
+                self.optimizer,
+                max_lr=base_lr * 3,  # peak at 3× base LR
+                total_steps=cycle_steps,
+                pct_start=0.3,
+                div_factor=10.0,
+                final_div_factor=1e4,
+                anneal_strategy="cos",
+                cycle_momentum=False,
+            )
+            self.scheduler = SequentialLR(
+                self.optimizer,
+                schedulers=[warmup_sched, onecycle_sched],
+                milestones=[warmup_steps],
+            )
+        else:
+            # Default: warmup + cosine annealing
+            warmup_steps = max(int(stage_epochs * 0.05), 2)
+            warmup_sched = torch.optim.lr_scheduler.LinearLR(
+                self.optimizer,
+                start_factor=0.01 / warmup_steps,
+                total_iters=warmup_steps,
+            )
+            cosine_sched = torch.optim.lr_scheduler.CosineAnnealingLR(
+                self.optimizer,
+                T_max=stage_epochs - warmup_steps,
+                eta_min=base_lr * 0.01,
+            )
+            self.scheduler = torch.optim.lr_scheduler.SequentialLR(
+                self.optimizer,
+                schedulers=[warmup_sched, cosine_sched],
+                milestones=[warmup_steps],
+            )
+
+    def _prepare_both_mels(self, batch):
+        wet = batch["wet_audio"]
+        dry = batch["dry_audio"]
+        if wet.device != self.device:
+            wet = wet.to(self.device, non_blocking=True)
+        if dry.device != self.device:
+            dry = dry.to(self.device, non_blocking=True)
+        # Process wet and dry separately to avoid doubling batch in STFT
+        # (stacking B wet + B dry = 2B samples causes CUDA OOM at large B)
+        mel_wet = self.frontend.mel_spectrogram(wet).squeeze(1)
+        mel_dry = self.frontend.mel_spectrogram(dry).squeeze(1)
+        return mel_wet, mel_dry
+
+    def train_one_epoch(self, epoch):
+        self.model.train()
+        epoch_loss = 0.0
+        n_batches = 0
+        nan_batches = 0
+        accumulated_loss = 0.0
+
+        for batch_idx, batch in enumerate(self.train_loader):
+            mel_frames, dry_mel = self._prepare_both_mels(batch)
+            target_gain = batch["gain"].to(self.device, non_blocking=True)
+            target_freq = batch["freq"].to(self.device, non_blocking=True)
+            target_q = batch["q"].to(self.device, non_blocking=True)
+            target_ft = batch["filter_type"].to(self.device, non_blocking=True)
+
+            is_accumulation_step = (batch_idx + 1) % self.grad_accum_steps != 0
+
+            # Guard inputs against NaN to protect BatchNorm
+            mel_frames = torch.nan_to_num(
+                mel_frames, nan=0.0, posinf=10.0, neginf=-10.0
+            )
+            dry_mel = torch.nan_to_num(dry_mel, nan=0.0, posinf=10.0, neginf=-10.0)
+
+            with torch.amp.autocast("cuda", dtype=self.amp_dtype, enabled=self.use_amp):
+                embedding, skip_sum = self.model.encoder(mel_frames)
+
+            # Use wet-only mel_profile for blind estimation consistency.
+            # Training with wet-dry difference creates a train/test mismatch
+            # since at inference only the wet signal is available.
+            mel_profile = mel_frames.mean(dim=-1)
+
+            with torch.amp.autocast("cuda", enabled=False):
+                output = self.model._predict_from_embedding(
+                    embedding, mel_profile=mel_profile
+                )
+
+            # Debug: check for NaN in model output
+            pred_gain, pred_freq, pred_q = output["params"]
+            if not torch.isfinite(pred_freq).all():
+                n_nan = (~torch.isfinite(pred_freq)).sum().item()
+                print(f"  WARNING: {n_nan} NaN in pred_freq at step {self.global_step}")
+                print(f"    pred_gain: {pred_gain.min():.2f} to {pred_gain.max():.2f}")
+                print(f"    pred_freq: {pred_freq.min():.2f} to {pred_freq.max():.2f}")
+                print(f"    pred_q: {pred_q.min():.2f} to {pred_q.max():.2f}")
+
+            if not torch.isfinite(output["H_mag"]).all():
+                n_nan = (~torch.isfinite(output["H_mag"])).sum().item()
+                print(f"  WARNING: {n_nan} NaN in H_mag at step {self.global_step}")
+                print(
+                    f"    H_mag range: {output['H_mag'].min():.4f} to {output['H_mag'].max():.4f}"
+                )
+
+            target_H_mag = self.model.dsp_cascade(
+                target_gain.float(),
+                target_freq.float(),
+                target_q.float(),
+                n_fft=self.n_fft,
+                filter_type=target_ft,
+            )
+            target_H_mag = torch.nan_to_num(target_H_mag, nan=1.0).clamp(
+                min=1e-4, max=1e4
+            )
+
+            # Debug: check for NaN in target_H_mag
+            if not torch.isfinite(target_H_mag).all():
+                n_nan = (~torch.isfinite(target_H_mag)).sum().item()
+                print(
+                    f"  WARNING: {n_nan} NaN in target_H_mag at step {self.global_step}"
+                )
+                print(
+                    f"    target_gain: {target_gain.min():.2f} to {target_gain.max():.2f}"
+                )
+                print(
+                    f"    target_freq: {target_freq.min():.2f} to {target_freq.max():.2f}"
+                )
+                print(f"    target_q: {target_q.min():.2f} to {target_q.max():.2f}")
+                print(f"    target_ft: {target_ft.unique()}")
+
+            total_loss, components = self.criterion(
+                output["params"][0],
+                output["params"][1],
+                output["params"][2],
+                output["type_logits"].float(),
+                output["H_mag"].float(),
+                target_gain,
+                target_freq,
+                target_q,
+                target_ft,
+                target_H_mag,
+                freq_attn=output.get("freq_attn"),
+                wet_mel=mel_frames,
+                dry_mel=dry_mel,
+            )
+
+            if not torch.isfinite(total_loss):
+                nan_batches += 1
+                self.global_step += 1
+                if self.global_step % self.log_every == 0:
+                    print(
+                        f"  [train] step={self.global_step} SKIPPING NaN/Inf loss "
+                        f"(nan_count={nan_batches})"
+                    )
+                continue
+
+            scaled_loss = total_loss / self.grad_accum_steps
+            scaled_loss.backward()
+
+            accumulated_loss += total_loss.item()
+
+            if not is_accumulation_step:
+                torch.nn.utils.clip_grad_norm_(self.model.parameters(), max_norm=1.0)
+
+                has_nan_grad = any(
+                    p.grad is not None and not torch.isfinite(p.grad).all()
+                    for p in self.model.parameters()
+                )
+                if has_nan_grad:
+                    self.global_step += 1
+                    nan_batches += 1
+                    self.optimizer.zero_grad(set_to_none=True)
+                    accumulated_loss = 0.0
+                    continue
+
+                self.optimizer.step()
+                self.optimizer.zero_grad(set_to_none=True)
+                self._update_ema()
+
+                epoch_loss += accumulated_loss
+                accumulated_loss = 0.0
+                n_batches += 1
+
+            self.global_step += 1
+
+            if self.global_step % 100 == 0:
+                self._check_model_health()
+
+            if self.global_step % self.log_every == 0:
+                lr = self.optimizer.param_groups[0]["lr"]
+                parts = [
+                    f"step={self.global_step} loss={total_loss.item():.4f} lr={lr:.2e}"
+                ]
+                for k, v in components.items():
+                    parts.append(f"{k}={v:.4f}")
+                print("  [train] " + " | ".join(parts))
+
+        if nan_batches > 0:
+            print(
+                f"  [train] epoch={epoch}: {nan_batches} NaN batches skipped "
+                f"out of {n_batches + nan_batches} total"
+            )
+        return epoch_loss / max(n_batches, 1)
+
+    def _check_model_health(self):
+        for name, param in self.model.named_parameters():
+            if not torch.isfinite(param).all():
+                print(
+                    f"  WARNING: NaN/Inf in model parameter '{name}' "
+                    f"(shape={param.shape})"
+                )
+
+    def _init_ema(self):
+        """Initialize EMA shadow weights from current model."""
+        self.ema_model = {
+            name: p.data.clone()
+            for name, p in self.model.named_parameters()
+            if p.requires_grad
+        }
+
+    def _update_ema(self):
+        """Exponential moving average update of shadow weights."""
+        if self.ema_model is None:
+            self._init_ema()
+            return
+        self.ema_step_count += 1
+        decay = min(self.ema_decay, 1.0 - 0.01 / max(0, self.ema_step_count))
+        for name, p in self.model.named_parameters():
+            if p.requires_grad and name in self.ema_model:
+                self.ema_model[name].mul_(1.0 - decay).add_(decay * p.data)
+
+    def _load_ema_weights(self):
+        """Load EMA weights into model for inference."""
+        if self.ema_model is None:
+            return None
+        backup = {
+            name: p.data.clone()
+            for name, p in self.model.named_parameters()
+            if p.requires_grad
+        }
+        for name, p in self.model.named_parameters():
+            if p.requires_grad and name in self.ema_model:
+                p.data.copy_(self.ema_model[name])
+        return backup
+
+    @torch.no_grad()
+    def validate(self, epoch, use_test_loader=False):
+        # Use raw weights for both train and val — gives fair comparison.
+        # EMA weights still saved for export/inference but are self.model.eval()
+        val_loss = 0.0
+        n_batches = 0
+        param_maes = {
+            "gain": [],
+            "freq": [],
+            "q": [],
+            "type_acc": [],
+            "freq_span": [],
+            "freq_err_low": [],
+            "freq_err_mid": [],
+            "freq_err_high": [],
+            "band_f1": [],
+            "hmag_mae": [],
+            "spec_cos": [],
+        }
+
+        loader = (
+            self.test_loader
+            if use_test_loader and self.test_loader is not None
+            else self.val_loader
+        )
+
+        autocast_ctx = (
+            torch.amp.autocast("cuda", dtype=self.amp_dtype, enabled=self.use_amp)
+            if self.use_amp
+            else torch.no_grad()
+        )
+
+        with autocast_ctx:
+            for batch in loader:
+                mel_frames, dry_mel = self._prepare_both_mels(batch)
+                
+                # Sanitize inputs explicitly to prevent validation NaN
+                mel_frames = torch.nan_to_num(mel_frames, nan=0.0, posinf=10.0, neginf=-10.0)
+                dry_mel = torch.nan_to_num(dry_mel, nan=0.0, posinf=10.0, neginf=-10.0)
+                
+                target_gain = batch["gain"].to(self.device, non_blocking=True)
+                target_freq = batch["freq"].to(self.device, non_blocking=True)
+                target_q = batch["q"].to(self.device, non_blocking=True)
+                target_ft = batch["filter_type"].to(self.device, non_blocking=True)
+
+                # Use wet-only mel_profile (consistent with training)
+                mel_profile = mel_frames.mean(dim=-1)
+
+                with torch.amp.autocast(
+                    "cuda", dtype=self.amp_dtype, enabled=self.use_amp
+                ):
+                    embedding, skip_sum = self.model.encoder(mel_frames)
+                with torch.amp.autocast("cuda", enabled=False):
+                    output = self.model._predict_from_embedding(
+                        embedding, mel_profile=mel_profile
+                    )
+                pred_gain, pred_freq, pred_q = output["params"]
+
+                target_H_mag = self.model.dsp_cascade(
+                    target_gain,
+                    target_freq,
+                    target_q,
+                    n_fft=self.n_fft,
+                    filter_type=target_ft,
+                )
+
+                total_loss, _ = self.criterion(
+                    pred_gain,
+                    pred_freq,
+                    pred_q,
+                    output["type_logits"],
+                    output["H_mag"],
+                    target_gain,
+                    target_freq,
+                    target_q,
+                    target_ft,
+                    torch.nan_to_num(target_H_mag, nan=1.0).clamp(min=1e-5),
+                    freq_attn=output.get("freq_attn"),
+                    wet_mel=mel_frames,
+                    dry_mel=dry_mel,
+                )
+
+                import math
+                tl_item = total_loss.item()
+                if not math.isnan(tl_item) and not math.isinf(tl_item):
+                    val_loss += tl_item
+                    n_batches += 1
+
+                matched = self.val_matcher(
+                    pred_gain.cpu(),
+                    pred_freq.cpu(),
+                    pred_q.cpu(),
+                    target_gain.cpu(),
+                    target_freq.cpu(),
+                    target_q.cpu(),
+                    output["type_logits"].cpu(),
+                    target_ft.cpu(),
+                )
+                if len(matched) == 4:
+                    m_gain, m_freq, m_q, m_ft = matched
+                else:
+                    m_gain, m_freq, m_q = matched
+                    m_ft = target_ft.cpu()
+
+                param_maes["gain"].append(
+                    (pred_gain.cpu() - m_gain).abs().mean().item()
+                )
+                param_maes["freq"].append(
+                    torch.clamp(
+                        (torch.log2(pred_freq.cpu() / m_freq.clamp(min=1e-3))).abs(),
+                        max=4.0,
+                    )
+                    .mean()
+                    .item()
+                )
+                param_maes["q"].append(
+                    (torch.log10(pred_q.cpu() / m_q.clamp(min=1e-3)))
+                    .abs()
+                    .mean()
+                    .item()
+                )
+                param_maes["type_acc"].append(
+                    (output["filter_type"].cpu() == m_ft).float().mean().item()
+                )
+
+                # Band detection F1: correct active/inactive classification
+                threshold_db = 1.5
+                pred_active = (pred_gain.cpu().abs() > threshold_db).float()
+                target_active = (m_gain.abs() > threshold_db).float()
+                tp = (pred_active * target_active).sum()
+                fp = (pred_active * (1 - target_active)).sum()
+                fn = ((1 - pred_active) * target_active).sum()
+                precision = tp / (tp + fp + 1e-8)
+                recall = tp / (tp + fn + 1e-8)
+                band_f1 = 2 * precision * recall / (precision + recall + 1e-8)
+                param_maes["band_f1"].append(band_f1.item())
+
+                sorted_pf, _ = torch.sort(pred_freq.cpu(), dim=-1)
+                pred_span = torch.log2(
+                    sorted_pf[:, -1] / sorted_pf[:, 0].clamp(min=1e-5)
+                )
+                param_maes["freq_span"].append(pred_span.mean().item())
+
+                log_err = (torch.log2(pred_freq.cpu() / m_freq.clamp(min=1e-5))).abs()
+                log_mf = torch.log2(m_freq.clamp(min=1e-5))
+
+                low_mask = log_mf < math.log2(500)
+                mid_mask = (log_mf >= math.log2(500)) & (log_mf < math.log2(4000))
+                high_mask = log_mf >= math.log2(4000)
+
+                if low_mask.any():
+                    param_maes["freq_err_low"].append(log_err[low_mask].mean().item())
+                if mid_mask.any():
+                    param_maes["freq_err_mid"].append(log_err[mid_mask].mean().item())
+                if high_mask.any():
+                    param_maes["freq_err_high"].append(log_err[high_mask].mean().item())
+
+        avg_val_loss = val_loss / max(n_batches, 1)
+
+        # Safety guard: if all validation batches produced NaN loss,
+        # report inf (worst-case) instead of NaN to avoid poisoning checkpoint logic
+        if math.isnan(avg_val_loss) or math.isinf(avg_val_loss):
+            avg_val_loss = float("inf")
+
+        metrics = {k: sum(v) / len(v) for k, v in param_maes.items() if v}
+
+        print(
+            f"  [val] epoch={epoch} val_loss={avg_val_loss:.4f} "
+            f"gain_mae={metrics.get('gain', 0):.2f}dB "
+            f"freq_mae={metrics.get('freq', 0):.3f}oct "
+            f"q_mae={metrics.get('q', 0):.3f}dec "
+            f"type_acc={metrics.get('type_acc', 0):.1%} "
+            f"band_f1={metrics.get('band_f1', 0):.3f} "
+            f"freq_span={metrics.get('freq_span', 0):.1f}oct "
+            f"freq_err=[{metrics.get('freq_err_low', 0):.2f} "
+            f"{metrics.get('freq_err_mid', 0):.2f} "
+            f"{metrics.get('freq_err_high', 0):.2f}]"
+        )
+
+        # No EMA weight swapping needed — raw weights used throughout
+        return avg_val_loss, metrics
+
+        return avg_val_loss, metrics
+
+    def save_checkpoint(self, epoch, val_loss, is_best=False, stage_name=""):
+        state = {
+            "epoch": epoch,
+            "stage": stage_name,
+            "model_state_dict": self.model.state_dict(),
+            "optimizer_state_dict": self.optimizer.state_dict(),
+            "scheduler_state_dict": self.scheduler.state_dict(),
+            "val_loss": val_loss,
+            "best_val_loss": self.best_val_loss,
+            "global_step": self.global_step,
+            "history": self.history,
+        }
+        path = self.ckpt_dir / f"epoch_{epoch:03d}.pt"
+        torch.save(state, path)
+        if is_best:
+            best_path = self.ckpt_dir / "best.pt"
+            torch.save(state, best_path)
+        print(f"  Saved checkpoint: {path}" + (" (best)" if is_best else ""))
+
+        hist_path = self.ckpt_dir / "training_history.json"
+        with open(hist_path, "w") as f:
+            json.dump(self.history, f, indent=2, default=str)
+
+        epoch_ckpts = sorted(self.ckpt_dir.glob("epoch_*.pt"))
+        for old_ckpt in epoch_ckpts[:-3]:
+            old_ckpt.unlink()
+            print(f"  Cleaned up old checkpoint: {old_ckpt}")
+
+    def _load_checkpoint(self, checkpoint_path):
+        print(f"  Loading checkpoint from {checkpoint_path}")
+        checkpoint = torch.load(
+            checkpoint_path, map_location=self.device, weights_only=True
+        )
+
+        state_dict = checkpoint["model_state_dict"]
+        stripped = {}
+        for k, v in state_dict.items():
+            # Skip type_mel_proj - added in recent code changes, not in checkpoint
+            if "type_mel_proj" in k:
+                continue
+            if k.startswith("_orig_mod."):
+                stripped[k[len("_orig_mod.") :]] = v
+            else:
+                stripped[k] = v
+        missing, unexpected = self.model.load_state_dict(stripped, strict=False)
+        if missing:
+            print(f"  Note: {len(missing)} missing keys (expected - new modules added)")
+        if unexpected:
+            print(f"  Note: {len(unexpected)} unexpected keys (skipping)")
+
+        # Force DSP frequency grid rebuild — checkpoint saves _cached_n_fft but
+        # not the cos/sin grids (they're plain attributes, not buffers). Without
+        # this, freq_response() returns empty tensors after resume.
+        self.model.dsp_cascade._cached_n_fft.fill_(0)
+        self.model.dsp_cascade.init_freq_grid(self.n_fft)
+
+        self.optimizer.load_state_dict(checkpoint["optimizer_state_dict"])
+
+        if "scheduler_state_dict" in checkpoint and hasattr(self, "scheduler"):
+            try:
+                self.scheduler.load_state_dict(checkpoint["scheduler_state_dict"])
+            except Exception as e:
+                print(f"  Warning: Could not restore scheduler state: {e}")
+
+        self.global_step = checkpoint.get("global_step", 0)
+        self.best_val_loss = checkpoint.get("best_val_loss", float("inf"))
+
+        if "history" in checkpoint:
+            self.history = checkpoint["history"]
+            print(f"  Restored {len(self.history)} history entries from checkpoint")
+        else:
+            hist_path = self.ckpt_dir / "training_history.json"
+            if hist_path.exists():
+                with open(hist_path, "r") as f:
+                    self.history = json.load(f)
+                print(f"  Restored {len(self.history)} history entries from disk")
+            else:
+                print("  WARNING: No training history found — starting fresh")
+
+        start_epoch = checkpoint.get("epoch", 0)
+        self.start_epoch = start_epoch
+
+        print(f"  Resumed from epoch {start_epoch}, global_step={self.global_step}")
+        print(f"  Best val loss: {self.best_val_loss:.4f}")
+
+    def fit(self):
+        total_params = sum(p.numel() for p in self.model.parameters())
+        print("IDSP Multi-Type EQ Estimator Training")
+        print(f"  Device: {self.device}")
+        print(f"  Parameters: {total_params:,}")
+        print(f"  Max epochs: {self.max_epochs}")
+        print(f"  Receptive field: {self.model.receptive_field_frames} frames")
+
+        if self.stages:
+            print(f"  Curriculum: {len(self.stages)} stages")
+            for s in self.stages:
+                print(f"    - {s['name']}: {s['epochs']} epochs")
+
+        start_epoch = getattr(self, "start_epoch", 0)
+        global_epoch = 0
+
+        if self.stages:
+            for stage in self.stages:
+                stage_start = global_epoch
+                stage_end = global_epoch + stage["epochs"]
+
+                if stage_end <= start_epoch:
+                    print(
+                        f"  Skipping fully completed stage: {stage['name']} "
+                        f"(epochs {stage_start + 1}-{stage_end})"
+                    )
+                    global_epoch = stage_end
+                    continue
+
+                self._setup_stage(stage)
+
+                for local_epoch in range(1, stage["epochs"] + 1):
+                    global_epoch += 1
+
+                    if global_epoch <= start_epoch:
+                        print(
+                            f"  Skipping epoch {global_epoch}/{self.max_epochs} (already completed)"
+                        )
+                        self.scheduler.step()
+                        continue
+
+                    t0 = time.time()
+                    train_loss = self.train_one_epoch(global_epoch)
+                    val_loss, metrics = self.validate(global_epoch)
+                    self.scheduler.step()
+                    elapsed = time.time() - t0
+
+                    is_best = val_loss < self.best_val_loss and val_loss > 0
+                    if is_best:
+                        self.best_val_loss = val_loss
+                    self.save_checkpoint(global_epoch, val_loss, is_best, stage["name"])
+
+                    self.history.append(
+                        {
+                            "epoch": global_epoch,
+                            "stage": stage["name"],
+                            "train_loss": train_loss,
+                            "val_loss": val_loss,
+                            "metrics": metrics,
+                            "time_s": elapsed,
+                        }
+                    )
+
+                    hist_path = self.ckpt_dir / "training_history.json"
+                    with open(hist_path, "w") as f:
+                        json.dump(self.history, f, indent=2, default=str)
+
+                    print(
+                        f"Epoch {global_epoch}/{self.max_epochs} [{stage['name']}] "
+                        f"({elapsed:.1f}s) train={train_loss:.4f} val={val_loss:.4f}"
+                    )
+        else:
+            self._setup_flat_training()
+            self.scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(
+                self.optimizer, T_max=self.max_epochs, eta_min=1e-6
+            )
+
+            start_epoch = getattr(self, "start_epoch", 0)
+            for epoch in range(start_epoch + 1, self.max_epochs + 1):
+                t0 = time.time()
+                train_loss = self.train_one_epoch(epoch)
+                val_loss, metrics = self.validate(epoch)
+                self.scheduler.step()
+                elapsed = time.time() - t0
+
+                is_best = val_loss < self.best_val_loss and val_loss > 0
+                if is_best:
+                    self.best_val_loss = val_loss
+                self.save_checkpoint(epoch, val_loss, is_best)
+
+                self.history.append(
+                    {
+                        "epoch": epoch,
+                        "train_loss": train_loss,
+                        "val_loss": val_loss,
+                        "metrics": metrics,
+                        "time_s": elapsed,
+                    }
+                )
+
+                hist_path = self.ckpt_dir / "training_history.json"
+                with open(hist_path, "w") as f:
+                    json.dump(self.history, f, indent=2, default=str)
+
+                print(
+                    f"Epoch {epoch}/{self.max_epochs} ({elapsed:.1f}s) "
+                    f"train={train_loss:.4f} val={val_loss:.4f}"
+                )
+
+        hist_path = self.ckpt_dir / "training_history.json"
+        with open(hist_path, "w") as f:
+            json.dump(self.history, f, indent=2, default=str)
+        print(f"\nTraining complete. Best val loss: {self.best_val_loss:.4f}")
+        print(f"History saved to {hist_path}")
+
+        if self.test_loader is not None:
+            print(f"\n{'=' * 60}")
+            print("  Test Evaluation")
+            print(f"{'=' * 60}")
+            test_loss, test_metrics = self.validate(
+                epoch=self.max_epochs, use_test_loader=True
+            )
+            print(f"  Test loss: {test_loss:.4f}")
+            print("  Test metrics:")
+            for k, v in test_metrics.items():
+                print(f"    {k}: {v:.4f}")
+            print(f"  Best val loss: {self.best_val_loss:.4f}")
+            print(f"{'=' * 60}\n")
+
+    def _setup_flat_training(self):
+        data_cfg = self.data_cfg
+
+        duration = data_cfg.get("audio_duration", 1.5)
+        size = data_cfg.get("dataset_size", 50000)
+
+        filter_types_cfg = data_cfg.get(
+            "filter_types", ["peaking", "lowshelf", "highshelf", "highpass", "lowpass"]
+        )
+        active_indices = [FILTER_TYPE_TO_IDX[ft] for ft in filter_types_cfg]
+        n_active = len(active_indices)
+        type_weights = [0.0] * len(FILTER_NAMES)
+        for idx in active_indices:
+            type_weights[idx] = 1.0 / n_active
+
+        dataset = SyntheticEQDataset(
+            num_bands=self.num_bands,
+            sample_rate=self.sample_rate,
+            duration=duration,
+            n_fft=self.n_fft,
+            size=size,
+            gain_range=tuple(data_cfg["gain_bounds"]),
+            freq_range=tuple(data_cfg["freq_bounds"]),
+            q_range=tuple(data_cfg["q_bounds"]),
+            type_weights=type_weights,
+            precompute_mels=False,
+            n_mels=data_cfg.get("n_mels", 128),
+        )
+        dataset.precompute()
+
+        n_train = int(len(dataset) * data_cfg["train_split"])
+        n_val = int(len(dataset) * data_cfg["val_split"])
+        n_test = len(dataset) - n_train - n_val
+
+        gen = torch.Generator().manual_seed(self.cfg.get("seed", 42))
+        train_set, val_set, test_set = torch.utils.data.random_split(
+            dataset, [n_train, n_val, n_test], generator=gen
+        )
+
+        num_workers = 0
+        pin_memory = False
+
+        self.train_loader = DataLoader(
+            train_set,
+            batch_size=self.data_cfg["batch_size"],
+            shuffle=True,
+            num_workers=num_workers,
+            collate_fn=collate_fn,
+            pin_memory=pin_memory,
+            drop_last=True,
+            prefetch_factor=2 if num_workers > 0 else None,
+            persistent_workers=num_workers > 0,
+        )
+        self.val_loader = DataLoader(
+            val_set,
+            batch_size=self.data_cfg["batch_size"],
+            shuffle=False,
+            num_workers=num_workers,
+            collate_fn=collate_fn,
+            pin_memory=pin_memory,
+            prefetch_factor=2 if num_workers > 0 else None,
+            persistent_workers=num_workers > 0,
+        )
+        self.test_loader = DataLoader(
+            test_set,
+            batch_size=self.data_cfg["batch_size"],
+            shuffle=False,
+            num_workers=num_workers,
+            collate_fn=collate_fn,
+            pin_memory=pin_memory,
+            prefetch_factor=2 if num_workers > 0 else None,
+            persistent_workers=num_workers > 0,
+        )
+        self.test_set = test_set
+
+
+if __name__ == "__main__":
+    import argparse
+
+    parser = argparse.ArgumentParser()
+    parser.add_argument("--config", type=str, default="conf/config.yaml")
+    parser.add_argument("--resume", type=str, default=None)
+    args = parser.parse_args()
+
+    trainer = Trainer(config_path=args.config, resume_from=args.resume)
+    trainer.fit()

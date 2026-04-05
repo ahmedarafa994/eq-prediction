@@ -1,0 +1,9 @@
+{
+  "id": "4",
+  "subject": "Fix train.py: EMA logging, attn_temperature, mel_profile norm",
+  "description": "Fix EMA validation discrepancy, wire attn_temperature updates in _setup_stage, fix mel_profile normalization consistency",
+  "activeForm": "Updating train.py",
+  "status": "completed",
+  "blocks": [],
+  "blockedBy": []
+}

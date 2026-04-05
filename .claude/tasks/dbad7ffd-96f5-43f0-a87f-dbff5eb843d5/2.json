@@ -1,0 +1,9 @@
+{
+  "id": "2",
+  "subject": "Ask clarifying questions about goals and constraints",
+  "description": "Ask one question at a time to understand constraints, goals, and priorities for fixing frequency localization.",
+  "activeForm": "Asking clarifying questions",
+  "status": "completed",
+  "blocks": [],
+  "blockedBy": []
+}

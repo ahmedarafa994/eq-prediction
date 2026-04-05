@@ -1,0 +1,9 @@
+{
+  "id": "3",
+  "subject": "Propose 2-3 approaches with trade-offs",
+  "description": "Propose 2-3 approaches with trade-offs for fixing frequency compression, covering diagnosis, loss adjustment, and architecture changes.",
+  "activeForm": "Proposing approaches",
+  "status": "completed",
+  "blocks": [],
+  "blockedBy": []
+}

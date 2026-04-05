@@ -1,0 +1,4 @@
+INFO  2026-04-04 16:57:59,723 [MainThread] serena.cli:start_mcp_server:269 - Initializing Serena MCP server
+INFO  2026-04-04 16:57:59,724 [MainThread] serena.cli:start_mcp_server:270 - Storing logs in /teamspace/studios/this_studio/.serena/logs/2026-04-04/mcp_20260404-165759_28259.txt
+INFO  2026-04-04 16:57:59,725 [MainThread] serena.config.serena_config:from_config_file:805 - Loading Serena configuration from /teamspace/studios/this_studio/.serena/serena_config.yml
+INFO  2026-04-04 16:57:59,731 [MainThread] serena.agent:__init__:332 - Will record tool usage statistics with token count estimator: CHAR_COUNT.

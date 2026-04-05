@@ -1,0 +1,252 @@
+/teamspace/studios/this_studio/insight/evaluate_model.py-4-Generates structured synthetic test signals with known ground-truth EQ parameters,
+/teamspace/studios/this_studio/insight/evaluate_model.py-5-runs batch and streaming inference, and reports per-signal-type metrics with
+insight/evaluate_model.py:6:Hungarian-matched band comparison.
+/teamspace/studios/this_studio/insight/evaluate_model.py-7-"""
+/teamspace/studios/this_studio/insight/evaluate_model.py-8-import sys
+/teamspace/studios/this_studio/insight/evaluate_model.py-9-import argparse
+/teamspace/studios/this_studio/insight/evaluate_model.py-10-import torch
+/teamspace/studios/this_studio/insight/evaluate_model.py-11-import numpy as np
+--
+/teamspace/studios/this_studio/insight/evaluate_model.py-20-from model_tcn import StreamingTCNModel
+/teamspace/studios/this_studio/insight/evaluate_model.py-21-from dataset import SyntheticEQDataset, collate_fn, FILTER_NAMES
+insight/evaluate_model.py:22:from loss_multitype import HungarianBandMatcher
+/teamspace/studios/this_studio/insight/evaluate_model.py-23-from torch.utils.data import DataLoader
+/teamspace/studios/this_studio/insight/evaluate_model.py-24-
+/teamspace/studios/this_studio/insight/evaluate_model.py-25-
+insight/evaluate_model.py-26-def load_config(path="conf/config.yaml"):
+insight/evaluate_model.py-27-    with open(path, "r") as f:
+--
+/teamspace/studios/this_studio/insight/evaluate_model.py-98-
+insight/evaluate_model.py-99-def compute_metrics_batch(model, dataset, device, batch_size=16):
+insight/evaluate_model.py:100:    """Run batch inference and compute metrics with Hungarian matching."""
+/teamspace/studios/this_studio/insight/evaluate_model.py-101-    loader = DataLoader(dataset, batch_size=batch_size, shuffle=False,
+/teamspace/studios/this_studio/insight/evaluate_model.py-102-                        collate_fn=collate_fn, num_workers=0)
+/teamspace/studios/this_studio/insight/evaluate_model.py-103-
+insight/evaluate_model.py:104:    matcher = HungarianBandMatcher()
+/teamspace/studios/this_studio/insight/evaluate_model.py-105-
+/teamspace/studios/this_studio/insight/evaluate_model.py-106-    all_gain_err = []
+/teamspace/studios/this_studio/insight/evaluate_model.py-107-    all_freq_err = []
+/teamspace/studios/this_studio/insight/evaluate_model.py-108-    all_q_err = []
+/teamspace/studios/this_studio/insight/evaluate_model.py-109-    all_type_acc = []
+--
+/teamspace/studios/this_studio/insight/evaluate_model.py-128-            pred_type_logits = output["type_logits"]
+/teamspace/studios/this_studio/insight/evaluate_model.py-129-
+insight/evaluate_model.py:130:            # Hungarian matching: returns TARGET values reordered to match pred band ordering
+/teamspace/studios/this_studio/insight/evaluate_model.py-131-            matched = matcher(
+/teamspace/studios/this_studio/insight/evaluate_model.py-132-                pred_gain.cpu(), pred_freq.cpu(), pred_q.cpu(),
+/teamspace/studios/this_studio/insight/evaluate_model.py-133-                target_gain, target_freq, target_q,
+/teamspace/studios/this_studio/insight/evaluate_model.py-134-                pred_type_logits.cpu(), target_ft,
+/teamspace/studios/this_studio/insight/evaluate_model.py-135-            )
+--
+insight/evaluate_model.py-264-def print_sample_predictions(model, dataset, device, n_samples=3):
+/teamspace/studios/this_studio/insight/evaluate_model.py-265-    """Print detailed prediction vs ground truth for a few samples."""
+insight/evaluate_model.py:266:    matcher = HungarianBandMatcher()
+/teamspace/studios/this_studio/insight/evaluate_model.py-267-
+/teamspace/studios/this_studio/insight/evaluate_model.py-268-    print(f"\n{'='*70}")
+/teamspace/studios/this_studio/insight/evaluate_model.py-269-    print(f"  Sample Predictions (first {n_samples} samples)")
+/teamspace/studios/this_studio/insight/evaluate_model.py-270-    print(f"{'='*70}")
+/teamspace/studios/this_studio/insight/evaluate_model.py-271-
+--
+/teamspace/studios/this_studio/insight/train.py-2-Training script for the multi-type IDSP EQ Estimator.
+/teamspace/studios/this_studio/insight/train.py-3-
+insight/train.py:4:Uses StreamingTCNModel with MultiTypeEQLoss (Hungarian matching,
+/teamspace/studios/this_studio/insight/train.py-5-permutation-invariant parameter regression, type classification).
+/teamspace/studios/this_studio/insight/train.py-6-Implements curriculum learning from conf/config.yaml stages.
+/teamspace/studios/this_studio/insight/train.py-7-"""
+/teamspace/studios/this_studio/insight/train.py-8-
+/teamspace/studios/this_studio/insight/train.py-9-import math
+--
+/teamspace/studios/this_studio/insight/train.py-13-from model_tcn import StreamingTCNModel
+/teamspace/studios/this_studio/insight/train.py-14-from dsp_frontend import STFTFrontend
+insight/train.py:15:from loss_multitype import MultiTypeEQLoss, HungarianBandMatcher
+/teamspace/studios/this_studio/insight/train.py-16-from dataset import SyntheticEQDataset, collate_fn, FILTER_NAMES
+/teamspace/studios/this_studio/insight/train.py-17-import yaml
+/teamspace/studios/this_studio/insight/train.py-18-from pathlib import Path
+/teamspace/studios/this_studio/insight/train.py-19-import time
+/teamspace/studios/this_studio/insight/train.py-20-import json
+--
+/teamspace/studios/this_studio/insight/train.py-118-        )
+/teamspace/studios/this_studio/insight/train.py-119-
+insight/train.py:120:        # Hungarian matcher for permutation-invariant validation metrics
+insight/train.py:121:        self.val_matcher = HungarianBandMatcher(
+/teamspace/studios/this_studio/insight/train.py-122-            lambda_freq=loss_cfg.get("lambda_freq_match", 1.0),
+/teamspace/studios/this_studio/insight/train.py-123-            lambda_q=loss_cfg.get("lambda_q_match", 0.5),
+/teamspace/studios/this_studio/insight/train.py-124-        )
+/teamspace/studios/this_studio/insight/train.py-125-
+/teamspace/studios/this_studio/insight/train.py-126-        self.data_cfg = data_cfg
+--
+/teamspace/studios/this_studio/insight/train.py-556-                n_batches += 1
+/teamspace/studios/this_studio/insight/train.py-557-
+insight/train.py:558:                # Use Hungarian matching for accurate permutation-invariant metrics
+/teamspace/studios/this_studio/insight/train.py-559-                matched = self.val_matcher(
+/teamspace/studios/this_studio/insight/train.py-560-                    pred_gain.cpu(),
+/teamspace/studios/this_studio/insight/train.py-561-                    pred_freq.cpu(),
+/teamspace/studios/this_studio/insight/train.py-562-                    pred_q.cpu(),
+/teamspace/studios/this_studio/insight/train.py-563-                    target_gain.cpu(),
+--
+/teamspace/studios/this_studio/insight/loss_multitype.py-3-
+insight/loss_multitype.py-4-Key components:
+insight/loss_multitype.py:5:- Hungarian matching for permutation-invariant band assignment (DETR-style)
+/teamspace/studios/this_studio/insight/loss_multitype.py-6-- Combined regression + classification loss
+/teamspace/studios/this_studio/insight/loss_multitype.py-7-- Spectral consistency loss for blind estimation
+/teamspace/studios/this_studio/insight/loss_multitype.py-8-- Auxiliary losses (band activity, frequency spread)
+/teamspace/studios/this_studio/insight/loss_multitype.py-9-"""
+/teamspace/studios/this_studio/insight/loss_multitype.py-10-
+--
+/teamspace/studios/this_studio/insight/loss_multitype.py-15-import torch.nn as nn
+/teamspace/studios/this_studio/insight/loss_multitype.py-16-import torch.nn.functional as F
+insight/loss_multitype.py:17:from scipy.optimize import linear_sum_assignment
+/teamspace/studios/this_studio/insight/loss_multitype.py-18-import numpy as np
+/teamspace/studios/this_studio/insight/loss_multitype.py-19-
+/teamspace/studios/this_studio/insight/loss_multitype.py-20-from loss import MultiResolutionSTFTLoss
+/teamspace/studios/this_studio/insight/loss_multitype.py-21-
+/teamspace/studios/this_studio/insight/loss_multitype.py-22-_HUNGARIAN_POOL = ThreadPoolExecutor(max_workers=4)
+/teamspace/studios/this_studio/insight/loss_multitype.py-23-
+/teamspace/studios/this_studio/insight/loss_multitype.py-24-
+insight/loss_multitype.py:25:class HungarianBandMatcher:
+/teamspace/studios/this_studio/insight/loss_multitype.py-26-    """
+insight/loss_multitype.py:27:    Solves the band permutation problem using Hungarian (bipartite) matching.
+/teamspace/studios/this_studio/insight/loss_multitype.py-28-
+/teamspace/studios/this_studio/insight/loss_multitype.py-29-    When predicting N EQ bands, the model's band ordering is arbitrary.
+/teamspace/studios/this_studio/insight/loss_multitype.py-30-    This finds the optimal assignment between predicted and ground-truth bands
+/teamspace/studios/this_studio/insight/loss_multitype.py-31-    to minimize parameter distance, following Carion et al. (DETR, 2020).
+/teamspace/studios/this_studio/insight/loss_multitype.py-32-    """
+--
+/teamspace/studios/this_studio/insight/loss_multitype.py-37-        self.lambda_type_match = lambda_type_match
+/teamspace/studios/this_studio/insight/loss_multitype.py-38-
+insight/loss_multitype.py:39:    def compute_cost_matrix(
+/teamspace/studios/this_studio/insight/loss_multitype.py-40-        self,
+/teamspace/studios/this_studio/insight/loss_multitype.py-41-        pred_gain,
+/teamspace/studios/this_studio/insight/loss_multitype.py-42-        pred_freq,
+/teamspace/studios/this_studio/insight/loss_multitype.py-43-        pred_q,
+/teamspace/studios/this_studio/insight/loss_multitype.py-44-        target_gain,
+--
+/teamspace/studios/this_studio/insight/loss_multitype.py-83-        cost = cost_gain + cost_freq + cost_q  # (B, N, N)
+/teamspace/studios/this_studio/insight/loss_multitype.py-84-
+insight/loss_multitype.py:85:        # Clamp cost to prevent FP16 overflow in Hungarian matching
+/teamspace/studios/this_studio/insight/loss_multitype.py-86-        cost = cost.clamp(max=1e4)
+/teamspace/studios/this_studio/insight/loss_multitype.py-87-
+insight/loss_multitype.py-88-        # Type mismatch penalty: prefer matching bands of the same filter type
+insight/loss_multitype.py-89-        if pred_type_logits is not None and target_filter_type is not None:
+/teamspace/studios/this_studio/insight/loss_multitype.py-90-            # Use predicted type probabilities for soft matching
+--
+insight/loss_multitype.py-107-        if np.any(np.isnan(cost_np)) or np.any(np.isinf(cost_np)):
+/teamspace/studios/this_studio/insight/loss_multitype.py-108-            print(
+insight/loss_multitype.py:109:                f"  WARNING: NaN/Inf in Hungarian cost matrix at batch {b} (shape={shape})"
+/teamspace/studios/this_studio/insight/loss_multitype.py-110-            )
+/teamspace/studios/this_studio/insight/loss_multitype.py-111-        cost_np = np.nan_to_num(cost_np, nan=1e6, posinf=1e6, neginf=-1e6)
+insight/loss_multitype.py:112:        return linear_sum_assignment(cost_np)
+/teamspace/studios/this_studio/insight/loss_multitype.py-113-
+insight/loss_multitype.py:114:    def match(self, cost_matrix):
+/teamspace/studios/this_studio/insight/loss_multitype.py-115-        """
+/teamspace/studios/this_studio/insight/loss_multitype.py-116-        Solve the assignment problem for each batch element.
+/teamspace/studios/this_studio/insight/loss_multitype.py-117-        Uses ThreadPoolExecutor to parallelize scipy calls across the batch.
+/teamspace/studios/this_studio/insight/loss_multitype.py-118-
+insight/loss_multitype.py-119-        Args:
+insight/loss_multitype.py:120:            cost_matrix: (Batch, N_pred, N_target)
+/teamspace/studios/this_studio/insight/loss_multitype.py-121-
+insight/loss_multitype.py-122-        Returns:
+/teamspace/studios/this_studio/insight/loss_multitype.py-123-            List of (row_indices, col_indices) tuples per batch element
+/teamspace/studios/this_studio/insight/loss_multitype.py-124-        """
+insight/loss_multitype.py:125:        B = cost_matrix.shape[0]
+insight/loss_multitype.py:126:        costs_np = cost_matrix.detach().cpu().numpy()
+insight/loss_multitype.py-127-        shape = costs_np.shape[1:]
+/teamspace/studios/this_studio/insight/loss_multitype.py-128-
+insight/loss_multitype.py-129-        if B <= 4:
+/teamspace/studios/this_studio/insight/loss_multitype.py-130-            assignments = []
+insight/loss_multitype.py-131-            for b in range(B):
+--
+/teamspace/studios/this_studio/insight/loss_multitype.py-157-            — ground truth reordered to match predicted band ordering
+/teamspace/studios/this_studio/insight/loss_multitype.py-158-        """
+insight/loss_multitype.py:159:        cost = self.compute_cost_matrix(
+/teamspace/studios/this_studio/insight/loss_multitype.py-160-            pred_gain,
+/teamspace/studios/this_studio/insight/loss_multitype.py-161-            pred_freq,
+/teamspace/studios/this_studio/insight/loss_multitype.py-162-            pred_q,
+/teamspace/studios/this_studio/insight/loss_multitype.py-163-            target_gain,
+/teamspace/studios/this_studio/insight/loss_multitype.py-164-            target_freq,
+--
+insight/loss_multitype.py-199-class PermutationInvariantParamLoss(nn.Module):
+/teamspace/studios/this_studio/insight/loss_multitype.py-200-    """
+insight/loss_multitype.py:201:    Parameter regression loss with Hungarian matching for band ordering.
+/teamspace/studios/this_studio/insight/loss_multitype.py-202-    Uses Huber loss for robustness to outliers.
+/teamspace/studios/this_studio/insight/loss_multitype.py-203-    """
+/teamspace/studios/this_studio/insight/loss_multitype.py-204-
+insight/loss_multitype.py-205-    def __init__(self, lambda_freq=1.0, lambda_q=0.5):
+/teamspace/studios/this_studio/insight/loss_multitype.py-206-        super().__init__()
+insight/loss_multitype.py:207:        self.matcher = HungarianBandMatcher(lambda_freq, lambda_q)
+/teamspace/studios/this_studio/insight/loss_multitype.py-208-        self.huber = nn.HuberLoss(delta=1.0)
+/teamspace/studios/this_studio/insight/loss_multitype.py-209-        self.huber_elementwise = nn.HuberLoss(delta=1.0, reduction="none")
+insight/loss_multitype.py-210-        # Separate Huber for frequency with smaller delta: stays in quadratic
+/teamspace/studios/this_studio/insight/loss_multitype.py-211-        # regime up to 0.25 octaves, providing stronger gradients for the
+/teamspace/studios/this_studio/insight/loss_multitype.py-212-        # 2+ octave errors observed during training. Standard delta=1.0 was
+--
+/teamspace/studios/this_studio/insight/debug_peaks.py-10-from torch.utils.data import DataLoader
+/teamspace/studios/this_studio/insight/debug_peaks.py-11-from scipy.signal import find_peaks
+insight/debug_peaks.py:12:from scipy.optimize import linear_sum_assignment
+/teamspace/studios/this_studio/insight/debug_peaks.py-13-
+/teamspace/studios/this_studio/insight/debug_peaks.py-14-# Build dataset (same config as training)
+/teamspace/studios/this_studio/insight/debug_peaks.py-15-dataset = SyntheticEQDataset(
+/teamspace/studios/this_studio/insight/debug_peaks.py-16-    num_bands=3, sample_rate=44100, duration=3.0, n_fft=2048,
+/teamspace/studios/this_studio/insight/debug_peaks.py-17-    size=200, gain_range=(-12, 12), freq_range=(100, 8000),
+--
+/teamspace/studios/this_studio/insight/debug_peaks.py-68-            peak_freqs = np.exp(mel_log_freqs[top_bins].numpy())
+/teamspace/studios/this_studio/insight/debug_peaks.py-69-
+insight/debug_peaks.py:70:        # Hungarian matching between predicted and target
+insight/debug_peaks.py-71-        cost = np.abs(np.log(peak_freqs[:, None] + 1) - np.log(tf[None, :] + 1))
+insight/debug_peaks.py:72:        row, col = linear_sum_assignment(cost)
+/teamspace/studios/this_studio/insight/debug_peaks.py-73-        matched_pred = peak_freqs[row]
+/teamspace/studios/this_studio/insight/debug_peaks.py-74-        matched_tgt = tf[col]
+/teamspace/studios/this_studio/insight/debug_peaks.py-75-
+/teamspace/studios/this_studio/insight/debug_peaks.py-76-        oct_err = np.abs(np.log2(matched_pred / np.maximum(matched_tgt, 1)))
+/teamspace/studios/this_studio/insight/debug_peaks.py-77-        oct_errors_peaks.extend(oct_err.tolist())
+--
+/teamspace/studios/this_studio/insight/debug_peaks.py-99-
+insight/debug_peaks.py-100-        cost2 = np.abs(np.log(peak_freqs2[:, None] + 1) - np.log(tf[None, :] + 1))
+insight/debug_peaks.py:101:        row2, col2 = linear_sum_assignment(cost2)
+/teamspace/studios/this_studio/insight/debug_peaks.py-102-        matched_pred2 = peak_freqs2[row2]
+/teamspace/studios/this_studio/insight/debug_peaks.py-103-        matched_tgt2 = tf[col2]
+/teamspace/studios/this_studio/insight/debug_peaks.py-104-
+/teamspace/studios/this_studio/insight/debug_peaks.py-105-        oct_err2 = np.abs(np.log2(matched_pred2 / np.maximum(matched_tgt2, 1)))
+/teamspace/studios/this_studio/insight/debug_peaks.py-106-        oct_errors_weighted.extend(oct_err2.tolist())
+--
+/teamspace/studios/this_studio/insight/training/lightning_module.py-25-from model_tcn import StreamingTCNModel
+/teamspace/studios/this_studio/insight/training/lightning_module.py-26-from dsp_frontend import STFTFrontend
+insight/training/lightning_module.py:27:from loss_multitype import MultiTypeEQLoss, HungarianBandMatcher
+/teamspace/studios/this_studio/insight/training/lightning_module.py-28-
+/teamspace/studios/this_studio/insight/training/lightning_module.py-29-FILTER_NAMES = ["peaking", "lowshelf", "highshelf", "highpass", "lowpass"]
+insight/training/lightning_module.py-30-FILTER_TYPE_TO_IDX = {name: idx for idx, name in enumerate(FILTER_NAMES)}
+/teamspace/studios/this_studio/insight/training/lightning_module.py-31-
+/teamspace/studios/this_studio/insight/training/lightning_module.py-32-
+--
+/teamspace/studios/this_studio/insight/training/lightning_module.py-104-        )
+/teamspace/studios/this_studio/insight/training/lightning_module.py-105-
+insight/training/lightning_module.py:106:        self.val_matcher = HungarianBandMatcher(
+/teamspace/studios/this_studio/insight/training/lightning_module.py-107-            lambda_freq=loss_cfg.get("lambda_freq_match", 1.0),
+/teamspace/studios/this_studio/insight/training/lightning_module.py-108-            lambda_q=loss_cfg.get("lambda_q_match", 0.5),
+/teamspace/studios/this_studio/insight/training/lightning_module.py-109-        )
+/teamspace/studios/this_studio/insight/training/lightning_module.py-110-
+insight/training/lightning_module.py-111-    def forward(self, mel_frames):
+--
+/teamspace/studios/this_studio/insight/training_log.txt-35-  lr = 1.00e-04
+/teamspace/studios/this_studio/insight/training_log.txt-36-  [train] step=10 loss=12.7747 lr=1.00e-04 | param_loss=7.1832 | type_loss=0.0000 | hmag_loss=0.2634 | spectral_loss=0.0000 | activity_loss=0.0000 | spread_loss=0.1687 | coverage_loss=3.0144 | freq_anchor_loss=2.0722 | attn_entropy_loss=0.7483
+insight/training_log.txt:37:  WARNING: NaN/Inf in Hungarian cost matrix at batch 0 (shape=(3, 3))
+insight/training_log.txt:38:  WARNING: NaN/Inf in Hungarian cost matrix at batch 1 (shape=(3, 3))
+insight/training_log.txt:39:  WARNING: NaN/Inf in Hungarian cost matrix at batch 2 (shape=(3, 3))
+insight/training_log.txt:40:  WARNING: NaN/Inf in Hungarian cost matrix at batch 3 (shape=(3, 3))
+insight/training_log.txt:41:  WARNING: NaN/Inf in Hungarian cost matrix at batch 4 (shape=(3, 3))
+insight/training_log.txt:42:  WARNING: NaN/Inf in Hungarian cost matrix at batch 5 (shape=(3, 3))
+insight/training_log.txt:43:  WARNING: NaN/Inf in Hungarian cost matrix at batch 6 (shape=(3, 3))
+insight/training_log.txt:44:  WARNING: NaN/Inf in Hungarian cost matrix at batch 7 (shape=(3, 3))
+insight/training_log.txt:45:  WARNING: NaN/Inf in Hungarian cost matrix at batch 8 (shape=(3, 3))
+insight/training_log.txt:46:  WARNING: NaN/Inf in Hungarian cost matrix at batch 9 (shape=(3, 3))
+insight/training_log.txt:47:  WARNING: NaN/Inf in Hungarian cost matrix at batch 10 (shape=(3, 3))
+insight/training_log.txt:48:  WARNING: NaN/Inf in Hungarian cost matrix at batch 11 (shape=(3, 3))
+insight/training_log.txt:49:  WARNING: NaN/Inf in Hungarian cost matrix at batch 12 (shape=(3, 3))
+insight/training_log.txt:50:  WARNING: NaN/Inf in Hungarian cost matrix at batch 13 (shape=(3, 3))
+insight/training_log.txt:51:  WARNING: NaN/Inf in Hungarian cost matrix at batch 14 (shape=(3, 3))
+insight/training_log.txt:52:  WARNING: NaN/Inf in Hungarian cost matrix at batch 15 (shape=(3, 3))
+insight/training_log.txt:53:  WARNING: NaN/Inf in Hungarian cost matrix at batch 16 (shape=(3, 3))
+insight/training_log.txt:54:  WARNING: NaN/Inf in Hungarian cost matrix at batch 17 (shape=(3, 3))
+insight/training_log.txt:55:  WARNING: NaN/Inf in Hungarian cost matrix at batch 18 (shape=(3, 3))
+
+[Showing results with pagination = limit: 250]

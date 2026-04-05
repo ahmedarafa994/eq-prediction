@@ -1,0 +1,11 @@
+{
+  "id": "2",
+  "subject": "Increase TCN receptive field (kernel_size 3→5, num_blocks 4→6)",
+  "description": "Update config.yaml to increase kernel_size and num_blocks for better temporal modeling. Current receptive field covers ~0.7s of 1.5s audio.",
+  "activeForm": "Updating TCN architecture config",
+  "status": "completed",
+  "blocks": [
+    "1"
+  ],
+  "blockedBy": []
+}

@@ -1,0 +1,9 @@
+{
+  "id": "1",
+  "subject": "Update config.yaml loss weights and curriculum params",
+  "description": "Change loss weights (lambda_freq_anchor, lambda_hmag), batch_size, accumulate_grad_batches, and add attn_temperature to curriculum stages",
+  "activeForm": "Updating config.yaml",
+  "status": "completed",
+  "blocks": [],
+  "blockedBy": []
+}

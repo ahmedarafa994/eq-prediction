@@ -1,0 +1,9 @@
+{
+  "id": "6",
+  "subject": "Replace Gaussian readout with MLP gain head in model_tcn.py",
+  "description": "Replace the Gaussian readout gain mechanism (10 params) with a proper 2-layer MLP regression head (512+ params) that takes trunk embedding directly. File: insight/model_tcn.py",
+  "activeForm": "Replacing Gaussian readout with MLP head",
+  "status": "pending",
+  "blocks": [],
+  "blockedBy": []
+}

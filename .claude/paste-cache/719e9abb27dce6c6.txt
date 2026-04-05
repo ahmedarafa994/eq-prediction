@@ -1,0 +1,36 @@
+This is a textbook example of a **balanced dataset**. 
+
+By including the `mixture.wav` alongside isolated stems, you are teaching the model both "micro" and "macro" spectral analysis. The mixture provides the dense, overlapping frequencies of a real-world master, while the stems act as "specialized teachers" for specific frequency ranges.
+
+### 🔬 Why your "Random Starting Positions" matter
+You hit on a key statistical point: even with "only" 161 files, your **effective diversity** is massive. 
+* **The Math:** 161 stems $\times$ 180 seconds = 28,980 seconds of source audio. 
+* **The Coverage:** You are extracting 10,000 samples $\times$ 5 seconds = 50,000 seconds of training data.
+* **The Result:** You are essentially "recycling" each piece of audio about 1.7 times. However, because each visit applies a **unique, randomized 24-parameter EQ**, the model never sees the same "Delta" twice. This is the perfect defense against overfitting.
+
+
+
+---
+
+### 🚀 What to expect when the L4 takes over
+Once your generation hits 10,000, you'll move to the L4. Here is how that training session is likely to play out:
+
+#### 1. The "Instrument Bias" Phase (Epochs 1–10)
+The model will first learn the "generic" shapes of your stems. It will recognize that `vocals.wav` usually has a big bump in the mids. During this phase, your `val_loss` might drop quickly as it learns to distinguish "Drums" from "Bass."
+
+#### 2. The "Delta Discovery" Phase (Epochs 10–30)
+This is where the magic happens. Thanks to your **Dual-Channel Input**, the model will stop looking at the instruments and start looking at the *difference* between the channels. It will realize: *"I don't care if this is a vocal or a kick drum; I see a 3dB deviation at 2kHz that isn't in the dry channel."* #### 3. The "Sub-0.100" Breakthrough
+If the model generalizes well across those 161 diverse stems, you should see the validation loss break the **0.100 barrier**. If it gets stuck above that, it’s a sign we might need to increase the complexity of the CNN (more filters) or simply double the dataset to 20,000.
+
+
+
+---
+
+### 🛠️ Final "Go-Live" Check for the Cloud
+While that progress bar climbs toward 10k, make sure your `train_cnn.py` is ready for the **Linux environment**:
+
+* **Paths:** Ensure `data_dir` uses forward slashes `/`.
+* **Persistence:** If you aren't using a persistent Studio, make sure you know where your `checkpoints/` folder is saving so you don't lose the weights if the instance restarts.
+* **Precision:** Since you're on an L4 (Ada Lovelace), use `torch.set_float32_matmul_precision('high')` at the top of your script. It will give you a significant speed boost with almost zero loss in accuracy.
+
+**I’m tracking with you. Once that 10,000th sample is saved and sharded, are you planning to do a "Learning Rate Finder" run, or are you going to jump straight into the 50-epoch bake?**
