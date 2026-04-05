@@ -498,20 +498,32 @@ class Trainer:
                         grad_parts = []
                         for name, param in self.model.named_parameters():
                             if param.grad is not None and param.grad.norm() > 0:
-                                if "gain" in name:
-                                    grad_parts.append(
-                                        ("gain", param.grad.norm().item())
-                                    )
-                                elif "freq" in name or "log_freq" in name:
-                                    grad_parts.append(
-                                        ("freq", param.grad.norm().item())
-                                    )
+                                # D-03: Fixed parameter name matching to actual model structure
+                                # Verified parameter name prefixes from StreamingTCNModel.named_parameters():
+                                #   param_head.gain_mlp.*         -> gain prediction MLP
+                                #   param_head.gain_trunk_head.*  -> gain from trunk embedding
+                                #   param_head.gain_mel_aux.*     -> mel-residual gain path
+                                #   param_head.q_head.*           -> Q prediction
+                                #   param_head.classification_head.* -> type classification
+                                #   param_head.freq_direct.*      -> frequency prediction
+                                #   param_head.freq_fallback.*    -> frequency fallback
+                                #   param_head.trunk.*            -> shared parameter trunk
+                                #   param_head.type_mel_proj.*    -> type mel projection
+                                #   param_head.mel_cnn.*          -> mel CNN features
+                                #   encoder.*                     -> TCN encoder
+                                if "gain_mlp" in name or "gain_trunk_head" in name or "gain_mel_aux" in name:
+                                    grad_parts.append(("gain", param.grad.norm().item()))
                                 elif "q_head" in name:
                                     grad_parts.append(("q", param.grad.norm().item()))
-                                elif "classif" in name or "type" in name:
-                                    grad_parts.append(
-                                        ("type", param.grad.norm().item())
-                                    )
+                                elif "classification_head" in name or "type_mel_proj" in name:
+                                    grad_parts.append(("type", param.grad.norm().item()))
+                                elif "freq_direct" in name or "freq_fallback" in name:
+                                    grad_parts.append(("freq", param.grad.norm().item()))
+                                elif "param_head" in name:
+                                    # Catch-all for trunk, cnn_merge, query_proj, etc.
+                                    grad_parts.append(("param_head_other", param.grad.norm().item()))
+                                elif "encoder" in name:
+                                    grad_parts.append(("encoder", param.grad.norm().item()))
                         if grad_parts:
                             grouped = {}
                             for k, v in grad_parts:
