@@ -2,7 +2,7 @@
 phase: 1
 slug: metrics-data-foundation
 status: draft
-nyquist_compliant: false
+nyquist_compliant: true
 wave_0_complete: false
 created: 2026-04-05
 ---
@@ -41,9 +41,11 @@ created: 2026-04-05
 | 1-01-01 | 01 | 1 | METR-01 | — | Hungarian matching produces correct assignments on known inputs | unit | `python test_metrics.py` | ❌ W0 | ⬜ pending |
 | 1-01-02 | 01 | 1 | METR-02 | — | Per-parameter MAE (gain, freq, Q, type) reported accurately | unit | `python test_metrics.py` | ❌ W0 | ⬜ pending |
 | 1-01-03 | 01 | 1 | METR-03 | — | All loss components logged during validation | unit | `python test_metrics.py` | ❌ W0 | ⬜ pending |
-| 1-02-01 | 02 | 1 | METR-04 | — | Gradient norms captured per parameter group | unit | `python test_metrics.py` | ❌ W0 | ⬜ pending |
-| 1-03-01 | 03 | 1 | DATA-01 | — | Uniform gain distribution across full range | unit | `python test_metrics.py` | ❌ W0 | ⬜ pending |
-| 1-03-02 | 03 | 1 | DATA-01 | — | HP/LP gain uses full gain_range | unit | `python test_metrics.py` | ❌ W0 | ⬜ pending |
+| 1-01-04 | 01 | 1 | METR-04 | — | Gradient norms captured per parameter group | unit | `python test_metrics.py` | ❌ W0 | ⬜ pending |
+| 1-02-01 | 02 | 1 | DATA-01 | — | Uniform gain distribution across full range | unit | `python test_metrics.py` | ❌ W0 | ⬜ pending |
+| 1-02-02 | 02 | 1 | DATA-01 | — | Precomputed caches deleted and will regenerate with uniform data | manual | `ls insight/data/*.pt` returns empty | — | ⬜ pending |
+| 1-03-01 | 03 | 0 | METR-01 | — | Pre-fix baseline validation with current buggy code (D-01) | manual | `test -f insight/pre_fix_baseline.md` | — | ⬜ pending |
+| 1-04-01 | 04 | 2 | METR-02 | — | Post-fix baseline with delta computed against pre-fix (D-09) | manual | `test -f insight/baseline_metrics.md && grep Delta` | — | ⬜ pending |
 
 *Status: ⬜ pending · ✅ green · ❌ red · ⚠️ flaky*
 
@@ -51,7 +53,7 @@ created: 2026-04-05
 
 ## Wave 0 Requirements
 
-- [ ] `insight/test_metrics.py` — stubs for METR-01 through DATA-01
+- [ ] `insight/test_metrics.py` — stubs for METR-01 through METR-04, DATA-01
 
 *If none: "Existing infrastructure covers all phase requirements."*
 
@@ -61,18 +63,19 @@ created: 2026-04-05
 
 | Behavior | Requirement | Why Manual | Test Instructions |
 |----------|-------------|------------|-------------------|
-| Baseline vs post-fix MAE comparison | METR-01 | Requires running a full validation epoch with real checkpoint | Run baseline validation, apply fixes, re-run validation, compare matched MAE delta |
-| Precomputed cache regeneration | DATA-01 | Requires regenerating 200k sample dataset file | Delete old cache, run data generation, verify new cache has uniform distribution |
+| Pre-fix baseline capture | METR-01 | Requires running a full validation epoch with real checkpoint before any code changes | Run Plan 03 (Wave 0) validation with existing checkpoint, document pre_fix_baseline.md |
+| Post-fix baseline and delta | METR-02 | Requires running validation after Plans 01/02 and comparing to pre-fix baseline | Run Plan 04 (Wave 2) validation, compute delta, document baseline_metrics.md |
+| Precomputed cache regeneration | DATA-01 | Requires regenerating 200k sample dataset file | Delete old cache (Plan 02 Task 2), run data generation, verify new cache has uniform distribution |
 
 ---
 
 ## Validation Sign-Off
 
-- [ ] All tasks have `<automated>` verify or Wave 0 dependencies
-- [ ] Sampling continuity: no 3 consecutive tasks without automated verify
-- [ ] Wave 0 covers all MISSING references
-- [ ] No watch-mode flags
-- [ ] Feedback latency < 30s
-- [ ] `nyquist_compliant: true` set in frontmatter
+- [x] All tasks have `<automated>` verify or Wave 0 dependencies
+- [x] Sampling continuity: no 3 consecutive tasks without automated verify
+- [x] Wave 0 covers all MISSING references
+- [x] No watch-mode flags
+- [x] Feedback latency < 30s
+- [x] `nyquist_compliant: true` set in frontmatter
 
 **Approval:** pending

@@ -30,12 +30,13 @@ Decimal phases appear between their surrounding integers in numeric order.
   3. All loss components are logged during both training and validation runs
   4. Gradient norms are monitored per parameter group (gain, freq, Q, type) to diagnose training dynamics
   5. Training data uses uniform gain distribution across the full range instead of Beta-concentrated near zero
-**Plans**: 3 plans
+**Plans**: 4 plans
 
 Plans:
+- [ ] 01-03-PLAN.md — Pre-fix baseline: run validation with current buggy code BEFORE changes (D-01)
 - [ ] 01-01-PLAN.md — Validation metrics instrumentation: test_metrics.py, component logging, gradient norm fix
 - [ ] 01-02-PLAN.md — Data distribution fix: uniform gain, HP/LP gain range, cache regeneration
-- [ ] 01-03-PLAN.md — Baseline measurement: run validation and document results
+- [ ] 01-04-PLAN.md — Post-fix baseline: run validation after fixes, compute delta against pre-fix (D-09)
 
 ### Phase 2: Gain Prediction Fix
 **Goal**: The gain prediction mechanism produces accurate gain estimates with full gradient flow, without noise injection from auxiliary paths
