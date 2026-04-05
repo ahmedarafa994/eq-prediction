@@ -1,9 +1,0 @@
-{
-  "id": "8",
-  "subject": "Implement spectral EQ prediction model",
-  "description": "Replace the collapsed TCN architecture with a spectral prediction model that predicts H_db directly from the wet spectral profile. Use a 1D CNN / MLP. Then extract params via peak detection + least-squares fitting.",
-  "activeForm": "Implementing spectral EQ model",
-  "status": "in_progress",
-  "blocks": [],
-  "blockedBy": []
-}

@@ -1,9 +1,0 @@
-{
-  "id": "6",
-  "subject": "Phase 1a: Unify clamp values in loss_multitype.py",
-  "description": "Change all clamp(min=1e-6) and clamp(min=1e-3) to clamp(min=1e-5) throughout loss_multitype.py for consistency. Lines 69, 75, 228-229, 231-233, 352-354, 379.",
-  "activeForm": "Unifying clamp values",
-  "status": "completed",
-  "blocks": [],
-  "blockedBy": []
-}

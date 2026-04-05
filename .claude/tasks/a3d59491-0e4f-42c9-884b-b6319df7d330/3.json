@@ -1,9 +1,0 @@
-{
-  "id": "3",
-  "subject": "Fix train.py - val/train H_mag consistency",
-  "description": "Fix validate() in train.py to use forward_soft with gain detached (same as training) instead of hard-typed H_mag that diverges when type accuracy is low",
-  "activeForm": "Fixing train/val consistency",
-  "status": "completed",
-  "blocks": [],
-  "blockedBy": []
-}

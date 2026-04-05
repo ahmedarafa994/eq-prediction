@@ -1,9 +1,0 @@
-{
-  "id": "8",
-  "subject": "Increase max_epochs and run training",
-  "description": "Set max_epochs=80 in config.yaml, run tests, start training.",
-  "activeForm": "Running training",
-  "status": "in_progress",
-  "blocks": [],
-  "blockedBy": []
-}

@@ -1,9 +1,0 @@
-{
-  "id": "5",
-  "subject": "Add freq weighting in PermutationInvariantParamLoss",
-  "description": "Add lambda_freq_param weight to frequency component inside param_loss in loss_multitype.py",
-  "activeForm": "Updating loss_multitype.py",
-  "status": "completed",
-  "blocks": [],
-  "blockedBy": []
-}

@@ -1,9 +1,0 @@
-{
-  "id": "5",
-  "subject": "Restart training with fixed config",
-  "description": "Clear stale cache and restart training with fixed config",
-  "activeForm": "Restarting training",
-  "status": "in_progress",
-  "blocks": [],
-  "blockedBy": []
-}
