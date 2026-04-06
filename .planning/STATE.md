@@ -3,14 +3,14 @@ gsd_state_version: 1.0
 milestone: v1.0
 milestone_name: milestone
 status: complete
-stopped_at: All 5 phases executed
-last_updated: "2026-04-06T12:00:00.000Z"
-last_activity: 2026-04-06 -- All phases executed and verified
+stopped_at: v1.0 milestone shipped
+last_updated: "2026-04-06T10:37:00.000Z"
+last_activity: 2026-04-06 -- v1.0 milestone completed and archived
 progress:
   total_phases: 5
   completed_phases: 5
-  total_plans: 10
-  completed_plans: 10
+  total_plans: 12
+  completed_plans: 12
   percent: 100
 ---
 
@@ -21,14 +21,14 @@ progress:
 See: .planning/PROJECT.md (updated 2026-04-06)
 
 **Core value:** The model must accurately estimate EQ parameters from wet audio alone — gain MAE < 1 dB
-**Current focus:** All phases complete — pending live training verification
+**Current focus:** v1.0 shipped — planning next milestone
 
 ## Current Position
 
-Phase: ALL COMPLETE
+Phase: ALL COMPLETE (v1.0 shipped)
 Plan: N/A
-Status: All implementation work complete; pending live training verification
-Last activity: 2026-04-06 -- All phases executed and verified
+Status: Milestone v1.0 archived. Next: `/gsd-new-milestone` to start v1.1
+Last activity: 2026-04-06
 
 Progress: [██████████] 100%
 
