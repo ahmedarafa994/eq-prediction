@@ -13,10 +13,10 @@ Systematic bug-fixing of a differentiable parametric EQ estimation pipeline that
 Decimal phases appear between their surrounding integers in numeric order.
 
 - [x] **Phase 1: Metrics & Data Foundation** - Fix validation measurement and balance training data to establish trustworthy baseline
-- [ ] **Phase 2: Gain Prediction Fix** - Replace broken gain head with direct MLP + STE clamp, remove mel-residual path, verify streaming
-- [ ] **Phase 3: Loss Architecture Restructuring** - Phase loss activation, dual forward path, log-cosh for gain, independent loss weights
-- [ ] **Phase 4: Q, Type & Frequency Refinement** - Fix Q parameterization, metric-gated curriculum, push all parameters to target accuracy
-- [ ] **Phase 5: Inference Refinement & Confidence** - Inference-time parameter optimization and per-band confidence estimation
+- [x] **Phase 2: Gain Prediction Fix** - Replace broken gain head with direct MLP + STE clamp, remove mel-residual path, verify streaming
+- [x] **Phase 3: Loss Architecture Restructuring** - Phase loss activation, dual forward path, log-cosh for gain, independent loss weights
+- [x] **Phase 4: Q, Type - [ ] **Phase 4: Q, Type & Frequency Refinement** Frequency Refinement** - Fix Q parameterization, metric-gated curriculum, push all parameters to target accuracy
+- [x] **Phase 5: Inference Refinement - [ ] **Phase 5: Inference Refinement & Confidence** Confidence** - Inference-time parameter optimization and per-band confidence estimation
 
 ## Phase Details
 
@@ -85,8 +85,8 @@ Plans:
 **Plans**: 2 plans
 
 Plans:
-- [ ] 04-01-PLAN.md — Replace Q head with 3-layer MLP + STE clamp, verify gradient flow (QP-01)
-- [ ] 04-02-PLAN.md — Equalize Hungarian cost weights, class-balanced focal loss, metric-gated curriculum, per-type accuracy, test suite (FREQ-02, TYPE-01, TYPE-02, DATA-03, QP-02)
+- [x] 04-01-PLAN.md — Replace Q head with 3-layer MLP + STE clamp, verify gradient flow (QP-01)
+- [x] 04-02-PLAN.md — Equalize Hungarian cost weights, class-balanced focal loss, metric-gated curriculum, per-type accuracy, test suite (FREQ-02, TYPE-01, TYPE-02, DATA-03, QP-02)
 
 ### Phase 5: Inference Refinement & Confidence
 **Goal**: Inference-time optimization pushes accuracy beyond single-pass results, and each band prediction carries a calibrated confidence estimate
@@ -95,7 +95,11 @@ Plans:
 **Success Criteria** (what must be TRUE):
   1. Inference-time refinement improves gain MAE by at least 30% over single-pass prediction
   2. Each predicted band has a calibrated confidence estimate reflecting type certainty and parameter uncertainty
-**Plans**: TBD
+**Plans**: 2 plans
+
+Plans:
+- [x] 05-01-PLAN.md — Gradient refinement: refine_forward(), _spectral_consistency_loss(), refinement: config (INFR-01)
+- [x] 05-02-PLAN.md — MC-Dropout confidence: _run_mc_dropout_passes(), _compute_confidence(), forward(refine=True), evaluate_with_refinement.py (INFR-01, INFR-02)
 
 ## Progress
 
@@ -107,5 +111,5 @@ Phases execute in numeric order: 1 → 2 → 3 → 4 → 5
 | 1. Metrics & Data Foundation | 4/4 | Complete | 2026-04-06 |
 | 2. Gain Prediction Fix | 2/2 | Complete | 2026-04-06 |
 | 3. Loss Architecture Restructuring | 2/2 | Complete | 2026-04-06 |
-| 4. Q, Type & Frequency Refinement | 0/2 | Not started | - |
-| 5. Inference Refinement & Confidence | 0/? | Not started | - |
+| 4. Q, Type | 4. Q, Type & Frequency Refinement | 0/2 | Not started | - | Frequency Refinement | 2/2 | Complete | 2026-04-06 |
+| 5. Inference Refinement | 5. Inference Refinement & Confidence | 0/2 | Not started | - | Confidence | 2/2 | Complete | 2026-04-06 |

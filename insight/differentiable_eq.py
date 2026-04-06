@@ -347,7 +347,7 @@ class DifferentiableBiquadCascade(nn.Module):
         num_mag2 = num_re**2 + num_im**2
         den_mag2 = den_re**2 + den_im**2
 
-        H_mag = torch.sqrt(num_mag2 / (den_mag2 + 1e-6))
+        H_mag = torch.sqrt(torch.clamp(num_mag2 / (den_mag2 + 1e-6), min=1e-10))
 
         return H_mag
 
@@ -564,7 +564,7 @@ class MultiTypeEQParameterHead(nn.Module):
             nn.ReLU(),
             nn.Linear(hidden_dim, 1),
         )
-        self.gain_output_scale = nn.Parameter(torch.tensor(24.0))
+        self.gain_output_scale = nn.Parameter(torch.tensor(12.0))  # FIX-5: was 24.0; halves gradient amplification
 
         # Q head: 3-layer MLP with log-linear output + STE clamp (per D-01, D-02)
         # Replaces single Linear + sigmoid->exp (gradient saturation at extremes).
@@ -591,13 +591,18 @@ class MultiTypeEQParameterHead(nn.Module):
             else None
         )
         type_input_dim = hidden_dim + (32 if n_mels > 0 else 0)
+        # FIX-4: 4-layer MLP with LayerNorm. LayerNorm(128) works on (B, num_bands, 128)
+        # by normalizing over the last dim; BatchNorm1d would not handle 3D input correctly.
         self.classification_head = nn.Sequential(
             nn.Linear(type_input_dim, 128),
+            nn.LayerNorm(128),
             nn.ReLU(),
             nn.Dropout(0.2),
-            nn.Linear(128, 64),
+            nn.Linear(128, 128),
             nn.ReLU(),
             nn.Dropout(0.1),
+            nn.Linear(128, 64),
+            nn.ReLU(),
             nn.Linear(64, num_filter_types),
         )
 

@@ -833,6 +833,13 @@ class Trainer:
             print(f"  [resume] Dropped {len(result.unexpected_keys)} extra keys from checkpoint (architecture change): {[k.split('.')[-1] for k in result.unexpected_keys]}")
         if result.missing_keys:
             print(f"  [resume] {len(result.missing_keys)} keys initialized randomly (not in checkpoint): {[k.split('.')[-1] for k in result.missing_keys]}")
+        # FIX-5: Reset gain_output_scale regardless of checkpoint value.
+        # The saved scale was learned under a corrupt regime (type loss absent 17 epochs).
+        # STE clamps output to ±24 dB regardless, so resetting to 12.0 only reduces noise.
+        if hasattr(self.model, 'param_head') and hasattr(self.model.param_head, 'gain_output_scale'):
+            with torch.no_grad():
+                self.model.param_head.gain_output_scale.fill_(12.0)
+            print("  [resume] Reset gain_output_scale to 12.0 (fix for overfit scale)")
         try:
             self.optimizer.load_state_dict(state["optimizer_state_dict"])
         except Exception as e:

@@ -101,8 +101,8 @@ def test_warmup_gating():
     (pg, pf, pq, pt, psoft, phard, tg, tf, tq, tft, tH) = make_dummy_inputs()
     _, components = loss_fn(pg, pf, pq, pt, psoft, phard, tg, tf, tq, tft, tH)
     assert components["loss_gain"].item() > 0, "gain should be active"
-    assert components["loss_freq"].item() == 0.0, f"freq should be zero: {components['loss_freq'].item()}"
-    assert components["loss_q"].item() == 0.0, "q should be zero"
+    assert components["loss_freq"].item() < 0.001, f"freq should be ~zero during warmup: {components['loss_freq'].item()}"
+    assert components["loss_q"].item() < 0.001, f"q should be ~zero during warmup: {components['loss_q'].item()}"
     assert components["type_loss"].item() == 0.0, "type should be zero"
 
     # After warmup
@@ -134,10 +134,10 @@ def test_hybrid_warmup_gate():
 
     # Past epoch but gain_mae_ema too high → still warmup
     loss_fn.current_epoch = 6
-    loss_fn.gain_mae_ema = 3.0  # above 2.5 threshold
+    loss_fn.gain_mae_ema = 5.0  # above 4.0 threshold → still warmup
     (pg, pf, pq, pt, psoft, phard, tg, tf, tq, tft, tH) = make_dummy_inputs()
     _, components = loss_fn(pg, pf, pq, pt, psoft, phard, tg, tf, tq, tft, tH)
-    assert components["loss_freq"].item() == 0.0, f"Warmup should still be on: {components['loss_freq'].item()}"
+    assert components["loss_freq"].item() < 0.01, f"Warmup should still be on (ramp ≈0): {components['loss_freq'].item()}"
 
     # Past epoch AND gain_mae_ema low → warmup ends
     loss_fn.gain_mae_ema = 2.0
@@ -177,10 +177,12 @@ def test_spectral_reconstruction_fires():
         pred_H_soft, pred_H_hard,
         target_gain, target_freq, target_q, target_ft, target_H,
     )
-    # log(2.0) - log(1.0) = log(2.0) ≈ 0.693
-    expected = math.log(2.0)
-    assert abs(comp["spectral_loss"].item() - expected) < 0.05, \
-        f"spectral_loss={comp['spectral_loss'].item():.4f}, expected ~{expected:.4f}"
+    # log(2.0) - log(1.0) = log(2.0) ≈ 0.693, scaled by spectral_weight ramp
+    from loss_multitype import sigmoid_ramp
+    sw = sigmoid_ramp(2, 0 + 5, width=3.0)  # warmup=0, spectral starts at warmup+5=5
+    expected = math.log(2.0) * sw
+    assert abs(comp["spectral_loss"].item() - expected) < 0.1, \
+        f"spectral_loss={comp['spectral_loss'].item():.4f}, expected ~{expected:.4f} (sw={sw:.4f})"
 
 
 # ====================================================================

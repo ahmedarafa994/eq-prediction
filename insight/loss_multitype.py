@@ -413,7 +413,10 @@ class MultiTypeEQLoss(nn.Module):
         gain_converged = self.gain_mae_ema <= 4.0
         base = self.warmup_epochs if gain_converged else 15.0
         freq_q_weight = sigmoid_ramp(self.current_epoch, base, width=3.0)
-        type_weight = sigmoid_ramp(self.current_epoch, base + 2, width=3.0)
+        # FIX-1: type_weight pinned to warmup_epochs+2 regardless of gain convergence.
+        # gain_mae_ema > 4.0 was silencing type loss until epoch 17, preventing the type
+        # head from ever learning. freq_q_weight still depends on base (gain convergence).
+        type_weight = sigmoid_ramp(self.current_epoch, self.warmup_epochs + 2, width=3.0)
         spectral_weight = sigmoid_ramp(self.current_epoch, base + 5, width=3.0)
         # Legacy booleans for detach / zero-out logic
         is_warmup = freq_q_weight < 0.01

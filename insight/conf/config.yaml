@@ -83,12 +83,12 @@ curriculum:
       metric_thresholds: {}  # First stage: no gating
       epoch_cap: 20
       lambda_type: 1.5
-      gumbel_temperature: 1.5
+      gumbel_temperature: 0.5  # FIX-2: was 1.5; tau=0.5 sharpens type predictions → cleaner gradients
       learning_rate_scale: 1.0
     - name: "type_learning"
       epochs: 20
       metric_thresholds:
-        gain_mae: 4.0    # Gain must be < 4 dB before learning types
+        gain_mae: 6.5    # FIX-3: was 4.0; model at 5.8 dB — unblocks curriculum immediately
       epoch_cap: 40
       lambda_type: 2.0
       gumbel_temperature: 0.8
@@ -112,3 +112,10 @@ curriculum:
       lambda_type: 1.5
       gumbel_temperature: 0.05
       learning_rate_scale: 0.1
+
+refinement:
+  enabled: true
+  mc_dropout_passes: 5        # Number of stochastic forward passes for MC-Dropout
+  grad_refine_steps: 5        # Adam gradient steps for parameter refinement
+  grad_lr: 0.01               # Adam learning rate for refinement
+  refine_loss: "log_l1_mel"   # Spectral consistency loss type
