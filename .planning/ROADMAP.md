@@ -12,7 +12,7 @@ Systematic bug-fixing of a differentiable parametric EQ estimation pipeline that
 
 Decimal phases appear between their surrounding integers in numeric order.
 
-- [ ] **Phase 1: Metrics & Data Foundation** - Fix validation measurement and balance training data to establish trustworthy baseline
+- [x] **Phase 1: Metrics & Data Foundation** - Fix validation measurement and balance training data to establish trustworthy baseline
 - [ ] **Phase 2: Gain Prediction Fix** - Replace broken gain head with direct MLP + STE clamp, remove mel-residual path, verify streaming
 - [ ] **Phase 3: Loss Architecture Restructuring** - Phase loss activation, dual forward path, log-cosh for gain, independent loss weights
 - [ ] **Phase 4: Q, Type & Frequency Refinement** - Fix Q parameterization, metric-gated curriculum, push all parameters to target accuracy
@@ -33,9 +33,9 @@ Decimal phases appear between their surrounding integers in numeric order.
 **Plans**: 4 plans
 
 Plans:
-- [ ] 01-03-PLAN.md — Pre-fix baseline: run validation with current buggy code BEFORE changes (D-01)
+- [x] 01-03-PLAN.md — Pre-fix baseline: run validation with current buggy code BEFORE changes (D-01)
 - [x] 01-01-PLAN.md — Validation metrics instrumentation: test_metrics.py, component logging, gradient norm fix
-- [ ] 01-02-PLAN.md — Data distribution fix: uniform gain, HP/LP gain range, cache regeneration
+- [x] 01-02-PLAN.md — Data distribution fix: uniform gain, HP/LP gain range, cache regeneration
 - [x] 01-04-PLAN.md — Post-fix baseline: run validation after fixes, compute delta against pre-fix (D-09)
 
 ### Phase 2: Gain Prediction Fix
@@ -48,7 +48,11 @@ Plans:
   3. Mel-residual auxiliary gain path is fully removed from the model code
   4. Gain MAE on validation set drops below 3 dB with matched metrics (down from ~6 dB)
   5. All changes preserve streaming inference — streaming vs batch consistency within 0.1 dB gain difference
-**Plans**: TBD
+**Plans**: 2 plans
+
+Plans:
+- [ ] 02-01-PLAN.md — Remove Tanh from gain_mlp, remove gain_trunk_head dead code, clean gradient monitoring, update tests (GAIN-01, GAIN-02, GAIN-03, STRM-01, STRM-02)
+- [ ] 02-02-PLAN.md — Run baseline validation and post-change training to measure gain MAE improvement (GAIN-04)
 
 ### Phase 3: Loss Architecture Restructuring
 **Goal**: The loss function directs gradient signal to gain regression first, then progressively activates spectral and other losses, preventing loss component competition
@@ -92,8 +96,8 @@ Phases execute in numeric order: 1 → 2 → 3 → 4 → 5
 
 | Phase | Plans Complete | Status | Completed |
 |-------|----------------|--------|-----------|
-| 1. Metrics & Data Foundation | 0/3 | Planning complete | - |
-| 2. Gain Prediction Fix | 0/? | Not started | - |
+| 1. Metrics & Data Foundation | 4/4 | Complete | 2026-04-06 |
+| 2. Gain Prediction Fix | 0/2 | Not started | - |
 | 3. Loss Architecture Restructuring | 0/? | Not started | - |
 | 4. Q, Type & Frequency Refinement | 0/? | Not started | - |
 | 5. Inference Refinement & Confidence | 0/? | Not started | - |
