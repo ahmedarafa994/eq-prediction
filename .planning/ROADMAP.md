@@ -60,7 +60,7 @@ Plans:
 **Requirements**: LOSS-01, LOSS-02, LOSS-03, LOSS-04, LOSS-05, LOSS-06, DATA-02
 **Success Criteria** (what must be TRUE):
   1. Loss weights for gain, freq, and Q are independently tunable (not a single combined param loss)
-  2. Training begins with a gain-only warmup period before spectral losses activate
+  2. Training begins with a gain-only warmup period before enabling spectral losses
   3. Gain regression uses log-cosh loss instead of Huber
   4. Dual forward path exists — hard argmax types for param regression loss, soft Gumbel for spectral loss
   5. Audio-domain reconstruction loss provides additional training signal
@@ -82,7 +82,11 @@ Plans:
   4. Frequency MAE < 0.25 octaves on validation set
   5. Hungarian matching cost matrix balances gain and frequency weight equally
   6. Curriculum stage transitions are gated by metric thresholds (not epoch count alone)
-**Plans**: TBD
+**Plans**: 2 plans
+
+Plans:
+- [ ] 04-01-PLAN.md — Replace Q head with 3-layer MLP + STE clamp, verify gradient flow (QP-01)
+- [ ] 04-02-PLAN.md — Equalize Hungarian cost weights, class-balanced focal loss, metric-gated curriculum, per-type accuracy, test suite (FREQ-02, TYPE-01, TYPE-02, DATA-03, QP-02)
 
 ### Phase 5: Inference Refinement & Confidence
 **Goal**: Inference-time optimization pushes accuracy beyond single-pass results, and each band prediction carries a calibrated confidence estimate
@@ -103,5 +107,5 @@ Phases execute in numeric order: 1 → 2 → 3 → 4 → 5
 | 1. Metrics & Data Foundation | 4/4 | Complete | 2026-04-06 |
 | 2. Gain Prediction Fix | 2/2 | Complete | 2026-04-06 |
 | 3. Loss Architecture Restructuring | 2/2 | Complete | 2026-04-06 |
-| 4. Q, Type & Frequency Refinement | 0/? | Not started | - |
+| 4. Q, Type & Frequency Refinement | 0/2 | Not started | - |
 | 5. Inference Refinement & Confidence | 0/? | Not started | - |
