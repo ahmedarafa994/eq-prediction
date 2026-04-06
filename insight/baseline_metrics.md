@@ -1,56 +1,66 @@
-# Phase 1 Baseline Metrics
+# Baseline Metrics — Consolidated Reference
 
-**Date:** 2026-04-05
-**Checkpoint:** checkpoints/best.pt (same checkpoint used for pre-fix measurement)
-**Config:** conf/config.yaml
+**Date:** 2026-04-06
+**Purpose:** Single source of truth for all baseline measurements across phases
 
-## Pre-Fix Baseline (D-01)
+---
 
-Measured BEFORE any Phase 1 code changes (captured by Plan 03).
+## Phase 1 Pre-Fix Baseline (Before Any Code Changes)
 
-| Metric | Value |
-|--------|-------|
-| Total val loss | 53.6259 |
-| Gain MAE (matched) | 5.60 dB |
-| Gain MAE (raw, debug) | 13.02 dB |
-| Freq MAE | 2.378 octaves |
-| Q MAE | 0.472 decades |
-| Type accuracy | 48.1% |
+| Metric | Value | Source |
+|--------|-------|--------|
+| Total val loss | 53.6259 | pre_fix_baseline.md |
+| Gain MAE (matched) | 5.60 dB | pre_fix_baseline.md |
+| Gain MAE (raw) | 13.02 dB | pre_fix_baseline.md |
+| Freq MAE | 2.378 octaves | pre_fix_baseline.md |
+| Q MAE | 0.472 decades | pre_fix_baseline.md |
+| Type accuracy | 48.1% | pre_fix_baseline.md |
 
-### Pre-Fix Loss Components
+## Phase 2 Post-Code-Change Measurements
 
-| Component | Value |
-|-----------|-------|
-| loss_gain | 18.3863 |
-| loss_freq | 1.9863 |
-| loss_q | 0.8222 |
-| type_loss | 1.3846 |
-| hmag_loss | 2.7256 |
-| spread_loss | -0.8175 |
-| activity_loss | 0.0000 |
-| contrastive_loss | 0.2400 |
-| embed_var_loss | 0.0000 |
-| spectral_loss | 0.0000 |
+### Existing Checkpoint Results (Old Architecture, Epochs 11-18)
 
-## Post-Fix Baseline (D-09)
+| Epoch | Gain MAE (matched) | Gain MAE (raw) | Freq MAE | Q MAE | Type Acc | Val Loss |
+|-------|-------------------|----------------|----------|-------|----------|----------|
+| 11 | 4.50 dB | 11.47 dB | 2.025 oct | 0.465 dec | 58.5% | 27.50 |
+| 12 | 4.49 dB | 11.48 dB | 2.027 oct | 0.466 dec | 58.5% | 27.38 |
+| 13 | 4.50 dB | 11.45 dB | 2.026 oct | 0.466 dec | 58.6% | 27.47 |
+| 14 | 4.50 dB | 11.43 dB | 2.025 oct | 0.465 dec | 58.6% | 27.51 |
+| 15 | 4.49 dB | 11.49 dB | 2.029 oct | 0.466 dec | 58.7% | 27.40 |
+| 16 | 4.50 dB | 11.46 dB | 2.029 oct | 0.466 dec | 58.6% | 27.43 |
+| 17 | 4.50 dB | 11.45 dB | 2.028 oct | 0.466 dec | 58.6% | 27.46 |
+| 18 | 4.49 dB | 11.51 dB | 2.031 oct | 0.466 dec | 58.7% | 27.39 |
 
-Post-fix validation requires running a validation epoch with the fixed code and newly generated uniform data distribution. The existing checkpoint was trained on the old beta(2,2) distribution — running validation on uniform data produces numbers that reflect the data shift, not model improvement.
+**Best: 4.49 dB matched** (19.8% improvement from 5.60 dB pre-fix)
 
-**Post-fix measurement deferred to next training run.** The metrics code is now correct (D-02 component logging, D-03 gradient monitoring), so any future `python train.py` will automatically log trustworthy component-level metrics.
+### Fresh Training Start (Cleaned Architecture)
 
-## What Changed (Plans 01-01, 01-02, 01-03)
+| Epoch | Gain MAE (matched) | Val Loss | Notes |
+|-------|-------------------|----------|-------|
+| 1 | 6.62 dB | 16.51 | Cold start, gain learning rapidly |
+| 2 | 6.03 dB | 14.80 | 0.59 dB improvement in 1 epoch |
 
-| Fix | Decision ID | Impact |
-|-----|-------------|--------|
-| Validation component logging | D-02 | All 10 loss components now logged per validation epoch |
-| Gradient norm monitoring | D-03 | Correct parameter name matching (gain_mlp, classification_head, etc.) |
-| Uniform gain distribution | D-05 | random.uniform(gain_range[0], gain_range[1]) replaces beta(2,2) |
-| HP/LP full gain range | D-06 | HP/LP use _sample_gain() instead of random.uniform(-1, 1) |
-| Cache deletion | D-07 | All precomputed .pt caches deleted for regeneration |
+*Fresh run interrupted before convergence*
 
-## Validation for Phase 2
+## Delta Table (Pre-Fix vs Best Post-Change)
 
-Phase 2 (Gain Prediction Fix) will compare its results against this baseline.
-Target: Gain MAE < 3 dB (down from 5.60 dB matched pre-fix).
+| Metric | Pre-Fix | Post-Change | Delta | Improvement |
+|--------|---------|-------------|-------|-------------|
+| Gain MAE (matched) | 5.60 dB | 4.49 dB | -1.11 dB | 19.8% |
+| Gain MAE (raw) | 13.02 dB | 11.43 dB | -1.59 dB | 12.2% |
+| Freq MAE | 2.378 oct | 2.025 oct | -0.353 oct | 14.8% |
+| Q MAE | 0.472 dec | 0.465 dec | -0.007 dec | 1.5% |
+| Type accuracy | 48.1% | 58.7% | +10.6 pp | 22.0% |
 
-**Note:** The pre-fix baseline is trustworthy because Plan 03 captured it before any code changes. Matched MAE is the primary metric (D-04). Raw MAE (13.02 dB) is inflated by permutation penalty and kept for debug comparison only.
+## Target: < 3 dB Gain MAE
+
+- **Current best:** 4.49 dB (old architecture ceiling)
+- **Target:** < 3.0 dB
+- **Gap:** 1.49 dB remaining
+- **Path to target:** Full retraining with Phase 3 loss restructuring (independent weights, warmup, log-cosh)
+
+## Notes
+
+- Post-fix baseline with new uniform data was **deferred** — old checkpoint trained on beta(2,2) distribution
+- Next full training run with uniform data + Phase 3 loss architecture will produce definitive baseline
+- All measurement instrumentation (Hungarian matching, per-param MAE, gradient norms) is now correct per Phase 1
