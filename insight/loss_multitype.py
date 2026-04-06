@@ -428,6 +428,16 @@ class MultiTypeEQLoss(nn.Module):
                 loss_contrastive = torch.clamp(loss_contrastive, max=5.0)
         components["contrastive_loss"] = loss_contrastive
 
+        # DATA-02: Detach type logits from gain gradient path during warmup.
+        # During gain-only warmup, the type classification head should NOT
+        # receive gradient signal from gain regression. If type_logits are not
+        # detached, noisy type gradients (random at init) contaminate gain learning.
+        # After warmup, joint gradients are allowed — type and gain learn together.
+        if is_warmup:
+            pred_type_logits_for_match = pred_type_logits.detach()
+        else:
+            pred_type_logits_for_match = pred_type_logits
+
         # 1. Parameter regression (permutation-invariant) + type matching in one pass.
         # Call the inner matcher directly so we get the same permutation applied to
         # filter types — param_loss.forward() only returns scalars and discards the
@@ -441,7 +451,7 @@ class MultiTypeEQLoss(nn.Module):
                 target_freq,
                 target_q,
                 target_filter_type=target_filter_type,
-                pred_type_logits=pred_type_logits,
+                pred_type_logits=pred_type_logits_for_match,
             )
         )
         # LOSS-03: Log-cosh for gain (smoother gradients than Huber)
