@@ -229,7 +229,7 @@ class Trainer:
 
         # Hungarian matcher for fair validation metrics (matches target ordering to predictions)
         self.matcher = HungarianBandMatcher(
-            lambda_freq=1.0, lambda_q=0.5, lambda_type_match=0.5
+            lambda_gain=1.0, lambda_freq=1.0, lambda_q=1.0, lambda_type_match=0.5
         )
 
         # Optimizer: per-group learning rates to handle the ~17,000x gradient imbalance
@@ -297,6 +297,7 @@ class Trainer:
 
         if resume_path is not None:
             self._load_checkpoint(resume_path)
+        self.criterion.to(self.device)
 
         # bf16-mixed precision: autocast context (no GradScaler needed for bf16)
         self.use_bf16 = trainer_cfg.get("precision", "").lower() == "bf16-mixed"
@@ -309,6 +310,7 @@ class Trainer:
         # Curriculum stages from config
         self.curriculum_stages = self.cfg.get("curriculum", {}).get("stages", [])
         self._current_stage_idx = -1
+        self._last_metrics = {}  # D-06/D-07: Updated after each validate() call
 
         # Per-stage LR warmup state
         self._stage_warmup_active = False
@@ -741,6 +743,17 @@ class Trainer:
                 (output["filter_type"] == matched_ft).float().mean().item()
             )
 
+            # D-11: Per-type accuracy breakdown
+            from differentiable_eq import FILTER_NAMES
+            pred_ft = output["filter_type"]
+            for type_idx, type_name in enumerate(FILTER_NAMES):
+                mask = (matched_ft == type_idx)
+                if mask.sum() > 0:
+                    per_type_acc = (pred_ft[mask] == matched_ft[mask]).float().mean().item()
+                else:
+                    per_type_acc = 0.0
+                param_maes.setdefault(f"type_{type_name}", []).append(per_type_acc)
+
         avg_val_loss = val_loss / max(n_batches, 1)
         metrics = {k: sum(v) / len(v) for k, v in param_maes.items() if v}
 
@@ -762,6 +775,12 @@ class Trainer:
             f"q_mae={metrics.get('q', 0):.3f}dec "
             f"type_acc={metrics.get('type_acc', 0):.1%}"
         )
+        # D-11: Per-type accuracy reporting
+        per_type_parts = []
+        for tn in ["peaking", "lowshelf", "highshelf", "highpass", "lowpass"]:
+            v = metrics.get(f"type_{tn}", 0)
+            per_type_parts.append(f"{tn}={v:.1%}")
+        print(f"  [val] per-type: {' | '.join(per_type_parts)}")
         return avg_val_loss, metrics
 
     def save_checkpoint(self, epoch, val_loss, is_best=False):
@@ -808,6 +827,7 @@ class Trainer:
         # torch.compile wraps keys with "_orig_mod." — strip it for non-compiled load
         if any(k.startswith("_orig_mod.") for k in sd):
             sd = {k.replace("_orig_mod.", "", 1): v for k, v in sd.items()}
+        self.model.to(self.device)
         result = self.model.load_state_dict(sd, strict=False)
         if result.unexpected_keys:
             print(f"  [resume] Dropped {len(result.unexpected_keys)} extra keys from checkpoint (architecture change): {[k.split('.')[-1] for k in result.unexpected_keys]}")
@@ -948,6 +968,32 @@ class Trainer:
         if stage_idx == self._current_stage_idx:
             return
 
+        # D-06/D-07/D-08: Metric-gated curriculum transitions
+        thresholds = stage.get("metric_thresholds", {})
+        if thresholds and self._last_metrics:
+            all_met = True
+            for metric_name, threshold in thresholds.items():
+                current_val = self._last_metrics.get(metric_name)
+                if current_val is None:
+                    all_met = False
+                    break
+                if "mae" in metric_name:
+                    if current_val > threshold:
+                        all_met = False
+                        break
+                elif "acc" in metric_name:
+                    if current_val < threshold:
+                        all_met = False
+                        break
+            epoch_cap = stage.get("epoch_cap", stage_epochs * 2)
+            epochs_in_current = epoch - stage_start_epoch
+            if not all_met and epochs_in_current < epoch_cap:
+                print(
+                    f"  [curriculum] Stage transition to '{stage['name']}' blocked: "
+                    f"metrics not met (epoch {epochs_in_current}/{epoch_cap})"
+                )
+                return
+
         self._current_stage_idx = stage_idx
 
         # Per-stage LR warmup: restore LR to fraction of initial, short linear warmup
@@ -1024,6 +1070,7 @@ class Trainer:
                     break
 
             val_loss, metrics = self.validate(epoch)
+            self._last_metrics = metrics  # D-06/D-07: Store for metric-gated curriculum
             self.scheduler.step()
             elapsed = time.time() - t0
 

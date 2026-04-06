@@ -43,10 +43,10 @@ loss:
   lambda_freq: 1.5       # Increased from 1.0 (freq learning is critical)
   lambda_q: 1.5          # Increased from 1.0
   lambda_type: 1.5       # Reduced from 3.0 (was starving gain, type stuck at ~50%)
-  lambda_spectral: 0.1   # Spectral reconstruction active (H_mag_soft vs target_H_mag)
+  lambda_spectral: 0.05  # Reduced from 0.1 (spectral too strong relative to gain)
   lambda_hmag: 0.5       # Increased from 0.3 (drives freq/type via spectral shape)
-  lambda_activity: 0.05  # Reduced from 0.1 (not used, dead weight)
-  lambda_spread: 0.02    # Reduced from 0.05 (negative, pushes to extremes)
+  lambda_activity: 0.0    # Disabled (all bands always active, dead weight)
+  lambda_spread: 0.005    # Reduced from 0.02 (fights freq learning, gated in loss)
   lambda_freq_match: 1.0
   lambda_q_match: 0.5
   lambda_type_match: 2.0
@@ -71,8 +71,8 @@ trainer:
   use_activation_quantization: false
   use_deepspeed: false
   deepspeed_config: "conf/deepspeed_config.json"
-  precompute_cache_path: "data/dataset_musdb_200k.pt"
-  early_stopping_patience: 15
+  precompute_cache_path: "data/dataset_phase3_200k.pt"
+  early_stopping_patience: 30
   monitor_val_metric: "val_loss"
   mode: "min"
 
@@ -80,21 +80,35 @@ curriculum:
   stages:
     - name: "warmup"
       epochs: 10
+      metric_thresholds: {}  # First stage: no gating
+      epoch_cap: 20
       lambda_type: 1.5
-      gumbel_temperature: 1.5    # Reduced from 2.0 (was too uniform)
-      learning_rate_scale: 1.0   # No LR reset at stage entry
+      gumbel_temperature: 1.5
+      learning_rate_scale: 1.0
     - name: "type_learning"
       epochs: 20
+      metric_thresholds:
+        gain_mae: 4.0    # Gain must be < 4 dB before learning types
+      epoch_cap: 40
       lambda_type: 2.0
-      gumbel_temperature: 0.8    # Reduced from 1.0 (sharper types)
-      learning_rate_scale: 1.0   # No LR reset at stage entry
+      gumbel_temperature: 0.8
+      learning_rate_scale: 1.0
     - name: "consolidation"
       epochs: 30
+      metric_thresholds:
+        gain_mae: 3.0
+        type_acc: 0.7   # Type accuracy must be > 70%
+      epoch_cap: 60
       lambda_type: 2.0
-      gumbel_temperature: 0.3    # Reduced from 0.5
-      learning_rate_scale: 1.0   # No LR reset at stage entry
+      gumbel_temperature: 0.3
+      learning_rate_scale: 1.0
     - name: "finetune"
       epochs: 10
+      metric_thresholds:
+        gain_mae: 2.5
+        type_acc: 0.85
+        q_mae: 0.4     # Q must be < 0.4 decades
+      epoch_cap: 20
       lambda_type: 1.5
       gumbel_temperature: 0.05
-      learning_rate_scale: 0.1   # Intentional final LR reduction
+      learning_rate_scale: 0.1
