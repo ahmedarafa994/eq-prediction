@@ -47,8 +47,8 @@ class HungarianBandMatcher:
     def __init__(
         self,
         lambda_freq=1.0,
-        lambda_q=0.5,
-        lambda_gain=2.0,
+        lambda_q=1.0,       # D-04: equalized (was 0.5)
+        lambda_gain=1.0,     # D-04: equalized (was 2.0)
         lambda_type_match=0.5,
     ):
         self.lambda_freq = lambda_freq
@@ -203,10 +203,10 @@ class PermutationInvariantParamLoss(nn.Module):
     Uses Huber loss for robustness to outliers.
     """
 
-    def __init__(self, lambda_freq=1.0, lambda_q=0.5, lambda_type_match=0.5):
+    def __init__(self, lambda_freq=1.0, lambda_q=1.0, lambda_type_match=0.5):
         super().__init__()
         self.matcher = HungarianBandMatcher(
-            lambda_freq, lambda_q, lambda_type_match=lambda_type_match
+            lambda_freq, lambda_q, lambda_gain=1.0, lambda_type_match=lambda_type_match
         )
         self.huber = nn.HuberLoss(delta=5.0)
 
@@ -313,7 +313,15 @@ class MultiTypeEQLoss(nn.Module):
         self.param_loss = PermutationInvariantParamLoss(
             lambda_type_match=lambda_type_match
         )
-        self.type_loss = nn.CrossEntropyLoss(label_smoothing=0.05)
+        # Class-balanced focal loss for type classification (per D-09, D-10)
+        # Replaces nn.CrossEntropyLoss. Inverse-frequency weighting from type_weights
+        # handles 5:1 class imbalance (peaking 50% vs HP/LP 10%).
+        type_weights_cfg = [0.5, 0.15, 0.15, 0.1, 0.1]  # from config data.type_weights
+        inv_w = 1.0 / torch.tensor(type_weights_cfg, dtype=torch.float32)
+        inv_w = inv_w / inv_w.sum() * len(type_weights_cfg)
+        self.register_buffer('type_class_weights', inv_w)
+        self.focal_gamma = 2.0  # D-09: focal loss focusing parameter
+        self.type_label_smoothing = 0.05
         self.mr_stft = MultiResolutionSTFTLoss()
 
     def update_gain_mae(self, batch_gain_mae: float, alpha: float = 0.1) -> None:
@@ -488,12 +496,19 @@ class MultiTypeEQLoss(nn.Module):
 
         # 2. Filter type classification against Hungarian-matched targets.
         # D-04: During warmup, type loss is zero (gain-only training)
+        # Class-balanced focal loss (per D-09, D-10)
         if is_type_active:
             B, N, C = pred_type_logits.shape
-            loss_type = self.type_loss(
-                pred_type_logits.reshape(B * N, C),
-                matched_filter_type.reshape(B * N),
+            type_logits_flat = pred_type_logits.reshape(B * N, C)
+            type_targets_flat = matched_filter_type.reshape(B * N)
+            ce_loss = F.cross_entropy(
+                type_logits_flat, type_targets_flat,
+                weight=self.type_class_weights, reduction='none',
+                label_smoothing=self.type_label_smoothing,
             )
+            pt = torch.exp(-ce_loss)
+            focal_weight = (1.0 - pt) ** self.focal_gamma
+            loss_type = (focal_weight * ce_loss).mean()
         else:
             loss_type = torch.tensor(0.0, device=pred_gain.device)
         components["type_loss"] = loss_type
