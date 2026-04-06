@@ -235,8 +235,9 @@ class Trainer:
         # between the mel_cnn encoder (large grads) and gain_mlp head (tiny grads).
         base_lr = model_cfg["learning_rate"]
         wd = model_cfg["weight_decay"]
+        head_lr_mult = model_cfg.get("head_lr_multiplier", 3.0)
 
-        # Classify parameters: encoder backbone gets base_lr, param head gets 5x higher
+        # Classify parameters: encoder backbone gets base_lr, param head gets higher
         encoder_params = []
         head_params = []
         for name, param in self.model.named_parameters():
@@ -247,6 +248,8 @@ class Trainer:
             else:
                 encoder_params.append(param)
 
+        print(f"  [opt] LR groups: encoder={base_lr:.1e}, head={base_lr*head_lr_mult:.1e} ({head_lr_mult:.1f}x)")
+
         param_groups = [
             {
                 "params": encoder_params,
@@ -256,9 +259,9 @@ class Trainer:
             },
             {
                 "params": head_params,
-                "lr": base_lr * 3.0,
+                "lr": base_lr * head_lr_mult,
                 "weight_decay": wd,
-                "initial_lr": base_lr * 3.0,
+                "initial_lr": base_lr * head_lr_mult,
             },
         ]
 
@@ -501,8 +504,6 @@ class Trainer:
                                 # D-03: Fixed parameter name matching to actual model structure
                                 # Verified parameter name prefixes from StreamingTCNModel.named_parameters():
                                 #   param_head.gain_mlp.*         -> gain prediction MLP
-                                #   param_head.gain_trunk_head.*  -> gain from trunk embedding
-                                #   param_head.gain_mel_aux.*     -> mel-residual gain path
                                 #   param_head.q_head.*           -> Q prediction
                                 #   param_head.classification_head.* -> type classification
                                 #   param_head.freq_direct.*      -> frequency prediction
@@ -511,7 +512,7 @@ class Trainer:
                                 #   param_head.type_mel_proj.*    -> type mel projection
                                 #   param_head.mel_cnn.*          -> mel CNN features
                                 #   encoder.*                     -> TCN encoder
-                                if "gain_mlp" in name or "gain_trunk_head" in name or "gain_mel_aux" in name:
+                                if "gain_mlp" in name:
                                     grad_parts.append(("gain", param.grad.norm().item()))
                                 elif "q_head" in name:
                                     grad_parts.append(("q", param.grad.norm().item()))
@@ -599,6 +600,10 @@ class Trainer:
 
     @torch.no_grad()
     def validate(self, epoch):
+        # Set curriculum epoch on criterion for consistent validation losses
+        if hasattr(self.criterion, 'current_epoch'):
+            self.criterion.current_epoch = epoch
+
         self.model.eval()
         val_loss = 0.0
         n_batches = 0
@@ -781,7 +786,11 @@ class Trainer:
         # torch.compile wraps keys with "_orig_mod." — strip it for non-compiled load
         if any(k.startswith("_orig_mod.") for k in sd):
             sd = {k.replace("_orig_mod.", "", 1): v for k, v in sd.items()}
-        self.model.load_state_dict(sd)
+        result = self.model.load_state_dict(sd, strict=False)
+        if result.unexpected_keys:
+            print(f"  [resume] Dropped {len(result.unexpected_keys)} extra keys from checkpoint (architecture change): {[k.split('.')[-1] for k in result.unexpected_keys]}")
+        if result.missing_keys:
+            print(f"  [resume] {len(result.missing_keys)} keys initialized randomly (not in checkpoint): {[k.split('.')[-1] for k in result.missing_keys]}")
         try:
             self.optimizer.load_state_dict(state["optimizer_state_dict"])
         except Exception as e:
@@ -842,6 +851,7 @@ class Trainer:
                     head_params.append(param)
                 else:
                     encoder_params.append(param)
+            head_lr_mult = self.cfg["model"].get("head_lr_multiplier", 3.0)
             param_groups = [
                 {
                     "params": encoder_params,
@@ -851,9 +861,9 @@ class Trainer:
                 },
                 {
                     "params": head_params,
-                    "lr": base_lr * 3.0,
+                    "lr": base_lr * head_lr_mult,
                     "weight_decay": wd,
-                    "initial_lr": base_lr * 3.0,
+                    "initial_lr": base_lr * head_lr_mult,
                 },
             ]
             self.optimizer = torch.optim.AdamW(param_groups)
@@ -960,6 +970,21 @@ class Trainer:
 
         for epoch in range(self.start_epoch, self.max_epochs + 1):
             t0 = time.time()
+
+            # Set curriculum epoch on criterion for warmup gating
+            if hasattr(self.criterion, 'current_epoch'):
+                self.criterion.current_epoch = epoch
+                if hasattr(self.criterion, 'warmup_epochs'):
+                    warmup = self.criterion.warmup_epochs
+                    if epoch < warmup:
+                        print(f"  [curriculum] Epoch {epoch}: GAIN-ONLY WARMUP ({warmup - epoch} remaining)")
+                    elif epoch < warmup + 1:
+                        print(f"  [curriculum] Epoch {epoch}: Gain + Freq + Q active")
+                    elif epoch < warmup + 2:
+                        print(f"  [curriculum] Epoch {epoch}: + Type loss activated")
+                    else:
+                        print(f"  [curriculum] Epoch {epoch}: All losses active")
+
             self._apply_curriculum_stage(epoch)
             train_loss = self.train_one_epoch(epoch)
 
