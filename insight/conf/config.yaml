@@ -43,7 +43,7 @@ loss:
   lambda_freq: 1.5       # Increased from 1.0 (freq learning is critical)
   lambda_q: 1.5          # Increased from 1.0
   lambda_type: 1.5       # Reduced from 3.0 (was starving gain, type stuck at ~50%)
-  lambda_spectral: 0.0   # was 1.0 — never fires (no audio prediction), dead weight
+  lambda_spectral: 0.1   # Spectral reconstruction active (H_mag_soft vs target_H_mag)
   lambda_hmag: 0.5       # Increased from 0.3 (drives freq/type via spectral shape)
   lambda_activity: 0.05  # Reduced from 0.1 (not used, dead weight)
   lambda_spread: 0.02    # Reduced from 0.05 (negative, pushes to extremes)
@@ -54,7 +54,6 @@ loss:
   lambda_embed_var: 0.3
   lambda_contrastive: 0.1  # Increased from 0.05
   embed_var_threshold: 0.1
-  warmup_epochs: 5       # Gain-only warmup: epochs 0-4 gain only, 5+ freq/Q, 6+ type, 7+ spectral
   warmup_epochs: 5       # Gain-only warmup: epochs 0-4 gain only, 5+ freq/Q, 6+ type, 7+ spectral
 
 trainer:
