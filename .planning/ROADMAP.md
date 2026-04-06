@@ -51,8 +51,8 @@ Plans:
 **Plans**: 2 plans
 
 Plans:
-- [ ] 02-01-PLAN.md — Remove Tanh from gain_mlp, remove gain_trunk_head dead code, clean gradient monitoring, update tests (GAIN-01, GAIN-02, GAIN-03, STRM-01, STRM-02)
-- [ ] 02-02-PLAN.md — Run baseline validation and post-change training to measure gain MAE improvement (GAIN-04)
+- [x] 02-01-PLAN.md — Remove mel-residual gain path, clean gradient monitoring, update tests (GAIN-01, GAIN-02, GAIN-03, STRM-01, STRM-02)
+- [x] 02-02-PLAN.md — Run baseline validation and post-change training to measure gain MAE improvement (GAIN-04, deferred to Phase 3 training)
 
 ### Phase 3: Loss Architecture Restructuring
 **Goal**: The loss function directs gradient signal to gain regression first, then progressively activates spectral and other losses, preventing loss component competition
@@ -65,7 +65,11 @@ Plans:
   4. Dual forward path exists — hard argmax types for param regression loss, soft Gumbel for spectral loss
   5. Audio-domain reconstruction loss provides additional training signal
   6. Gumbel-Softmax type probs are detached from gain gradient path during warmup
-**Plans**: TBD
+**Plans**: 2 plans
+
+Plans:
+- [ ] 03-01-PLAN.md — Dual forward path wiring, Gumbel detach, warmup config, verify existing features (LOSS-01, LOSS-02, LOSS-03, LOSS-04, DATA-02)
+- [ ] 03-02-PLAN.md — Spectral reconstruction loss wiring, activity mask from dataset (LOSS-05, LOSS-06)
 
 ### Phase 4: Q, Type & Frequency Refinement
 **Goal**: All four parameter types (gain, freq, Q, type) reach target accuracy thresholds with metric-gated curriculum progression
@@ -97,7 +101,7 @@ Phases execute in numeric order: 1 → 2 → 3 → 4 → 5
 | Phase | Plans Complete | Status | Completed |
 |-------|----------------|--------|-----------|
 | 1. Metrics & Data Foundation | 4/4 | Complete | 2026-04-06 |
-| 2. Gain Prediction Fix | 0/2 | Not started | - |
-| 3. Loss Architecture Restructuring | 0/? | Not started | - |
+| 2. Gain Prediction Fix | 2/2 | Complete | 2026-04-06 |
+| 3. Loss Architecture Restructuring | 0/2 | Not started | - |
 | 4. Q, Type & Frequency Refinement | 0/? | Not started | - |
 | 5. Inference Refinement & Confidence | 0/? | Not started | - |
