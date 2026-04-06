@@ -20,35 +20,6 @@ import numpy as np
 from loss import MultiResolutionSTFTLoss
 
 
-def sigmoid_ramp(current_epoch, start_epoch, ramp_width=3.0):
-    """Smooth 0→1 ramp using a sigmoid, centered at start_epoch.
-
-    At `start_epoch - ramp_width`: output ≈ 0.12
-    At `start_epoch`:              output = 0.5
-    At `start_epoch + ramp_width`: output ≈ 0.88
-
-    Args:
-        current_epoch: current training epoch (int or float)
-        start_epoch: epoch at which ramp reaches 0.5
-        ramp_width: controls steepness (larger = more gradual)
-    Returns:
-        float in [0, 1]
-    """
-    x = (current_epoch - start_epoch) / max(ramp_width, 0.1)
-    # Numerically stable sigmoid: clamp input to prevent overflow
-    x = max(-20.0, min(20.0, x))
-    return 1.0 / (1.0 + math.exp(-x))
-
-
-def sigmoid_ramp(epoch: float, start: float, width: float = 3.0) -> float:
-    """Smooth 0→1 ramp centered at `start`, transitioning over ±`width` epochs."""
-    if width <= 0:
-        return 1.0 if epoch >= start else 0.0
-    x = (epoch - start) / width * 2.0
-    x = max(-20.0, min(20.0, x))
-    return 1.0 / (1.0 + math.exp(-x))
-
-
 def log_cosh_loss(pred, target):
     """
     Log-cosh loss: log(cosh(pred - target)).
@@ -76,8 +47,8 @@ class HungarianBandMatcher:
     def __init__(
         self,
         lambda_freq=1.0,
-        lambda_q=1.0,       # D-04: equalized (was 0.5)
-        lambda_gain=1.0,     # D-04: equalized (was 2.0)
+        lambda_q=0.5,
+        lambda_gain=2.0,
         lambda_type_match=0.5,
     ):
         self.lambda_freq = lambda_freq
@@ -114,17 +85,16 @@ class HungarianBandMatcher:
         pq = pred_q.unsqueeze(-1)
         tq = target_q.unsqueeze(-2)
 
-        # Gain cost: L1 in dB, normalized to [0,1] by max range (48 dB for [-24,24])
-        cost_gain = self.lambda_gain * (pg - tg).abs() / 48.0
+        # Gain cost: L1 in dB (weighted to balance against octave-scale freq cost)
+        cost_gain = self.lambda_gain * (pg - tg).abs()
 
-        # Frequency cost: L1 in log-space (octaves), normalized by max (~7 octaves)
+        # Frequency cost: L1 in log-space (octaves)
         cost_freq = (
             self.lambda_freq * (torch.log(pf + 1e-8) - torch.log(tf + 1e-8)).abs()
-            / 7.0
         )
 
-        # Q cost: L1 in log-space (decades), normalized by max range
-        cost_q = self.lambda_q * (torch.log(pq + 1e-8) - torch.log(tq + 1e-8)).abs() / 5.0
+        # Q cost: L1 in log-space (decades)
+        cost_q = self.lambda_q * (torch.log(pq + 1e-8) - torch.log(tq + 1e-8)).abs()
 
         cost = cost_gain + cost_freq + cost_q  # (B, N, N)
 
@@ -233,10 +203,10 @@ class PermutationInvariantParamLoss(nn.Module):
     Uses Huber loss for robustness to outliers.
     """
 
-    def __init__(self, lambda_freq=1.0, lambda_q=1.0, lambda_type_match=0.5):
+    def __init__(self, lambda_freq=1.0, lambda_q=0.5, lambda_type_match=0.5):
         super().__init__()
         self.matcher = HungarianBandMatcher(
-            lambda_freq, lambda_q, lambda_gain=1.0, lambda_type_match=lambda_type_match
+            lambda_freq, lambda_q, lambda_type_match=lambda_type_match
         )
         self.huber = nn.HuberLoss(delta=5.0)
 
@@ -343,14 +313,17 @@ class MultiTypeEQLoss(nn.Module):
         self.param_loss = PermutationInvariantParamLoss(
             lambda_type_match=lambda_type_match
         )
-        # Class-balanced focal loss for type classification (per D-09, D-10)
-        # Replaces nn.CrossEntropyLoss. Inverse-frequency weighting from type_weights
-        # handles 5:1 class imbalance (peaking 50% vs HP/LP 10%).
+        # Class-balanced focal loss for type classification
+        # Replaces CrossEntropyLoss to prevent class collapse on peaking filters
+        # Type distribution: peaking=50%, lowshelf=15%, highshelf=15%, highpass=10%, lowpass=10%
+        # Inverse frequency weights: peaking gets HIGHEST weight since it's the majority class
+        # that the model is collapsing on (predicting everything as non-peaking)
         type_weights_cfg = [0.5, 0.15, 0.15, 0.1, 0.1]  # from config data.type_weights
         inv_w = 1.0 / torch.tensor(type_weights_cfg, dtype=torch.float32)
-        inv_w = inv_w / inv_w.sum() * len(type_weights_cfg)
+        # Normalize so mean weight = 1.0 (prevents overall loss scale change)
+        inv_w = inv_w / inv_w.mean()
         self.register_buffer('type_class_weights', inv_w)
-        self.focal_gamma = 2.0  # D-09: focal loss focusing parameter
+        self.focal_gamma = 2.0  # focusing parameter — higher = more focus on hard samples
         self.type_label_smoothing = 0.05
         self.mr_stft = MultiResolutionSTFTLoss()
 
@@ -407,22 +380,21 @@ class MultiTypeEQLoss(nn.Module):
         """
         components = {}
 
-        # --- Curriculum warmup gating: smooth sigmoid ramp (replaces binary cliff) ---
-        # Each loss component ramps 0→1 over ~3 epochs at staggered start points.
-        # This avoids the epoch-15 gradient shock that caused the 14.3→25.3 loss spike.
-        gain_converged = self.gain_mae_ema <= 4.0
-        base = self.warmup_epochs if gain_converged else 15.0
-        freq_q_weight = sigmoid_ramp(self.current_epoch, base, width=3.0)
-        # FIX-1: type_weight pinned to warmup_epochs+2 regardless of gain convergence.
-        # gain_mae_ema > 4.0 was silencing type loss until epoch 17, preventing the type
-        # head from ever learning. freq_q_weight still depends on base (gain convergence).
-        type_weight = sigmoid_ramp(self.current_epoch, self.warmup_epochs + 2, width=3.0)
-        spectral_weight = sigmoid_ramp(self.current_epoch, base + 5, width=3.0)
-        # Legacy booleans for detach / zero-out logic
-        is_warmup = freq_q_weight < 0.01
-        is_freq_q_active = freq_q_weight > 0.01
-        is_type_active = type_weight > 0.01
-        is_spectral_active = spectral_weight > 0.01
+        # --- Curriculum warmup gating (D-02, D-03) ---
+        # D-03/D-04: Hybrid warmup gate.
+        # Warmup ENDS when BOTH conditions are true:
+        #   (a) current_epoch >= warmup_epochs (minimum epoch threshold)
+        #   (b) gain_mae_ema <= 2.5 dB (gain has converged sufficiently)
+        # Hard cap: if epoch >= 15, warmup ends regardless of gain_mae_ema
+        # (prevents infinite warmup if gain MAE never converges below 2.5 dB).
+        past_epoch_threshold = self.current_epoch >= self.warmup_epochs
+        gain_converged = self.gain_mae_ema <= 2.5
+        past_hard_cap = self.current_epoch >= 15
+        is_warmup = not ((past_epoch_threshold and gain_converged) or past_hard_cap)
+
+        is_freq_q_active = not is_warmup
+        is_type_active = not is_warmup and self.current_epoch >= self.warmup_epochs + 1
+        is_spectral_active = not is_warmup and self.current_epoch >= self.warmup_epochs + 2
 
         # --- Anti-collapse losses (computed first so they appear early in logs) ---
 
@@ -467,11 +439,11 @@ class MultiTypeEQLoss(nn.Module):
                 loss_contrastive = torch.clamp(loss_contrastive, max=5.0)
         components["contrastive_loss"] = loss_contrastive
 
-        # DATA-02: Detach type logits from gain gradient path during warmup.
+        # D-05 (DATA-02): Detach type_probs from gain gradient path during warmup.
         # During gain-only warmup, the type classification head should NOT
-        # receive gradient signal from gain regression. If type_logits are not
-        # detached, noisy type gradients (random at init) contaminate gain learning.
-        # After warmup, joint gradients are allowed — type and gain learn together.
+        # receive gradient signal from gain regression. If type_probs are not detached,
+        # noisy type gradients (random at epoch 0) contaminate the gain learning signal.
+        # After warmup, joint gradients are allowed -- type and gain learn together.
         if is_warmup:
             pred_type_logits_for_match = pred_type_logits.detach()
         else:
@@ -503,9 +475,10 @@ class MultiTypeEQLoss(nn.Module):
             torch.log(pred_q + 1e-8), torch.log(matched_q + 1e-8)
         )
 
-        # Smooth ramp gating: scale freq/Q losses by ramp weight
-        loss_freq = loss_freq * freq_q_weight
-        loss_q = loss_q * freq_q_weight
+        # Warmup gating: zero out non-gain losses during warmup
+        if not is_freq_q_active:
+            loss_freq = loss_freq * 0.0
+            loss_q = loss_q * 0.0
 
         components["loss_gain"] = loss_gain
         components["loss_freq"] = loss_freq
@@ -525,20 +498,35 @@ class MultiTypeEQLoss(nn.Module):
         components["param_loss"] = loss_param
 
         # 2. Filter type classification against Hungarian-matched targets.
-        # Smooth ramp: type loss scales 0→1 via type_weight (no cliff)
-        # Class-balanced focal loss (per D-09, D-10)
+        # D-04: During warmup, type loss is zero (gain-only training)
+        # Class-balanced focal loss to prevent peaking filter collapse
         if is_type_active:
             B, N, C = pred_type_logits.shape
-            type_logits_flat = pred_type_logits.reshape(B * N, C)
-            type_targets_flat = matched_filter_type.reshape(B * N)
-            ce_loss = F.cross_entropy(
-                type_logits_flat, type_targets_flat,
-                weight=self.type_class_weights, reduction='none',
-                label_smoothing=self.type_label_smoothing,
-            )
-            pt = torch.exp(-ce_loss)
-            focal_weight = (1.0 - pt) ** self.focal_gamma
-            loss_type = (focal_weight * ce_loss).mean() * type_weight
+            logits_flat = pred_type_logits.reshape(B * N, C)  # (B*N, 5)
+            targets_flat = matched_filter_type.reshape(B * N)  # (B*N,)
+
+            # Label smoothing
+            log_probs = F.log_softmax(logits_flat, dim=1)
+            probs = log_probs.exp()
+            n_classes = C
+            smoothed_targets = (1.0 - self.type_label_smoothing) * F.one_hot(
+                targets_flat, n_classes
+            ).float() + self.type_label_smoothing / n_classes
+
+            # Focal loss: FL(p_t) = -alpha_t * (1 - p_t)^gamma * log(p_t)
+            # p_t = probability of the target class
+            p_t = (probs * smoothed_targets).sum(dim=1)  # (B*N,)
+            focal_weight = (1.0 - p_t) ** self.focal_gamma  # (B*N,)
+
+            # Class-balanced weights: pick weight for each sample's target class
+            class_weights = self.type_class_weights[targets_flat]  # (B*N,)
+            focal_weight = focal_weight * class_weights
+
+            # Per-sample loss
+            per_sample_loss = focal_weight * (-log_probs * smoothed_targets).sum(dim=1)
+
+            # Normalize by sum of focal weights to prevent scale drift
+            loss_type = per_sample_loss.sum() / (focal_weight.sum() + 1e-8)
         else:
             loss_type = torch.tensor(0.0, device=pred_gain.device)
         components["type_loss"] = loss_type
@@ -553,11 +541,12 @@ class MultiTypeEQLoss(nn.Module):
 
         # 4. Spectral reconstruction loss (LOSS-05, D-06)
         # Uses H_mag_soft (Gumbel-Softmax path) for differentiable type gradients.
-        # Smooth ramp: spectral_weight ramps 0→1 over ~3 epochs (no cliff).
+        # Direct L1 on log-magnitude: log(pred_H_mag_soft) vs log(target_H_mag).
+        # Replaces MR-STFT which requires time-domain audio (unavailable from precomputed cache).
         if is_spectral_active:
             pred_spec_safe = torch.clamp(pred_H_mag_soft.float(), min=1e-6, max=1e6)
             target_spec_safe = torch.clamp(target_H_mag.float(), min=1e-6, max=1e6)
-            loss_spectral = F.l1_loss(torch.log(pred_spec_safe), torch.log(target_spec_safe)) * spectral_weight
+            loss_spectral = F.l1_loss(torch.log(pred_spec_safe), torch.log(target_spec_safe))
         else:
             loss_spectral = torch.tensor(0.0, device=pred_gain.device)
         components["spectral_loss"] = loss_spectral
@@ -571,18 +560,17 @@ class MultiTypeEQLoss(nn.Module):
         components["activity_loss"] = loss_activity
 
         # 6. Frequency spread regularization (bounded to prevent pushing frequencies to extremes)
-        # Gate: only activate repulsive force AFTER freq learning stabilises.
-        # Weight fades 1→0 as freq_q_weight ramps up, preventing gradient conflict
-        # when the model should predict nearby bands (e.g. 500 Hz & 700 Hz).
-        spread_gate = max(0.0, 1.0 - freq_q_weight)
-        if pred_freq.shape[1] > 1 and spread_gate > 0.01:
+        if pred_freq.shape[1] > 1:
             log_freq = torch.log(pred_freq + 1e-8)
             # Pairwise log-frequency differences
             diff = log_freq.unsqueeze(-1) - log_freq.unsqueeze(-2)  # (B, N, N)
             spread = diff.abs().mean()
+            # The maximum achievable mean pairwise spread is bounded by the
+            # log-frequency range (~6.9 octaves for 20-20000 Hz).  Clamp so
+            # the repulsive force saturates instead of growing without bound.
             max_spread = math.log(20000.0 / 20.0)  # ~6.9
             spread = torch.clamp(spread, max=max_spread)
-            loss_spread = -spread * spread_gate
+            loss_spread = -spread  # Maximize spread
         else:
             loss_spread = torch.tensor(0.0, device=pred_gain.device)
         components["spread_loss"] = loss_spread

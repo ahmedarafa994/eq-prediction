@@ -20,7 +20,7 @@ data:
   train_split: 0.8
   val_split: 0.1
   test_split: 0.1
-  batch_size: 1024
+  batch_size: 512
   num_workers: 8
 
 model:
@@ -66,7 +66,7 @@ trainer:
   gradient_accumulation_steps: 1
   # Optimization flags (QLoRA/Unsloth/DeepSpeed-inspired)
   use_8bit_optimizer: false
-  use_torch_compile: true
+  use_torch_compile: false
   use_gradient_checkpointing: false
   use_activation_quantization: false
   use_deepspeed: false
@@ -99,7 +99,7 @@ curriculum:
         gain_mae: 3.0
         type_acc: 0.7   # Type accuracy must be > 70%
       epoch_cap: 60
-      lambda_type: 2.0
+      lambda_type: 5.0           # Increased from 2.0 to combat peaking filter collapse
       gumbel_temperature: 0.3
       learning_rate_scale: 1.0
     - name: "finetune"
