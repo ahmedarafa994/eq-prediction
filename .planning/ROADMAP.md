@@ -34,7 +34,7 @@ Decimal phases appear between their surrounding integers in numeric order.
 
 Plans:
 - [ ] 01-03-PLAN.md — Pre-fix baseline: run validation with current buggy code BEFORE changes (D-01)
-- [ ] 01-01-PLAN.md — Validation metrics instrumentation: test_metrics.py, component logging, gradient norm fix
+- [x] 01-01-PLAN.md — Validation metrics instrumentation: test_metrics.py, component logging, gradient norm fix
 - [ ] 01-02-PLAN.md — Data distribution fix: uniform gain, HP/LP gain range, cache regeneration
 - [ ] 01-04-PLAN.md — Post-fix baseline: run validation after fixes, compute delta against pre-fix (D-09)
 
