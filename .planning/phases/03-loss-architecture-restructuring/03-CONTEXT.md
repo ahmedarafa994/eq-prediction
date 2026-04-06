@@ -18,9 +18,9 @@ Restructure the loss function so gradient signal flows to gain regression first,
 - **D-02:** model_tcn.py already has partial split (lines 637-643): `H_mag_hard` computed with argmax, `H_mag` soft during training. Verify loss_multitype.py uses `H_mag_hard` for hmag_loss component.
 
 ### Gain-only warmup
-- **D-03:** Epoch-based warmup: 5 epochs gain-only, then activate freq/Q, then type, then spectral. Keep current phased activation schedule in MultiTypeEQLoss.
-- **D-04:** Metric-gated transitions deferred to Phase 4 (DATA-03).
-- **D-05:** Gumbel-Softmax type probabilities detached from gain gradient path during warmup only. After warmup, allow joint gradients.
+- **D-03:** **Hybrid gate** — warmup uses BOTH epoch count AND gain MAE threshold: activate freq/Q/type only when `current_epoch >= warmup_epochs (5)` AND `gain_mae_ema <= 2.5 dB`. If gain MAE is still > 2.5 dB after 5 epochs, stay in warmup until threshold is met OR a hard cap of 15 epochs is reached.
+- **D-04:** Implementation: add `gain_mae_ema` (EMA of per-batch gain MAE, alpha=0.1) to MultiTypeEQLoss. Train.py calls `criterion.update_gain_mae(batch_gain_mae)` each step. Warmup condition: `not (epoch >= warmup_epochs and gain_mae_ema <= 2.5)`.
+- **D-05:** Gumbel-Softmax type probabilities detached from gain gradient path during warmup only. After warmup, re-couple IMMEDIATELY (no gradual ramp).
 
 ### Audio reconstruction loss
 - **D-06:** Spectral-domain MR-STFT: compare H_mag * wet_spectrum vs target_spectrum. No time-domain waveform reconstruction.

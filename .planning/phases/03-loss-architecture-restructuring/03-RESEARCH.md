@@ -270,22 +270,25 @@ Note: The actual MR-STFT loss in `loss.py` expects time-domain audio (Batch, Tim
 | A3 | Spectral MR-STFT loss expects time-domain audio, not frequency response | Pattern 3 | If wrong, wiring is simpler than expected |
 | A4 | warmup_epochs=5 default is correct for the current config.yaml curriculum stages (10 epoch warmup stage) | LOSS-02 | If wrong, warmup period may conflict with curriculum stages |
 
-## Open Questions
+## Open Questions (RESOLVED)
 
 1. **MR-STFT input format**
    - What we know: `MultiResolutionSTFTLoss.forward()` expects `(x, y)` time-domain audio (Batch, Time) based on `loss.py:19-20` which calls `torch.stft()` on the inputs.
    - What's unclear: CONTEXT.md says "spectral-domain MR-STFT: compare H_mag * wet_spectrum vs target_spectrum" -- but MR-STFT applies its own STFT to time-domain signals. Feeding it frequency responses directly would be incorrect.
    - Recommendation: Either (a) adapt MR-STFT to accept magnitude spectra directly, or (b) use a simpler spectral L1 loss for the reconstruction term, or (c) ensure wet audio is available for time-domain reconstruction. Claude's discretion to determine the best approach.
+   - **RESOLVED:** Using spectral L1 on log H_mag (no time-domain audio needed). MR-STFT call in forward() is replaced with `F.l1_loss(torch.log(pred_H_mag_soft), torch.log(target_H_mag))`. The `self.mr_stft` module stays in `__init__` but is no longer called in `forward()`.
 
 2. **Dataset active_band_mask availability**
    - What we know: The loss function accepts `active_band_mask` but train.py never extracts it from the batch.
    - What's unclear: Whether `SyntheticEQDataset` or `MUSDB18EQDataset` actually include `active_band_mask` in the batch dict.
    - Recommendation: Verify during implementation. If not present, add it to the dataset's `__getitem__`.
+   - **RESOLVED:** `active_band_mask` is not present in current `dataset.py`. Plan 02 Task 1 adds it to `__getitem__`, `precompute()`, `_generate_sample()`, and `collate_fn`. All synthetic samples use all-True mask (all 5 bands active).
 
 3. **Interaction between loss warmup and curriculum stages**
    - What we know: Config has curriculum stages starting at epoch 1 (10-epoch "warmup" stage). Loss warmup_epochs=5 is a separate mechanism.
    - What's unclear: Whether these two systems conflict (curriculum "warmup" stage lasts 10 epochs, loss warmup ends at epoch 5).
    - Recommendation: These are orthogonal -- curriculum controls Gumbel temperature and LR, loss warmup controls which loss components are active. No conflict, but planner should document the interaction clearly.
+   - **RESOLVED:** These are orthogonal systems. Curriculum stage config (Gumbel temperature, LR scale) is unchanged. The loss hybrid gate (epoch + gain_mae_ema) is a separate mechanism in `MultiTypeEQLoss`. The curriculum "warmup" stage name is coincidental -- it controls Gumbel temperature only, not loss component activation.
 
 ## Environment Availability
 
