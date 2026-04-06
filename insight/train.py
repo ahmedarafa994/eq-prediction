@@ -224,6 +224,7 @@ class Trainer:
             lambda_contrastive=loss_cfg.get("lambda_contrastive", 0.05),
             lambda_type_match=loss_cfg.get("lambda_type_match", 0.5),
             embed_var_threshold=loss_cfg.get("embed_var_threshold", 0.1),
+            warmup_epochs=loss_cfg.get("warmup_epochs", 5),
         )
 
         # Hungarian matcher for fair validation metrics (matches target ordering to predictions)
@@ -405,6 +406,9 @@ class Trainer:
             target_freq = batch["freq"].to(self.device, non_blocking=True)
             target_q = batch["q"].to(self.device, non_blocking=True)
             target_ft = batch["filter_type"].to(self.device, non_blocking=True)
+            active_band_mask = batch.get("active_band_mask", None)
+            if active_band_mask is not None:
+                active_band_mask = active_band_mask.to(self.device, non_blocking=True)
 
             # Forward (wrapped in autocast for bf16-mixed precision)
             with self.autocast_ctx:
@@ -420,33 +424,35 @@ class Trainer:
                     filter_type=target_ft,
                 )
 
-                # Use soft-typed H_mag with gain detached for spectral loss.
-                # Hard-typed dsp_cascade uses nested torch.where which produces
-                # NaN gradients — non-selected branches still propagate NaN through
-                # the backward pass (0 * NaN = NaN in gradient accumulation).
-                # forward_soft blends coefficients via type_probs, giving clean
-                # gradients. Gain is detached so hmag_loss only trains
-                # freq/Q/type — gain learns purely from the Huber regression term.
-                pred_H_mag_for_loss = self.model.dsp_cascade.forward_soft(
-                    pred_gain.detach(),
-                    pred_freq,
-                    pred_q,
-                    output["type_probs"],
-                    self.n_fft,
-                )
+                # LOSS-04: Dual H_mag path — model outputs both soft (Gumbel) and hard (argmax)
+                pred_H_mag_soft = output["H_mag"]       # soft path for spectral_loss gradient
+                pred_H_mag_hard = output["H_mag_hard"]  # hard path for hmag_loss (detached inside loss)
 
-                # Loss (pass embedding for anti-collapse regularization)
+                # LOSS-05: Spectral reconstruction — pass H_mag_soft when spectral is active
+                is_spectral_active = (
+                    hasattr(self.criterion, 'current_epoch') and
+                    hasattr(self.criterion, 'warmup_epochs') and
+                    self.criterion.current_epoch >= self.criterion.warmup_epochs + 2
+                )
+                pred_audio_for_loss = pred_H_mag_soft if is_spectral_active else None
+                target_audio_for_loss = target_H_mag if is_spectral_active else None
+
+                # Loss (dual H_mag path, active_band_mask, spectral reconstruction)
                 total_loss, components = self.criterion(
                     pred_gain,
                     pred_freq,
                     pred_q,
                     output["type_logits"],
-                    pred_H_mag_for_loss,
+                    pred_H_mag_soft,
+                    pred_H_mag_hard,
                     target_gain,
                     target_freq,
                     target_q,
                     target_ft,
                     target_H_mag,
+                    pred_audio=pred_audio_for_loss,
+                    target_audio=target_audio_for_loss,
+                    active_band_mask=active_band_mask,
                     embedding=output["embedding"],
                 )
 
@@ -537,6 +543,14 @@ class Trainer:
                             print(f"  [grads] step={self.global_step} {grad_str}")
 
                     self.optimizer.step()
+
+                    # D-04: Update gain MAE EMA for hybrid warmup gate in loss function.
+                    # Use raw gain MAE (not log_cosh) so the threshold (2.5 dB) has physical meaning.
+                    if hasattr(self.criterion, 'update_gain_mae'):
+                        with torch.no_grad():
+                            batch_gain_mae = (pred_gain - target_gain).abs().mean().item()
+                        self.criterion.update_gain_mae(batch_gain_mae)
+
                     # Sanitize optimizer state: reset any Adam momentum/variance
                     # buffers that contain NaN (prevents permanent training death)
                     for state in self.optimizer.state.values():
@@ -616,6 +630,9 @@ class Trainer:
             target_freq = batch["freq"].to(self.device, non_blocking=True)
             target_q = batch["q"].to(self.device, non_blocking=True)
             target_ft = batch["filter_type"].to(self.device, non_blocking=True)
+            active_band_mask = batch.get("active_band_mask", None)
+            if active_band_mask is not None:
+                active_band_mask = active_band_mask.to(self.device, non_blocking=True)
 
             with self.autocast_ctx:
                 output = self.model(mel_frames)
@@ -644,29 +661,34 @@ class Trainer:
                     filter_type=target_ft,
                 )
 
-                # Use forward_soft with gain detached for val hmag_loss,
-                # matching the training computation. Hard-typed H_mag diverges
-                # wildly when type accuracy is low (~54%), creating an artificial
-                # train/val gap (24 vs 65 in the failed run).
-                pred_H_mag_for_val = self.model.dsp_cascade.forward_soft(
-                    pred_gain.detach(),
-                    pred_freq,
-                    pred_q,
-                    output["type_probs"],
-                    self.n_fft,
+                # Dual H_mag path for validation (matching training)
+                pred_H_mag_soft = output["H_mag"]
+                pred_H_mag_hard = output["H_mag_hard"]
+
+                # Spectral reconstruction for validation (matching training)
+                is_spectral_active = (
+                    hasattr(self.criterion, 'current_epoch') and
+                    hasattr(self.criterion, 'warmup_epochs') and
+                    self.criterion.current_epoch >= self.criterion.warmup_epochs + 2
                 )
+                pred_audio_for_loss = pred_H_mag_soft if is_spectral_active else None
+                target_audio_for_loss = target_H_mag if is_spectral_active else None
 
                 total_loss, components = self.criterion(
                     pred_gain,
                     pred_freq,
                     pred_q,
                     output["type_logits"],
-                    pred_H_mag_for_val,
+                    pred_H_mag_soft,
+                    pred_H_mag_hard,
                     target_gain,
                     target_freq,
                     target_q,
                     target_ft,
                     target_H_mag,
+                    pred_audio=pred_audio_for_loss,
+                    target_audio=target_audio_for_loss,
+                    active_band_mask=active_band_mask,
                     embedding=output["embedding"],
                 )
 
