@@ -1,37 +1,36 @@
 """Phase 4 test suite: Q MLP, focal loss, metric-gated curriculum, per-type accuracy."""
 import sys, os, math
 sys.path.insert(0, os.path.dirname(__file__))
-
 import torch
 import yaml
 
 def test_q_mlp_structure():
     from differentiable_eq import MultiTypeEQParameterHead
-    head = MultiTypeEQParameterHead(hidden_dim=64, num_bands=5, n_mels=128)
+    head = MultiTypeEQParameterHead(embedding_dim=64, num_bands=5)
     assert hasattr(head, 'q_mlp'), 'q_mlp not found'
     assert not hasattr(head, 'q_head'), 'Old q_head still exists'
-    assert len(head.q_mlp) == 5, f'q_mlp has {len(head.q_mlp)} layers, expected 5'
-    assert isinstance(head.q_mlp[4], torch.nn.Linear)
+    assert len(head.q_mlp) == 5
     assert head.q_mlp[4].out_features == 1
     return True
 
 def test_q_output_bounds():
     from differentiable_eq import MultiTypeEQParameterHead
-    head = MultiTypeEQParameterHead(hidden_dim=64, num_bands=5, n_mels=128)
-    trunk = torch.randn(4, 5, 64)
+    head = MultiTypeEQParameterHead(embedding_dim=64, num_bands=5)
+    embedding = torch.randn(4, 64)
     mel = torch.randn(4, 128)
-    _, _, q, _, _, _ = head(trunk, mel)
-    assert (q >= 0.1).all() and (q <= 10.0).all(), f'Q out of bounds: min={q.min()}, max={q.max()}'
+    out = head(embedding, mel)
+    q = out[2]  # (gain_db, freq, q, type_logits, type_probs, filter_type)
+    assert (q >= 0.1).all() and (q <= 10.0).all(), f'Q OOB: {q.min():.3f}-{q.max():.3f}'
     assert not torch.isnan(q).any()
     return True
 
 def test_q_gradient_flow():
     from differentiable_eq import MultiTypeEQParameterHead
-    head = MultiTypeEQParameterHead(hidden_dim=64, num_bands=5, n_mels=128)
-    trunk = torch.randn(4, 5, 64)
+    head = MultiTypeEQParameterHead(embedding_dim=64, num_bands=5)
+    embedding = torch.randn(4, 64)
     mel = torch.randn(4, 128)
-    _, _, q, _, _, _ = head(trunk, mel)
-    q.sum().backward()
+    out = head(embedding, mel)
+    out[2].sum().backward()
     assert head.q_mlp[0].weight.grad is not None and head.q_mlp[0].weight.grad.abs().sum() > 0
     assert head.q_mlp[4].weight.grad is not None and head.q_mlp[4].weight.grad.abs().sum() > 0
     return True
@@ -53,7 +52,7 @@ def test_focal_loss_wired():
     fn = MultiTypeEQLoss()
     assert fn.focal_gamma == 2.0
     assert hasattr(fn, 'type_class_weights') and fn.type_class_weights.shape == (5,)
-    assert fn.type_class_weights[3] > fn.type_class_weights[0]  # HP > peaking
+    assert fn.type_class_weights[3] > fn.type_class_weights[0]
     assert not hasattr(fn, 'type_loss')
     return True
 
@@ -61,10 +60,11 @@ def test_metric_gated_curriculum():
     with open(os.path.join(os.path.dirname(__file__), 'conf/config.yaml')) as f:
         cfg = yaml.safe_load(f)
     stages = cfg['curriculum']['stages']
-    for s in stages:
-        assert 'metric_thresholds' in s, f"Stage {s['name']} missing metric_thresholds"
-    s3 = stages[3]  # finetune
-    assert 'type_acc' in s3['metric_thresholds']
+    for i, s in enumerate(stages):
+        assert 'metric_thresholds' in s, f"Stage {i} ({s['name']}) missing metric_thresholds"
+        assert 'epoch_cap' in s, f"Stage {i} ({s['name']}) missing epoch_cap"
+    assert 'gain_mae' in stages[2]['metric_thresholds']
+    assert 'type_acc' in stages[2]['metric_thresholds']
     return True
 
 def test_per_type_accuracy():
@@ -72,10 +72,12 @@ def test_per_type_accuracy():
     assert len(FILTER_NAMES) == 5
     matched = torch.tensor([0, 0, 1, 2, 3, 4, 0])
     pred = torch.tensor([0, 1, 1, 2, 3, 3, 0])
+    accs = {}
     for i, name in enumerate(FILTER_NAMES):
         mask = (matched == i)
-        if mask.sum() > 0:
-            acc = (pred[mask] == matched[mask]).float().mean().item()
+        accs[name] = (pred[mask] == matched[mask]).float().mean().item() if mask.sum() > 0 else 0.0
+    assert abs(accs['peaking'] - 2/3) < 0.01
+    assert abs(accs['highpass'] - 1.0) < 0.01
     return True
 
 if __name__ == "__main__":
