@@ -24,6 +24,16 @@ The model must accurately estimate EQ parameters from wet audio alone. If gain M
 - ✓ Spectral model alternative (0.20 dB MAE for H_db prediction) — existing
 - ✓ ONNX export — existing
 
+### Validated in Phase 3
+
+- ✓ LOSS-01: Independent loss weights (lambda_param=0.0, independent lambda_gain/freq/q)
+- ✓ LOSS-02: Gain-only warmup with hybrid gate (epoch count + gain_mae_ema threshold, 15-epoch hard cap)
+- ✓ LOSS-03: Log-cosh loss for gain regression (numerically stable formulation)
+- ✓ LOSS-04: Dual forward path (hard argmax for hmag_loss.detach(), soft Gumbel for spectral_loss)
+- ✓ LOSS-05: Spectral L1 reconstruction (H_mag_soft vs target_H_mag, lambda_spectral=0.1)
+- ✓ LOSS-06: Active band mask from dataset through train.py to loss
+- ✓ DATA-02: Gumbel-Softmax detach during warmup (pred_type_logits.detach())
+
 ### Active
 
 <!-- Current scope. Building toward these. -->
@@ -103,4 +113,4 @@ This document evolves at phase transitions and milestone boundaries.
 4. Update Context with current state
 
 ---
-*Last updated: 2026-04-05 after initialization*
+*Last updated: 2026-04-06 after phase 3 completion*
