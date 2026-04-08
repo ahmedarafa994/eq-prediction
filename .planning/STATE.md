@@ -5,7 +5,7 @@ milestone_name: milestone
 status: complete
 stopped_at: v1.0 milestone shipped
 last_updated: "2026-04-06T10:37:00.000Z"
-last_activity: 2026-04-08 - Completed quick task 260408-3fg: apply lowshelf class weight increase and gain sign penalty to fix EQ estimator accuracy
+last_activity: 2026-04-08 - Completed quick task 260408-p8c: add shelf-detection features (lo_ratio, hi_ratio, tilt_slope) to MultiTypeEQParameterHead type classifier
 progress:
   total_phases: 5
   completed_phases: 5
@@ -28,7 +28,7 @@ See: .planning/PROJECT.md (updated 2026-04-06)
 Phase: ALL COMPLETE (v1.0 shipped)
 Plan: N/A
 Status: Milestone v1.0 archived. Next: `/gsd-new-milestone` to start v1.1
-Last activity: 2026-04-06
+Last activity: 2026-04-08 - Completed quick task 260408-p8c: add shelf-detection features to MultiTypeEQParameterHead
 
 Progress: [██████████] 100%
 
@@ -91,10 +91,11 @@ Recent decisions affecting current work:
 | # | Description | Date | Commit | Directory |
 |---|-------------|------|--------|-----------|
 | 260408-3fg | apply lowshelf class weight increase and gain sign penalty to fix EQ estimator accuracy | 2026-04-08 | a647de2 | [260408-3fg-apply-lowshelf-class-weight-increase-and](.planning/quick/260408-3fg-apply-lowshelf-class-weight-increase-and/) |
+| 260408-p8c | add low-frequency energy ratio shelf-detection features to MultiTypeEQParameterHead | 2026-04-08 | 5f707f8 | [260408-p8c-add-low-frequency-energy-ratio-shelf-det](.planning/quick/260408-p8c-add-low-frequency-energy-ratio-shelf-det/) |
 
 ## Session Continuity
 
-Last session: 2026-04-06T12:00:00.000Z
+Last session: 2026-04-08T18:15:47Z
 Stopped at: All phases executed
 Resume file: None needed — all implementation work complete
 
