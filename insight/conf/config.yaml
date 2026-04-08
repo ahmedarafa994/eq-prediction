@@ -42,6 +42,7 @@ model:
     mel_noise_std: 0.05       # Gaussian noise on mel input for regularization
   num_bands: 5
   type_conditioned_frequency: true
+  n_shelf_bands: 16        # mel bands used for lo/hi energy ratio shelf detection (out of 128)
   learning_rate: 0.0001
   weight_decay: 0.05          # was 0.02 — stronger regularization for overfitting
   head_lr_multiplier: 1.5
@@ -59,11 +60,11 @@ loss:
   label_smoothing: 0.02
   focal_gamma: 2.0
   lambda_type_match: 1.0
-  lambda_type_prior: 2.0   # was 0.0 — KL penalty prevents distribution collapse
+  lambda_type_prior: 15.0  # strong KL prior to prevent any type collapse
   # Per-class focal loss multipliers (applied after inverse-frequency normalization).
   # Index order: [peaking, lowshelf, highshelf, highpass, lowpass]
-  # Lowshelf gets 5x extra weight because it collapses to 5.5% accuracy (epoch 20).
-  class_weight_multipliers: [1.0, 5.0, 1.0, 1.0, 1.0]
+  # Equal multipliers — rely on KL prior + inverse-frequency focal weights for balance
+  class_weight_multipliers: [1.0, 1.0, 1.0, 1.0, 1.0]
   # Penalty for predicting gain with wrong sign vs ground truth.
   # 0.5 = half the log-cosh gain term contribution for each sign-flipped band.
   sign_penalty_weight: 0.5
