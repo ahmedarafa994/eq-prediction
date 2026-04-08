@@ -21,6 +21,7 @@ import torch.nn.functional as F
 from torch.utils.data import DataLoader, random_split
 from model_tcn import StreamingTCNModel
 from dsp_frontend import STFTFrontend
+from differentiable_eq import FILTER_HIGHSHELF, FILTER_LOWSHELF
 from loss_v2 import SimplifiedEQLoss
 from loss_multitype import HungarianBandMatcher
 from metrics import compute_eq_metrics
@@ -234,6 +235,7 @@ class Trainer:
             ),
             dropout=enc_cfg.get("dropout", 0.1),
             mel_noise_std=enc_cfg.get("mel_noise_std", 0.0),
+            n_shelf_bands=model_cfg.get("n_shelf_bands", 16),
         ).to(self.device)
 
         # STFT frontend
@@ -264,6 +266,7 @@ class Trainer:
             embed_var_threshold=loss_cfg.get("embed_var_threshold", 0.1),
             class_weight_multipliers=self.cfg.get("loss", {}).get("class_weight_multipliers", None),
             sign_penalty_weight=self.cfg.get("loss", {}).get("sign_penalty_weight", 0.0),
+            lambda_hdb=self.cfg.get("loss", {}).get("lambda_hdb", 2.0),
         )
         self.metric_lambda_type_match = loss_cfg.get("lambda_type_match", 0.0)
 
@@ -428,6 +431,10 @@ class Trainer:
                     filter_type=target_ft,
                 )
 
+                # H_db target for direct prediction loss (hybrid spectral-parametric)
+                h_db_target = 20.0 * torch.log10(target_H_mag.clamp(min=1e-6))
+                h_db_pred = output.get("h_db_pred")
+
                 # Use soft H_mag (differentiable w.r.t. type_logits) for spectral loss
                 total_loss, components = self.criterion(
                     pred_gain,
@@ -441,6 +448,8 @@ class Trainer:
                     target_ft,
                     target_H_mag,
                     embedding=output["embedding"],
+                    h_db_pred=h_db_pred,
+                    h_db_target=h_db_target,
                 )
 
             # Skip batch if loss is NaN (from early training instability)
@@ -587,6 +596,14 @@ class Trainer:
             "type_logits": [],
         }
         val_component_accum = {}
+        shelf_diag = {
+            "pred_lowshelf_count": 0,
+            "pred_highshelf_count": 0,
+            "low_shelf_bias_sum": 0.0,
+            "low_shelf_bias_count": 0,
+            "high_shelf_bias_sum": 0.0,
+            "high_shelf_bias_count": 0,
+        }
 
         for batch in self.val_loader:
             mel_frames = self._prepare_input(batch)
@@ -676,6 +693,38 @@ class Trainer:
                 val = v.item() if isinstance(v, torch.Tensor) else float(v)
                 val_component_accum[k] = val_component_accum.get(k, 0.0) + val
 
+            matched_filter_type = self.matcher(
+                pred_gain,
+                pred_freq,
+                pred_q,
+                target_gain,
+                target_freq,
+                target_q,
+                target_filter_type=target_ft,
+                pred_type_logits=output_hard["type_logits"],
+            )[3]
+            pred_filter_type = output_hard["filter_type"]
+            shelf_diag["pred_lowshelf_count"] += int(
+                (pred_filter_type == FILTER_LOWSHELF).sum().item()
+            )
+            shelf_diag["pred_highshelf_count"] += int(
+                (pred_filter_type == FILTER_HIGHSHELF).sum().item()
+            )
+            shelf_bias = output_hard.get("shelf_bias")
+            if shelf_bias is not None:
+                low_mask = matched_filter_type == FILTER_LOWSHELF
+                high_mask = matched_filter_type == FILTER_HIGHSHELF
+                if low_mask.any():
+                    shelf_diag["low_shelf_bias_sum"] += (
+                        shelf_bias[..., 0][low_mask].float().sum().item()
+                    )
+                    shelf_diag["low_shelf_bias_count"] += int(low_mask.sum().item())
+                if high_mask.any():
+                    shelf_diag["high_shelf_bias_sum"] += (
+                        shelf_bias[..., 1][high_mask].float().sum().item()
+                    )
+                    shelf_diag["high_shelf_bias_count"] += int(high_mask.sum().item())
+
             metric_tensors["gain_pred"].append(pred_gain.detach().float().cpu())
             metric_tensors["gain_gt"].append(target_gain.detach().float().cpu())
             metric_tensors["freq_pred"].append(pred_freq.detach().float().cpu())
@@ -708,6 +757,18 @@ class Trainer:
         metrics["val_loss_soft"] = avg_val_loss_soft
         metrics["val_loss_hard"] = avg_val_loss_hard
         metrics["val_loss"] = avg_val_loss_soft
+        metrics["pred_lowshelf_count"] = shelf_diag["pred_lowshelf_count"]
+        metrics["pred_highshelf_count"] = shelf_diag["pred_highshelf_count"]
+        metrics["mean_low_shelf_bias_on_lowshelf"] = (
+            shelf_diag["low_shelf_bias_sum"] / shelf_diag["low_shelf_bias_count"]
+            if shelf_diag["low_shelf_bias_count"] > 0
+            else 0.0
+        )
+        metrics["mean_high_shelf_bias_on_highshelf"] = (
+            shelf_diag["high_shelf_bias_sum"] / shelf_diag["high_shelf_bias_count"]
+            if shelf_diag["high_shelf_bias_count"] > 0
+            else 0.0
+        )
 
         # D-02: Log averaged validation loss components
         if n_batches > 0 and val_component_accum:
@@ -734,6 +795,12 @@ class Trainer:
             v = metrics.get(f"type_accuracy_{tn}_matched", 0)
             per_type_parts.append(f"{tn}={v:.1%}")
         print(f"  [val] per-type: {' | '.join(per_type_parts)}")
+        print(
+            f"  [val] shelf: pred_lowshelf={metrics['pred_lowshelf_count']} "
+            f"pred_highshelf={metrics['pred_highshelf_count']} "
+            f"low_bias_on_lowshelf={metrics['mean_low_shelf_bias_on_lowshelf']:.3f} "
+            f"high_bias_on_highshelf={metrics['mean_high_shelf_bias_on_highshelf']:.3f}"
+        )
         return avg_val_loss_soft, metrics
 
     def save_checkpoint(self, epoch, val_loss, is_best=False, metrics=None):
@@ -913,6 +980,13 @@ class Trainer:
 
             val_loss, metrics = self.validate(epoch)
             self.scheduler.step()
+
+            # Curriculum schedule for H_db gain mix: ramp 0.1 → 0.9 over training
+            model_ref = self.model.module if hasattr(self.model, "module") else self.model
+            mix_schedule = min(0.9, 0.1 + 0.8 * (epoch - 1) / max(self.max_epochs - 1, 1))
+            model_ref.param_head.gain_mix_value.fill_(mix_schedule)
+            if epoch <= 3 or epoch % 5 == 0:
+                print(f"  [schedule] gain_mix={mix_schedule:.3f} (H_db weight)")
             elapsed = time.time() - t0
 
             # Track consecutive NaN val epochs (death spiral detection)

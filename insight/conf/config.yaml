@@ -43,6 +43,10 @@ model:
   num_bands: 5
   type_conditioned_frequency: true
   n_shelf_bands: 16        # mel bands used for lo/hi energy ratio shelf detection (out of 128)
+  # Per-band shelf features: localized energy ratios at each band's predicted frequency
+  # Replaces old global 3-scalar broadcast with 6 per-band + 5 multi-scale global features
+  shelf_feature_gaussian_sigma: 8.0   # mel band width for per-band energy window
+  shelf_feature_n_scales: 5          # multi-scale global energy ratio cutoffs [4,8,16,32,64]
   learning_rate: 0.0001
   weight_decay: 0.05          # was 0.02 — stronger regularization for overfitting
   head_lr_multiplier: 1.5
@@ -53,7 +57,7 @@ loss:
   lambda_spectral: 2.0
   lambda_param: 1.0        # was 2.0 — reduced so type loss dominates early
   lambda_type: 8.0         # was 2.0 — 4x increase to break type collapse
-  lambda_gain: 1.0
+  lambda_gain: 4.0         # was 1.0 — 4x increase to prioritize gain regression
   lambda_freq: 1.0
   lambda_q: 0.5            # was 1.0 — Q is least diagnostic, reduce weight
   lambda_gain_zero: 6.0
@@ -64,12 +68,13 @@ loss:
   # Per-class focal loss multipliers (applied after inverse-frequency normalization).
   # Index order: [peaking, lowshelf, highshelf, highpass, lowpass]
   # Equal multipliers — rely on KL prior + inverse-frequency focal weights for balance
-  class_weight_multipliers: [1.0, 1.0, 1.0, 1.0, 1.0]
+  class_weight_multipliers: [0.5, 5.0, 2.0, 2.0, 2.0]
   # Penalty for predicting gain with wrong sign vs ground truth.
   # 0.5 = half the log-cosh gain term contribution for each sign-flipped band.
   sign_penalty_weight: 0.5
   lambda_embed_var: 1.0    # was 0.3 — stronger anti-collapse (continuous penalty)
   lambda_contrastive: 0.1
+  lambda_hdb: 2.0
 
 trainer:
   max_epochs: 30

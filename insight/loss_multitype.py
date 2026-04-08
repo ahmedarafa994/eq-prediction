@@ -299,6 +299,7 @@ class MultiTypeEQLoss(nn.Module):
         warmup_epochs=5,
         class_weight_multipliers=None,
         sign_penalty_weight=0.0,
+        lambda_hdb=2.0,
     ):
         super().__init__()
         self.lambda_param = lambda_param
@@ -308,6 +309,7 @@ class MultiTypeEQLoss(nn.Module):
         self.lambda_type = lambda_type
         self.lambda_spectral = lambda_spectral
         self.lambda_hmag = lambda_hmag
+        self.lambda_hdb = lambda_hdb
         self.lambda_activity = lambda_activity
         self.lambda_spread = lambda_spread
         self.lambda_embed_var = lambda_embed_var
@@ -319,7 +321,7 @@ class MultiTypeEQLoss(nn.Module):
 
         # D-03/D-04: Hybrid warmup gate — warmup ends when BOTH epoch threshold AND
         # gain MAE threshold are met (hard cap at 15 epochs prevents infinite warmup).
-        self.gain_mae_ema = 2.5  # EMA of per-batch gain MAE (dB), alpha=0.1
+        self.gain_mae_ema = 10.0  # EMA of per-batch gain MAE (dB), alpha=0.1 — start high (realistic)
 
         self.param_loss = PermutationInvariantParamLoss(
             lambda_type_match=lambda_type_match
@@ -375,6 +377,8 @@ class MultiTypeEQLoss(nn.Module):
         target_audio=None,
         active_band_mask=None,
         embedding=None,
+        h_db_pred=None,
+        h_db_target=None,
     ):
         """
         Compute total loss.
@@ -622,6 +626,13 @@ class MultiTypeEQLoss(nn.Module):
             loss_spread = torch.tensor(0.0, device=pred_gain.device)
         components["spread_loss"] = loss_spread
 
+        # 9. H_db direct prediction loss (hybrid spectral-parametric)
+        if h_db_pred is not None and h_db_target is not None:
+            loss_hdb = F.l1_loss(h_db_pred, h_db_target)
+        else:
+            loss_hdb = torch.tensor(0.0, device=pred_gain.device)
+        components["hdb_loss"] = loss_hdb
+
         # Total: independent per-parameter weights (no combined lambda_param wrapper)
         total_loss = (
             self.lambda_gain * loss_gain
@@ -634,6 +645,7 @@ class MultiTypeEQLoss(nn.Module):
             + self.lambda_spread * loss_spread
             + self.lambda_embed_var * loss_embed_var
             + self.lambda_contrastive * loss_contrastive
+            + self.lambda_hdb * loss_hdb
         )
 
         # Clamp total loss to prevent NaN propagation from any single component

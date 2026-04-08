@@ -419,6 +419,8 @@ class MultiTypeEQParameterHead(nn.Module):
         n_mels=0,
         type_conditioned_frequency=True,
         n_shelf_bands=16,
+        n_fft=2048,
+        sample_rate=44100,
     ):
         super().__init__()
         self.num_bands = num_bands
@@ -426,6 +428,8 @@ class MultiTypeEQParameterHead(nn.Module):
         self.n_mels = n_mels
         self.type_conditioned_frequency = type_conditioned_frequency
         self.n_shelf_bands = n_shelf_bands
+        self.n_fft_bins = n_fft // 2 + 1
+        self.sample_rate = sample_rate
         self.log_f_min = FILTER_LOG_FREQ_BOUNDS[FILTER_PEAKING][0]
         self.log_f_max = FILTER_LOG_FREQ_BOUNDS[FILTER_PEAKING][1]
         hidden_dim = 64
@@ -437,7 +441,17 @@ class MultiTypeEQParameterHead(nn.Module):
             nn.ReLU(),
         )
 
-        # Gain head: single linear + ste_clamp
+        # Hybrid spectral-parametric: predict H_db directly from embedding
+        # (spectral pretrain model achieves 0.20 dB MAE this way)
+        self.h_db_head = nn.Linear(embedding_dim, self.n_fft_bins)
+        nn.init.xavier_uniform_(self.h_db_head.weight, gain=0.1)
+        nn.init.zeros_(self.h_db_head.bias)
+
+        # Learned mixing weight for gain: sigmoid(alpha) * gain_hdb + (1-sigmoid(alpha)) * gain_raw
+        # Start at 0.0 (all H_db) since spectral path is proven better
+        self.register_buffer('gain_mix_value', torch.tensor(0.1))
+
+        # Gain head: single linear + ste_clamp (kept as fallback/residual)
         self.gain_head = nn.Linear(hidden_dim, 1)
         nn.init.zeros_(self.gain_head.bias)
         nn.init.xavier_uniform_(self.gain_head.weight, gain=0.1)
@@ -548,7 +562,48 @@ class MultiTypeEQParameterHead(nn.Module):
             else None
         )
 
-        type_input_dim = hidden_dim + 3
+        self.shelf_feature_encoder = (
+            nn.Sequential(
+                nn.Conv1d(3, 32, kernel_size=5, padding=2),
+                nn.GELU(),
+                nn.Conv1d(32, mel_hidden_dim, kernel_size=3, padding=1),
+                nn.GELU(),
+            )
+            if n_mels > 0
+            else None
+        )
+        self.shelf_band_query = (
+            nn.Linear(hidden_dim, mel_hidden_dim) if n_mels > 0 else None
+        )
+        self.shelf_context_norm = (
+            nn.LayerNorm(mel_hidden_dim) if n_mels > 0 else None
+        )
+        self.shelf_bias_head = (
+            nn.Sequential(
+                nn.Linear(mel_hidden_dim, 32),
+                nn.GELU(),
+                nn.Linear(32, 2),
+            )
+            if n_mels > 0
+            else None
+        )
+        if self.shelf_bias_head is not None:
+            # Small random init (not zeros) so gradient flows through the
+            # entire attention chain from the very first training step.
+            # Zero-init creates a dead gradient: ∂(0·x)/∂x = 0 for the
+            # preceding Conv1d encoder and attention layers.
+            nn.init.normal_(self.shelf_bias_head[-1].weight, std=0.01)
+            nn.init.zeros_(self.shelf_bias_head[-1].bias)
+        # Fixed-scale direct logit bias from prefix_suffix_ratio at the
+        # first and last mel-band positions.  These are non-learned scalar
+        # evidence signals that bypass the attention mechanism entirely.
+        # prefix_suffix_ratio[0] = log(E_below_fc_min / E_above_fc_min)
+        #   → strongly positive for lowshelf boost
+        # prefix_suffix_ratio[-1] = log(E_below_fc_max / E_above_fc_max)
+        #   → strongly positive for highshelf boost (treble-heavy)
+        self.direct_shelf_scale = nn.Parameter(torch.tensor(2.0))
+
+        type_input_dim = hidden_dim
         self.type_head = nn.Sequential(
             nn.Linear(type_input_dim, 128),
             nn.ReLU(),
@@ -633,58 +688,74 @@ class MultiTypeEQParameterHead(nn.Module):
             self.gain_band_mel_norm,
         )
 
-    def _compute_shelf_features(self, mel_profile: torch.Tensor) -> torch.Tensor:
+    def _mel_log_to_normalized_energy(self, mel_profile: torch.Tensor) -> torch.Tensor:
+        """Convert log-mel to scale-invariant linear energy for shelf features."""
+        mel_energy = torch.exp(mel_profile.clamp(min=-12.0, max=12.0))
+        return mel_energy / mel_energy.mean(dim=-1, keepdim=True).clamp(min=1e-6)
+
+    def _compute_shelf_feature_map(self, mel_profile: torch.Tensor) -> torch.Tensor:
         """
-        Compute fixed (non-learned) scalar features that discriminate shelf
-        filter types from peaking filters.
-
-        A lowshelf boosts/cuts all frequencies below fc monotonically — the
-        low-band mean is systematically higher/lower than the high-band mean.
-        A peaking filter creates a localized bump with similar energy on both
-        sides. These three statistics make that distinction directly observable
-        without relying on learned feature extraction.
-
-        Args:
-            mel_profile: (B, n_mels) — raw (not centered) mel energy profile
+        Build per-cutoff shelf evidence curves in normalized linear-energy space.
 
         Returns:
-            shelf_feats: (B, 3) — [lo_ratio, hi_ratio, tilt_slope]
-                lo_ratio: log(mean(mel[0:N]) / mean(mel[N:])) — bass tilt
-                hi_ratio: log(mean(mel[-N:]) / mean(mel[:-N])) — treble tilt
-                tilt_slope: linear regression slope across mel bands (normalized)
+            (B, 3, n_mels) ordered as:
+              prefix_suffix_ratio, boundary_step, local_peakness
         """
-        B, n_mels = mel_profile.shape
-        n = min(self.n_shelf_bands, n_mels // 4)  # guard: never exceed 25% of bands
+        _, n_mels = mel_profile.shape
+        if n_mels <= 1:
+            return mel_profile.new_zeros(mel_profile.shape[0], 3, n_mels)
 
-        # Use absolute value so negative mel values (e.g. log-mel can be negative)
-        # do not produce NaN in the log ratio. Energy magnitude is what matters.
-        mel_abs = mel_profile.abs()
+        mel_energy = self._mel_log_to_normalized_energy(mel_profile)
+        boundary_idx = torch.arange(n_mels, device=mel_profile.device).clamp(
+            1, n_mels - 1
+        )
+        boundary_idx = boundary_idx.to(torch.long)
+        cumsum = F.pad(mel_energy.cumsum(dim=-1), (1, 0))
 
-        # Low-frequency energy ratio: log(E_low / E_high)
-        lo_mean = mel_abs[:, :n].mean(dim=-1, keepdim=True)           # (B, 1)
-        hi_mean = mel_abs[:, n:].mean(dim=-1, keepdim=True)           # (B, 1)
-        lo_ratio = torch.log((lo_mean + 1e-6) / (hi_mean + 1e-6))     # (B, 1)
+        left_counts = boundary_idx.to(mel_profile.dtype).unsqueeze(0)
+        right_counts = (n_mels - boundary_idx).to(mel_profile.dtype).unsqueeze(0)
+        left_means = cumsum[:, boundary_idx] / left_counts
+        right_means = (cumsum[:, -1:] - cumsum[:, boundary_idx]) / right_counts
+        prefix_suffix_ratio = torch.log(
+            (left_means + 1e-6) / (right_means + 1e-6)
+        )
 
-        # High-frequency energy ratio: log(E_high_tail / E_rest)
-        hi_tail = mel_abs[:, -n:].mean(dim=-1, keepdim=True)          # (B, 1)
-        rest = mel_abs[:, :-n].mean(dim=-1, keepdim=True)             # (B, 1)
-        hi_ratio = torch.log((hi_tail + 1e-6) / (rest + 1e-6))        # (B, 1)
+        window = min(max(1, self.n_shelf_bands), max(1, n_mels // 4))
+        energy = mel_energy.unsqueeze(1)
+        padded = F.pad(energy, (2 * window, 2 * window), mode="replicate")
+        short_windows = padded.unfold(-1, window, 1).squeeze(1)
+        long_windows = padded.unfold(-1, 2 * window, 1).squeeze(1)
 
-        # Spectral tilt slope: linear regression coefficient across mel bands
-        # x = normalized band indices in [-1, 1]; y = mel_profile
-        x = torch.linspace(-1.0, 1.0, n_mels, device=mel_profile.device,
-                           dtype=mel_profile.dtype).unsqueeze(0)       # (1, n_mels)
-        x_centered = x - x.mean()
-        denom = (x_centered ** 2).sum()
-        y_centered = mel_profile - mel_profile.mean(dim=-1, keepdim=True)
-        slope = (x_centered * y_centered).sum(dim=-1, keepdim=True) / (denom + 1e-8)  # (B, 1)
+        left_windows = short_windows[:, window : window + n_mels, :]
+        right_windows = short_windows[:, 2 * window : 2 * window + n_mels, :]
+        boundary_step = left_windows.mean(dim=-1) - right_windows.mean(dim=-1)
 
-        # Clamp all features to reasonable range to avoid exploding values
-        lo_ratio = torch.clamp(lo_ratio, -5.0, 5.0)
-        hi_ratio = torch.clamp(hi_ratio, -5.0, 5.0)
-        slope = torch.clamp(slope, -5.0, 5.0)
+        left_outer = short_windows[:, :n_mels, :]
+        center_windows = long_windows[:, window : window + n_mels, :]
+        right_outer = short_windows[:, 3 * window : 3 * window + n_mels, :]
+        local_peakness = center_windows.mean(dim=-1) - 0.5 * (
+            left_outer.mean(dim=-1) + right_outer.mean(dim=-1)
+        )
 
-        return torch.cat([lo_ratio, hi_ratio, slope], dim=-1)  # (B, 3)
+        feature_map = torch.stack(
+            [prefix_suffix_ratio, boundary_step, local_peakness],
+            dim=1,
+        )
+        return torch.clamp(feature_map, min=-6.0, max=6.0)
+
+    def _build_shelf_context(self, trunk_out, mel_profile):
+        if self.shelf_feature_encoder is None or mel_profile is None:
+            return None, None
+
+        shelf_feature_map = self._compute_shelf_feature_map(mel_profile)
+        shelf_values = self.shelf_feature_encoder(shelf_feature_map)
+        shelf_queries = self.shelf_band_query(trunk_out)
+        attn_scores = torch.einsum("bnc,bcm->bnm", shelf_queries, shelf_values)
+        attn_scores = attn_scores / math.sqrt(shelf_values.shape[1])
+        shelf_attention = torch.softmax(attn_scores, dim=-1)
+        shelf_context = torch.einsum("bnm,bcm->bnc", shelf_attention, shelf_values)
+        shelf_context = self.shelf_context_norm(shelf_context)
+        return shelf_context, shelf_attention
 
     def summarize_gain_aux_features(self, mel_profile):
         if self.gain_mel_proj is None or mel_profile is None:
@@ -712,22 +783,6 @@ class MultiTypeEQParameterHead(nn.Module):
             )
         else:
             type_input = trunk_out
-        if mel_profile is not None and self.n_shelf_bands > 0:
-            shelf_feats = self._compute_shelf_features(mel_profile)  # (B, 3)
-            # Expand to per-band: (B, 3) -> (B, num_bands, 3)
-            shelf_feats_expanded = shelf_feats.unsqueeze(1).expand(-1, self.num_bands, -1)
-            type_input_with_shelf = torch.cat([type_input, shelf_feats_expanded], dim=-1)
-        else:
-            # Pad with zeros if mel_profile unavailable (keeps type_head input dim consistent)
-            shelf_feats_expanded = torch.zeros(
-                type_input.shape[0], self.num_bands, 3,
-                device=type_input.device, dtype=type_input.dtype
-            )
-            type_input_with_shelf = torch.cat([type_input, shelf_feats_expanded], dim=-1)
-        type_logits = self.type_head(type_input_with_shelf)
-        type_probs = F.softmax(type_logits, dim=-1)
-        filter_type = type_logits.argmax(dim=-1)
-        type_probs_for_params = type_probs
 
         if gain_aux is not None and self.gain_context_proj is not None:
             gain_hidden = self.gain_context_proj(torch.cat([trunk_out, gain_aux], dim=-1))
@@ -735,19 +790,53 @@ class MultiTypeEQParameterHead(nn.Module):
             gain_hidden = trunk_out
         gain_raw = self.gain_head(gain_hidden).squeeze(-1)
         gain_db_raw = ste_clamp(gain_raw * 24.0, -24.0, 24.0)
-        if hard_types:
-            # Inference: hard-zero HP/LP gain via argmax type mask.
-            gain_db = gain_db_raw * self.gainful_type_mask[filter_type]
-        else:
-            # Training: do NOT apply soft gain mask.
-            # Soft mask = gain_db_raw * (sum of gainful type probs) chains
-            # ∂L/∂gain_db_raw = gain_mask * ∂L/∂gain_db.  When the type head
-            # is wrong (e.g. predicts HP for a peaking band), gain_mask≈0 and
-            # gain_head gets near-zero gradient — it cannot learn sign or scale.
-            # The zero-gain constraint for HP/LP is handled explicitly by
-            # lambda_gain_zero in SimplifiedEQLoss instead.
-            gain_db = gain_db_raw
 
+        # ── Hybrid spectral-parametric: predict H_db from embedding ────────
+        h_db_pred = self.h_db_head(embedding)  # (B, n_fft_bins)
+        shelf_context, shelf_attention = self._build_shelf_context(trunk_out, mel_profile)
+        type_logits = self.type_head(type_input)
+        shelf_bias = type_logits.new_zeros(type_logits.shape[0], self.num_bands, 2)
+        if shelf_context is not None and self.shelf_bias_head is not None:
+            shelf_bias = self.shelf_bias_head(shelf_context)
+        if shelf_attention is None:
+            shelf_attention = type_logits.new_zeros(
+                type_logits.shape[0], self.num_bands, self.n_mels
+            )
+        low_shelf_bias = shelf_bias[..., 0]
+        high_shelf_bias = shelf_bias[..., 1]
+        type_logits = type_logits.clone()
+        type_logits[..., FILTER_LOWSHELF] += low_shelf_bias
+        type_logits[..., FILTER_HIGHSHELF] += high_shelf_bias
+        type_logits[..., FILTER_PEAKING] -= 0.5 * (
+            low_shelf_bias + high_shelf_bias
+        )
+
+        # Direct non-learned shelf evidence from the feature map.
+        # prefix_suffix_ratio at band 0 = global lo_ratio (positive → bass-heavy → lowshelf)
+        # prefix_suffix_ratio at last band = negated hi_ratio (positive → treble-heavy → highshelf)
+        # This bypasses the learned attention chain, giving the type classifier
+        # an immediate discriminative signal from the very first training step.
+        if mel_profile is not None and self.n_shelf_bands > 0:
+            feature_map = self._compute_shelf_feature_map(mel_profile)  # (B, 3, n_mels)
+            prefix_suffix = feature_map[:, 0, :]  # (B, n_mels)
+            # Global low evidence: ratio at first mel position (bass vs rest)
+            # Positive when bass-heavy → correctly boosts lowshelf logit
+            direct_lo = prefix_suffix[:, 0:1] * self.direct_shelf_scale  # (B, 1)
+            # Global high evidence: NEGATED ratio at last mel position
+            # prefix_suffix[-1] = log(E_before_last / E_last). For highshelf
+            # (treble-heavy), E_last is large so this is negative; negating
+            # gives positive highshelf evidence. For lowshelf (bass-heavy),
+            # E_before_last includes bass so this is positive; negating gives
+            # negative → correctly penalizes highshelf.
+            direct_hi = -prefix_suffix[:, -1:] * self.direct_shelf_scale  # (B, 1)
+            type_logits[..., FILTER_LOWSHELF] += direct_lo  # broadcast over bands
+            type_logits[..., FILTER_HIGHSHELF] += direct_hi
+            type_logits[..., FILTER_PEAKING] -= 0.5 * (direct_lo + direct_hi)
+        type_probs = F.softmax(type_logits, dim=-1)
+        filter_type = type_logits.argmax(dim=-1)
+        type_probs_for_params = type_probs
+
+        # ── Final frequency computation ───────────────────────────────────
         if type_mel_context is not None and self.freq_context_proj is not None:
             freq_hidden = self.freq_context_proj(
                 torch.cat([trunk_out, type_mel_context], dim=-1)
@@ -768,9 +857,36 @@ class MultiTypeEQParameterHead(nn.Module):
         log_freq = log_f_min + freq_unit * (log_f_max - log_f_min)
         freq = torch.exp(log_freq)
 
+        # ── Q computation ─────────────────────────────────────────────────
         q_log = self.q_head(trunk_out).squeeze(-1)
         q_log = ste_clamp(q_log, math.log(0.1), math.log(10.0))
         q = torch.exp(q_log)
+
+        # ── Hybrid gain: interpolate H_db at predicted frequency ──────────
+        # Convert predicted freq (Hz) to continuous bin index
+        freq_clamped = freq.clamp(min=1.0, max=self.sample_rate / 2.0 - 1.0)
+        bin_continuous = freq_clamped / (self.sample_rate / 2.0) * (self.n_fft_bins - 1)
+        bin_floor = bin_continuous.long().clamp(0, self.n_fft_bins - 2)
+        bin_ceil = bin_floor + 1
+        weight = (bin_continuous - bin_floor.float()).clamp(0.0, 1.0)  # (B, N)
+
+        # Gather H_db values at floor and ceil bins for each band
+        B = h_db_pred.shape[0]
+        hdb_floor = h_db_pred.gather(1, bin_floor)  # (B, N)
+        hdb_ceil = h_db_pred.gather(1, bin_ceil)     # (B, N)
+        # Differentiable interpolation
+        gain_from_hdb = (1.0 - weight) * hdb_floor + weight * hdb_ceil  # (B, N)
+
+        # Learned mix: sigmoid(alpha) * gain_hdb + (1-sigmoid(alpha)) * gain_raw
+        mix = self.gain_mix_value.clamp(0.0, 1.0)
+        gain_db_mixed = mix * gain_from_hdb + (1.0 - mix) * gain_db_raw
+
+        if hard_types:
+            # Inference: hard-zero HP/LP gain via argmax type mask.
+            gain_db = gain_db_mixed * self.gainful_type_mask[filter_type]
+        else:
+            # Training: no soft mask — zero-gain for HP/LP handled by lambda_gain_zero
+            gain_db = gain_db_mixed
 
         if return_aux:
             aux = {
@@ -778,6 +894,9 @@ class MultiTypeEQParameterHead(nn.Module):
                 "gain_aux_summary": (
                     gain_aux.mean(dim=1) if gain_aux is not None else None
                 ),
+                "shelf_bias": shelf_bias,
+                "shelf_attention": shelf_attention,
+                "h_db_pred": h_db_pred,
             }
             return gain_db, freq, q, type_logits, type_probs, filter_type, aux
 

@@ -586,6 +586,8 @@ class StreamingTCNModel(nn.Module):
             n_mels=n_mels,
             type_conditioned_frequency=type_conditioned_frequency,
             n_shelf_bands=n_shelf_bands,
+            n_fft=n_fft,
+            sample_rate=sample_rate,
         )
 
         # DSP layer
@@ -704,6 +706,9 @@ class StreamingTCNModel(nn.Module):
             "mel_profile": mel_profile,
             "mel_profile_centered": param_aux.get("mel_profile_centered"),
             "gain_aux_summary": param_aux.get("gain_aux_summary"),
+            "shelf_bias": param_aux.get("shelf_bias"),
+            "shelf_attention": param_aux.get("shelf_attention"),
+            "h_db_pred": param_aux.get("h_db_pred"),
             "attn_weights": attn_weights,
         }
 
@@ -805,6 +810,8 @@ class StreamingTCNModel(nn.Module):
             "mel_profile": mel_profile,
             "mel_profile_centered": param_aux.get("mel_profile_centered"),
             "gain_aux_summary": param_aux.get("gain_aux_summary"),
+            "shelf_bias": param_aux.get("shelf_bias"),
+            "shelf_attention": param_aux.get("shelf_attention"),
         }
 
         # Restore training mode if we forced eval for BatchNorm safety
