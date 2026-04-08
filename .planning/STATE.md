@@ -5,7 +5,7 @@ milestone_name: milestone
 status: complete
 stopped_at: v1.0 milestone shipped
 last_updated: "2026-04-06T10:37:00.000Z"
-last_activity: 2026-04-06 -- v1.0 milestone completed and archived
+last_activity: 2026-04-08 - Completed quick task 260408-3fg: apply lowshelf class weight increase and gain sign penalty to fix EQ estimator accuracy
 progress:
   total_phases: 5
   completed_phases: 5
@@ -85,6 +85,12 @@ Recent decisions affecting current work:
 - [Phase 4]: Metric-gated curriculum threshold criteria need empirical tuning based on observed training dynamics
 - [Phase 5]: Inference-time refinement adds 50-200ms latency; acceptable for batch/evaluation use case
 - [General]: All validation sign-offs approved pending live training verification
+
+### Quick Tasks Completed
+
+| # | Description | Date | Commit | Directory |
+|---|-------------|------|--------|-----------|
+| 260408-3fg | apply lowshelf class weight increase and gain sign penalty to fix EQ estimator accuracy | 2026-04-08 | a647de2 | [260408-3fg-apply-lowshelf-class-weight-increase-and](.planning/quick/260408-3fg-apply-lowshelf-class-weight-increase-and/) |
 
 ## Session Continuity
 
