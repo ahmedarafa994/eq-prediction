@@ -42,6 +42,15 @@ FILTER_LOWPASS = 4
 NUM_FILTER_TYPES = 5
 
 FILTER_NAMES = ["peaking", "lowshelf", "highshelf", "highpass", "lowpass"]
+DEFAULT_TYPE_PRIORS = [0.5, 0.15, 0.15, 0.1, 0.1]
+FILTER_GAINFUL_MASK = [1.0, 1.0, 1.0, 0.0, 0.0]
+FILTER_LOG_FREQ_BOUNDS = [
+    (math.log(20.0), math.log(20000.0)),
+    (math.log(20.0), math.log(5000.0)),
+    (math.log(1000.0), math.log(20000.0)),
+    (math.log(20.0), math.log(500.0)),
+    (math.log(2000.0), math.log(20000.0)),
+]
 
 
 class DifferentiableBiquadCascade(nn.Module):
@@ -235,91 +244,6 @@ class DifferentiableBiquadCascade(nn.Module):
 
         return b0, b1, b2, a1, a2
 
-    def compute_biquad_coeffs_multitype_soft(self, gain_db, freq, q, type_probs):
-        """
-        Compute biquad coefficients as a weighted mixture across filter types,
-        using soft type probabilities from Gumbel-Softmax.
-
-        Inputs:
-            gain_db: (Batch, Num_Bands)
-            freq: (Batch, Num_Bands)
-            q: (Batch, Num_Bands)
-            type_probs: (Batch, Num_Bands, 5) — soft type probabilities
-
-        Returns: b0, b1, b2, a1, a2 (each shape (Batch, Num_Bands))
-        """
-        A = 10.0 ** (gain_db / 40.0)
-        w0 = 2.0 * torch.pi * freq / self.sample_rate
-        cos_w0 = torch.cos(w0)
-        sin_w0 = torch.sin(w0)
-        alpha = sin_w0 / (2.0 * q + 1e-8)
-        sqrt_A = torch.sqrt(torch.clamp(A, min=1e-8))
-        two_sqrt_A_alpha = 2.0 * sqrt_A * alpha
-
-        # Peaking
-        peak_b0 = 1.0 + alpha * A
-        peak_b1 = -2.0 * cos_w0
-        peak_b2 = 1.0 - alpha * A
-        peak_a0 = 1.0 + alpha / A
-        peak_a1 = -2.0 * cos_w0
-        peak_a2 = 1.0 - alpha / A
-
-        # Low-Shelf
-        ls_b0 = A * ((A + 1.0) - (A - 1.0) * cos_w0 + two_sqrt_A_alpha)
-        ls_b1 = 2.0 * A * ((A - 1.0) - (A + 1.0) * cos_w0)
-        ls_b2 = A * ((A + 1.0) - (A - 1.0) * cos_w0 - two_sqrt_A_alpha)
-        ls_a0 = (A + 1.0) + (A - 1.0) * cos_w0 + two_sqrt_A_alpha
-        ls_a1 = -2.0 * ((A - 1.0) + (A + 1.0) * cos_w0)
-        ls_a2 = (A + 1.0) + (A - 1.0) * cos_w0 - two_sqrt_A_alpha
-
-        # High-Shelf
-        hs_b0 = A * ((A + 1.0) + (A - 1.0) * cos_w0 + two_sqrt_A_alpha)
-        hs_b1 = -2.0 * A * ((A - 1.0) + (A + 1.0) * cos_w0)
-        hs_b2 = A * ((A + 1.0) + (A - 1.0) * cos_w0 - two_sqrt_A_alpha)
-        hs_a0 = (A + 1.0) - (A - 1.0) * cos_w0 + two_sqrt_A_alpha
-        hs_a1 = 2.0 * ((A - 1.0) - (A + 1.0) * cos_w0)
-        hs_a2 = (A + 1.0) - (A - 1.0) * cos_w0 - two_sqrt_A_alpha
-
-        # High-Pass
-        hp_b0 = (1.0 + cos_w0) / 2.0
-        hp_b1 = -(1.0 + cos_w0)
-        hp_b2 = (1.0 + cos_w0) / 2.0
-        hp_a0 = 1.0 + alpha
-        hp_a1 = -2.0 * cos_w0
-        hp_a2 = 1.0 - alpha
-
-        # Low-Pass
-        lp_b0 = (1.0 - cos_w0) / 2.0
-        lp_b1 = 1.0 - cos_w0
-        lp_b2 = (1.0 - cos_w0) / 2.0
-        lp_a0 = 1.0 + alpha
-        lp_a1 = -2.0 * cos_w0
-        lp_a2 = 1.0 - alpha
-
-        # Stack into (Batch, Num_Bands, 5) and weight by type_probs
-        def weighted_sum(peak, ls, hs, hp, lp):
-            # Each input is (Batch, Num_Bands)
-            stacked = torch.stack([peak, ls, hs, hp, lp], dim=-1)  # (B, N, 5)
-            return (stacked * type_probs).sum(dim=-1)  # (B, N)
-
-        b0_raw = weighted_sum(peak_b0, ls_b0, hs_b0, hp_b0, lp_b0)
-        b1_raw = weighted_sum(peak_b1, ls_b1, hs_b1, hp_b1, lp_b1)
-        b2_raw = weighted_sum(peak_b2, ls_b2, hs_b2, hp_b2, lp_b2)
-        a0_raw = weighted_sum(peak_a0, ls_a0, hs_a0, hp_a0, lp_a0)
-        a1_raw = weighted_sum(peak_a1, ls_a1, hs_a1, hp_a1, lp_a1)
-        a2_raw = weighted_sum(peak_a2, ls_a2, hs_a2, hp_a2, lp_a2)
-
-        # Normalize by a0 — clamp to prevent near-zero division from
-        # convex combination of coefficients from different filter types
-        a0_raw = torch.clamp(a0_raw, min=1e-4)
-        b0 = b0_raw / a0_raw
-        b1 = b1_raw / a0_raw
-        b2 = b2_raw / a0_raw
-        a1 = a1_raw / a0_raw
-        a2 = a2_raw / a0_raw
-
-        return b0, b1, b2, a1, a2
-
     def freq_response(self, b0, b1, b2, a1, a2, n_fft=2048):
         """
         Compute the frequency response of the biquad filter.
@@ -417,57 +341,6 @@ class DifferentiableBiquadCascade(nn.Module):
         )
         return y_time
 
-    def forward_soft(self, gain_db, freq, q, type_probs, n_fft=2048):
-        """
-        Forward pass using soft type probabilities (for training with Gumbel-Softmax).
-
-        Forces float32 computation to prevent bf16 NaN from soft coefficient
-        blending. The Gumbel-Softmax produces blended biquad coefficients that
-        don't correspond to any real filter — under bf16, the intermediate
-        products can underflow/overflow at certain frequency bins, and the
-        product over 5 bands amplifies this into inf/NaN.
-
-        Args:
-            gain_db: (Batch, Num_Bands)
-            freq: (Batch, Num_Bands)
-            q: (Batch, Num_Bands)
-            type_probs: (Batch, Num_Bands, 5) soft type probabilities
-            n_fft: FFT size
-
-        Returns: (Batch, N_FFT // 2 + 1)
-        """
-        # Cast inputs to float32 for numerical stability
-        orig_dtype = gain_db.dtype
-        gain_db = gain_db.float()
-        freq = freq.float()
-        q = q.float()
-        type_probs = type_probs.float()
-
-        b0, b1, b2, a1, a2 = self.compute_biquad_coeffs_multitype_soft(
-            gain_db, freq, q, type_probs
-        )
-
-        # Per-band stability check: detect coefficients near unit circle
-        # that would produce resonance poles and inf in frequency response
-        pole_check = torch.abs(a1) + torch.abs(a2)
-        unstable = pole_check > 1.95
-        if unstable.any():
-            b0 = torch.where(unstable, torch.ones_like(b0) * 0.5, b0)
-            b1 = torch.where(unstable, torch.zeros_like(b1), b1)
-            b2 = torch.where(unstable, torch.zeros_like(b2), b2)
-            a1 = torch.where(unstable, torch.zeros_like(a1), a1)
-            a2 = torch.where(unstable, torch.zeros_like(a2), a2)
-
-        H_mag_bands = self.freq_response(b0, b1, b2, a1, a2, n_fft)
-
-        # Per-band clamping BEFORE product to prevent inf propagation
-        H_mag_bands = torch.clamp(H_mag_bands, min=1e-6, max=1e3)
-        H_mag_total = torch.prod(H_mag_bands, dim=1)
-
-        # Final clamp with gradient-safe bound
-        H_mag_total = torch.clamp(H_mag_total, min=1e-6, max=1e4)
-        return H_mag_total.to(orig_dtype)
-
     def inverse_freq_response(
         self, gain_db, freq, q, n_fft=2048, max_gain=4.0, filter_type=None
     ):
@@ -530,283 +403,382 @@ class EQParameterHead(nn.Module):
 
 class MultiTypeEQParameterHead(nn.Module):
     """
-    Maps TCN embeddings + mel_profile to [Gain, Freq, Q] + filter type classification.
+    Parameter head for multi-type EQ estimation.
 
-    Frequency: attention over position-aware 1D CNN on mel spectrogram + direct sigmoid regression.
-    Gain: 2-layer MLP from trunk embedding, bounded by ste_clamp (D-01: single clean path).
-    Q: 3-layer MLP (Linear->ReLU->Linear->ReLU->Linear) with log-linear STE clamp output.
-    Type: trunk + mel features with Gumbel-Softmax.
+    Key behaviors:
+    - Gain is type-aware: HP/LP gains are suppressed via type probabilities.
+    - Frequency is mapped through type-specific log-frequency bounds.
+    - Type prediction uses both global and per-band mel evidence.
     """
 
     def __init__(
-        self, embedding_dim, num_bands=5, num_filter_types=NUM_FILTER_TYPES, n_mels=0
+        self,
+        embedding_dim,
+        num_bands=5,
+        num_filter_types=NUM_FILTER_TYPES,
+        n_mels=0,
+        type_conditioned_frequency=True,
+        n_shelf_bands=16,
     ):
         super().__init__()
         self.num_bands = num_bands
         self.num_filter_types = num_filter_types
-        self.log_f_min = math.log(20.0)
-        self.log_f_max = math.log(20000.0)
-
+        self.n_mels = n_mels
+        self.type_conditioned_frequency = type_conditioned_frequency
+        self.n_shelf_bands = n_shelf_bands
+        self.log_f_min = FILTER_LOG_FREQ_BOUNDS[FILTER_PEAKING][0]
+        self.log_f_max = FILTER_LOG_FREQ_BOUNDS[FILTER_PEAKING][1]
         hidden_dim = 64
-        cnn_channels = 32
+        mel_hidden_dim = 64
 
         # Shared trunk: embedding -> per-band features
-        self.trunk = nn.Linear(embedding_dim, num_bands * hidden_dim)
-
-        # --- Gain: dedicated 2-layer MLP from trunk embedding (no mel-residual dependency) ---
-        # Previous Gaussian readout had only 10 learnable params (scale+bias per band)
-        # and could not map log-mel residual amplitude to dB gain.
-        # MLP regression head takes the full 64-dim trunk embedding and outputs gain directly.
-        # Output is scaled by gain_output_scale (24.0) so the MLP only needs to produce
-        # values in [-1, 1] instead of [-24, 24], matching typical Xavier initialization range.
-        self.gain_mlp = nn.Sequential(
-            nn.Linear(hidden_dim, hidden_dim),
+        self.trunk = nn.Sequential(
+            nn.Linear(embedding_dim, num_bands * hidden_dim),
             nn.ReLU(),
-            nn.Linear(hidden_dim, 1),
         )
-        self.gain_output_scale = nn.Parameter(torch.tensor(12.0))  # FIX-5: was 24.0; halves gradient amplification
 
-        # Q head: 3-layer MLP with log-linear output + STE clamp (per D-01, D-02)
-        # Replaces single Linear + sigmoid->exp (gradient saturation at extremes).
-        # Output: log(Q), bounded by ste_clamp to [log(0.1), log(10.0)]
-        self.q_mlp = nn.Sequential(
-            nn.Linear(hidden_dim, hidden_dim),  # 64 -> 64
-            nn.ReLU(),
-            nn.Linear(hidden_dim, hidden_dim),  # 64 -> 64
-            nn.ReLU(),
-            nn.Linear(hidden_dim, 1),           # 64 -> 1
-        )
-        self.dropout = nn.Dropout(p=0.2)
+        # Gain head: single linear + ste_clamp
+        self.gain_head = nn.Linear(hidden_dim, 1)
+        nn.init.zeros_(self.gain_head.bias)
+        nn.init.xavier_uniform_(self.gain_head.weight, gain=0.1)
 
-        # --- Type classification: trunk + mel spectral shape features ---
-        self.type_mel_proj = (
+        self.freq_context_proj = (
             nn.Sequential(
-                nn.Conv1d(1, 32, kernel_size=15, stride=4, padding=7),
-                nn.ReLU(),
-                nn.AdaptiveAvgPool1d(1),
-                nn.Flatten(),
-                nn.Linear(32, 32),
+                nn.Linear(hidden_dim + mel_hidden_dim, hidden_dim),
+                nn.GELU(),
             )
             if n_mels > 0
             else None
         )
-        type_input_dim = hidden_dim + (32 if n_mels > 0 else 0)
-        # FIX-4: 4-layer MLP with LayerNorm. LayerNorm(128) works on (B, num_bands, 128)
-        # by normalizing over the last dim; BatchNorm1d would not handle 3D input correctly.
-        self.classification_head = nn.Sequential(
+        self.freq_head = nn.Linear(hidden_dim, 1)
+        nn.init.zeros_(self.freq_head.bias)
+        nn.init.xavier_uniform_(self.freq_head.weight, gain=0.1)
+
+        # Q head: single linear + log-space ste_clamp → exp
+        self.q_head = nn.Linear(hidden_dim, 1)
+
+        # Type path: centered spectral-shape evidence plus the learned trunk.
+        self.type_mel_proj = (
+            nn.Sequential(
+                nn.Conv1d(1, 32, kernel_size=15, stride=4, padding=7),
+                nn.GELU(),
+                nn.Conv1d(32, mel_hidden_dim, kernel_size=7, stride=2, padding=3),
+                nn.GELU(),
+                nn.AdaptiveAvgPool1d(1),
+                nn.Flatten(),
+                nn.Linear(mel_hidden_dim, mel_hidden_dim),
+                nn.GELU(),
+            )
+            if n_mels > 0
+            else None
+        )
+        self.band_mel_encoder = (
+            nn.Sequential(
+                nn.Conv1d(1, 32, kernel_size=15, padding=7),
+                nn.GELU(),
+                nn.Conv1d(32, mel_hidden_dim, kernel_size=7, padding=3),
+                nn.GELU(),
+            )
+            if n_mels > 0
+            else None
+        )
+        self.band_mel_query = (
+            nn.Linear(hidden_dim, mel_hidden_dim) if n_mels > 0 else None
+        )
+        self.band_mel_value = (
+            nn.Conv1d(mel_hidden_dim, mel_hidden_dim, kernel_size=1)
+            if n_mels > 0
+            else None
+        )
+        self.band_mel_norm = (
+            nn.LayerNorm(mel_hidden_dim) if n_mels > 0 else None
+        )
+        self.type_fusion_proj = (
+            nn.Sequential(
+                nn.Linear(hidden_dim + mel_hidden_dim, hidden_dim),
+                nn.GELU(),
+            )
+            if n_mels > 0
+            else None
+        )
+
+        # Gain path: separate auxiliary spectral branch so gain gradients do not
+        # need to repurpose the type branch.
+        self.gain_mel_proj = (
+            nn.Sequential(
+                nn.Conv1d(1, 32, kernel_size=15, stride=4, padding=7),
+                nn.GELU(),
+                nn.Conv1d(32, mel_hidden_dim, kernel_size=7, stride=2, padding=3),
+                nn.GELU(),
+                nn.AdaptiveAvgPool1d(1),
+                nn.Flatten(),
+                nn.Linear(mel_hidden_dim, mel_hidden_dim),
+                nn.GELU(),
+            )
+            if n_mels > 0
+            else None
+        )
+        self.gain_band_mel_encoder = (
+            nn.Sequential(
+                nn.Conv1d(1, 32, kernel_size=15, padding=7),
+                nn.GELU(),
+                nn.Conv1d(32, mel_hidden_dim, kernel_size=7, padding=3),
+                nn.GELU(),
+            )
+            if n_mels > 0
+            else None
+        )
+        self.gain_band_mel_query = (
+            nn.Linear(hidden_dim, mel_hidden_dim) if n_mels > 0 else None
+        )
+        self.gain_band_mel_value = (
+            nn.Conv1d(mel_hidden_dim, mel_hidden_dim, kernel_size=1)
+            if n_mels > 0
+            else None
+        )
+        self.gain_band_mel_norm = (
+            nn.LayerNorm(mel_hidden_dim) if n_mels > 0 else None
+        )
+        self.gain_context_proj = (
+            nn.Sequential(
+                nn.Linear(hidden_dim + mel_hidden_dim, hidden_dim),
+                nn.GELU(),
+            )
+            if n_mels > 0
+            else None
+        )
+
+        type_input_dim = hidden_dim + 3
+        self.type_head = nn.Sequential(
             nn.Linear(type_input_dim, 128),
-            nn.LayerNorm(128),
-            nn.ReLU(),
-            nn.Dropout(0.2),
-            nn.Linear(128, 128),
             nn.ReLU(),
             nn.Dropout(0.1),
             nn.Linear(128, 64),
             nn.ReLU(),
             nn.Linear(64, num_filter_types),
         )
-
-        # Gumbel-Softmax temperature
-        self.register_buffer("gumbel_temperature", torch.tensor(1.0))
-        self.min_tau = 0.1
-
-        # --- Frequency: attention over position-aware CNN on mel profile ---
-        self.use_mel_profile = n_mels > 0
-        if self.use_mel_profile:
-            log_f_min, log_f_max = math.log(20.0), math.log(20000.0)
-            log_freq_coord = torch.linspace(log_f_min, log_f_max, n_mels).view(1, 1, -1)
-            self.register_buffer("log_freq_coord", log_freq_coord)
-
-            if n_mels > 512:
-                downsample_ratio = max(1, n_mels // 256)
-                kernel = downsample_ratio * 2 + 1
-                stride = downsample_ratio
-                padding = downsample_ratio
-                self.input_downsample = nn.Sequential(
-                    nn.Conv1d(2, 2, kernel_size=kernel, stride=stride, padding=padding),
-                    nn.ReLU(),
-                )
-                self._downsampled_bins = (n_mels + stride - 1) // stride
-            else:
-                self.input_downsample = None
-                self._downsampled_bins = n_mels
-
-            self.mel_cnn = nn.Sequential(
-                nn.Conv1d(2, cnn_channels, kernel_size=7, padding=3),
-                nn.ReLU(),
-                nn.Conv1d(cnn_channels, cnn_channels, kernel_size=5, padding=2),
-                nn.ReLU(),
+        with torch.no_grad():
+            self.type_head[-1].bias.copy_(
+                torch.log(torch.tensor(DEFAULT_TYPE_PRIORS[:num_filter_types]))
             )
-            self.mel_cnn_dilated = nn.Sequential(
-                nn.Conv1d(2, cnn_channels, kernel_size=5, padding=8, dilation=4),
-                nn.ReLU(),
-                nn.Conv1d(
-                    cnn_channels, cnn_channels, kernel_size=3, padding=8, dilation=8
-                ),
-                nn.ReLU(),
-            )
-            self.cnn_merge = nn.Conv1d(cnn_channels * 2, cnn_channels, kernel_size=1)
+        self.register_buffer(
+            "gainful_type_mask",
+            torch.tensor(FILTER_GAINFUL_MASK, dtype=torch.float32),
+        )
+        self.register_buffer(
+            "type_log_f_min",
+            torch.tensor(
+                [bounds[0] for bounds in FILTER_LOG_FREQ_BOUNDS], dtype=torch.float32
+            ),
+        )
+        self.register_buffer(
+            "type_log_f_max",
+            torch.tensor(
+                [bounds[1] for bounds in FILTER_LOG_FREQ_BOUNDS], dtype=torch.float32
+            ),
+        )
 
-            self.query_proj = nn.Linear(hidden_dim, cnn_channels)
-            mel_pos = torch.linspace(0, 1, self._downsampled_bins)
-            centers = torch.linspace(0.15, 0.85, num_bands)
-            gaussian_init = -0.5 * (mel_pos.unsqueeze(0) - centers.unsqueeze(1)) ** 2
-            self.attn_position_bias = nn.Parameter(gaussian_init)
-            self.register_buffer("attn_temperature", torch.tensor(0.5))
+    def _center_mel_profile(self, mel_profile):
+        if mel_profile is None:
+            return None
+        return mel_profile - mel_profile.mean(dim=-1, keepdim=True)
 
-        # Fallback frequency: sigmoid regression
-        self.freq_fallback = nn.Linear(hidden_dim, 1)
-        uniform_raw = torch.linspace(0.1, 0.9, num_bands)
-        self.register_buffer("freq_prior_raw", uniform_raw)
-        self.freq_prior_scale = nn.Parameter(torch.tensor(1.0))
+    def _build_band_context(
+        self,
+        trunk_out,
+        mel_profile,
+        global_proj,
+        local_encoder,
+        band_query,
+        band_value,
+        band_norm,
+    ):
+        if global_proj is None or mel_profile is None:
+            return None
 
-        # Direct frequency regression (parallel to attention)
-        self.freq_direct = nn.Linear(hidden_dim, 1)
-        self.freq_blend_weight = nn.Parameter(torch.tensor(0.0))
+        global_mel_feat = global_proj(mel_profile.unsqueeze(1))
 
-        # Init
-        nn.init.xavier_uniform_(self.trunk.weight, gain=2.0)
-        nn.init.zeros_(self.trunk.bias)
-        nn.init.xavier_uniform_(self.gain_mlp[0].weight)  # gain_mlp first Linear
-        nn.init.zeros_(self.gain_mlp[0].bias)
-        nn.init.xavier_uniform_(self.gain_mlp[2].weight)  # gain_mlp last Linear
-        nn.init.zeros_(self.gain_mlp[2].bias)
-        # Q MLP initialization (3-layer, matching gain head pattern)
-        nn.init.xavier_uniform_(self.q_mlp[0].weight)
-        nn.init.zeros_(self.q_mlp[0].bias)
-        nn.init.xavier_uniform_(self.q_mlp[2].weight)
-        nn.init.zeros_(self.q_mlp[2].bias)
-        nn.init.xavier_uniform_(self.q_mlp[4].weight)  # Third Linear layer
-        nn.init.zeros_(self.q_mlp[4].bias)
-        if self.use_mel_profile:
-            for module in [self.mel_cnn, self.mel_cnn_dilated]:
-                for m in module.modules():
-                    if isinstance(m, nn.Conv1d):
-                        nn.init.xavier_uniform_(m.weight, gain=2.0)
-                        if m.bias is not None:
-                            nn.init.zeros_(m.bias)
-            nn.init.xavier_uniform_(self.cnn_merge.weight, gain=2.0)
-            nn.init.zeros_(self.cnn_merge.bias)
-            nn.init.xavier_uniform_(self.query_proj.weight, gain=1.0)
-            nn.init.zeros_(self.query_proj.bias)
+        if local_encoder is None:
+            return global_mel_feat.unsqueeze(1).expand(-1, self.num_bands, -1)
 
-        # Init classification head (3-layer MLP)
-        for module in self.classification_head:
-            if isinstance(module, nn.Linear):
-                nn.init.xavier_uniform_(module.weight, gain=1.0)
-                nn.init.zeros_(module.bias)
+        local_mel = local_encoder(mel_profile.unsqueeze(1))
+        local_values = band_value(local_mel).transpose(1, 2)
+        band_query = band_query(trunk_out)
+        attn_scores = torch.einsum("bnc,bmc->bnm", band_query, local_values)
+        attn_scores = attn_scores / math.sqrt(local_values.shape[-1])
+        attn = torch.softmax(attn_scores, dim=-1)
+        local_mel_feat = torch.einsum("bnm,bmc->bnc", attn, local_values)
+        local_mel_feat = band_norm(local_mel_feat)
+        return local_mel_feat + global_mel_feat.unsqueeze(1)
 
-    def forward(self, embedding, mel_profile=None, hard_types=False):
-        trunk_out = self.trunk(embedding)
+    def _build_type_mel_context(self, trunk_out, mel_profile):
+        return self._build_band_context(
+            trunk_out,
+            mel_profile,
+            self.type_mel_proj,
+            self.band_mel_encoder,
+            self.band_mel_query,
+            self.band_mel_value,
+            self.band_mel_norm,
+        )
+
+    def _build_gain_aux(self, trunk_out, mel_profile):
+        return self._build_band_context(
+            trunk_out,
+            mel_profile,
+            self.gain_mel_proj,
+            self.gain_band_mel_encoder,
+            self.gain_band_mel_query,
+            self.gain_band_mel_value,
+            self.gain_band_mel_norm,
+        )
+
+    def _compute_shelf_features(self, mel_profile: torch.Tensor) -> torch.Tensor:
+        """
+        Compute fixed (non-learned) scalar features that discriminate shelf
+        filter types from peaking filters.
+
+        A lowshelf boosts/cuts all frequencies below fc monotonically — the
+        low-band mean is systematically higher/lower than the high-band mean.
+        A peaking filter creates a localized bump with similar energy on both
+        sides. These three statistics make that distinction directly observable
+        without relying on learned feature extraction.
+
+        Args:
+            mel_profile: (B, n_mels) — raw (not centered) mel energy profile
+
+        Returns:
+            shelf_feats: (B, 3) — [lo_ratio, hi_ratio, tilt_slope]
+                lo_ratio: log(mean(mel[0:N]) / mean(mel[N:])) — bass tilt
+                hi_ratio: log(mean(mel[-N:]) / mean(mel[:-N])) — treble tilt
+                tilt_slope: linear regression slope across mel bands (normalized)
+        """
+        B, n_mels = mel_profile.shape
+        n = min(self.n_shelf_bands, n_mels // 4)  # guard: never exceed 25% of bands
+
+        # Use absolute value so negative mel values (e.g. log-mel can be negative)
+        # do not produce NaN in the log ratio. Energy magnitude is what matters.
+        mel_abs = mel_profile.abs()
+
+        # Low-frequency energy ratio: log(E_low / E_high)
+        lo_mean = mel_abs[:, :n].mean(dim=-1, keepdim=True)           # (B, 1)
+        hi_mean = mel_abs[:, n:].mean(dim=-1, keepdim=True)           # (B, 1)
+        lo_ratio = torch.log((lo_mean + 1e-6) / (hi_mean + 1e-6))     # (B, 1)
+
+        # High-frequency energy ratio: log(E_high_tail / E_rest)
+        hi_tail = mel_abs[:, -n:].mean(dim=-1, keepdim=True)          # (B, 1)
+        rest = mel_abs[:, :-n].mean(dim=-1, keepdim=True)             # (B, 1)
+        hi_ratio = torch.log((hi_tail + 1e-6) / (rest + 1e-6))        # (B, 1)
+
+        # Spectral tilt slope: linear regression coefficient across mel bands
+        # x = normalized band indices in [-1, 1]; y = mel_profile
+        x = torch.linspace(-1.0, 1.0, n_mels, device=mel_profile.device,
+                           dtype=mel_profile.dtype).unsqueeze(0)       # (1, n_mels)
+        x_centered = x - x.mean()
+        denom = (x_centered ** 2).sum()
+        y_centered = mel_profile - mel_profile.mean(dim=-1, keepdim=True)
+        slope = (x_centered * y_centered).sum(dim=-1, keepdim=True) / (denom + 1e-8)  # (B, 1)
+
+        # Clamp all features to reasonable range to avoid exploding values
+        lo_ratio = torch.clamp(lo_ratio, -5.0, 5.0)
+        hi_ratio = torch.clamp(hi_ratio, -5.0, 5.0)
+        slope = torch.clamp(slope, -5.0, 5.0)
+
+        return torch.cat([lo_ratio, hi_ratio, slope], dim=-1)  # (B, 3)
+
+    def summarize_gain_aux_features(self, mel_profile):
+        if self.gain_mel_proj is None or mel_profile is None:
+            return None
+        centered = self._center_mel_profile(mel_profile)
+        return self.gain_mel_proj(centered.unsqueeze(1))
+
+    def forward(
+        self,
+        embedding,
+        mel_profile=None,
+        hard_types=False,
+        return_aux=False,
+    ):
+        trunk_out = self.trunk(embedding)  # (B, num_bands * 64)
         trunk_out = trunk_out.view(-1, self.num_bands, 64)
-        trunk_out = F.relu(trunk_out)
-        trunk_out = self.dropout(trunk_out)
+        mel_profile_centered = self._center_mel_profile(mel_profile)
 
-        attn = None
-        gain_db = None
-        freq = None
+        type_mel_context = self._build_type_mel_context(trunk_out, mel_profile_centered)
+        gain_aux = self._build_gain_aux(trunk_out, mel_profile_centered)
 
-        if self.use_mel_profile and mel_profile is not None:
-            n_mels = mel_profile.shape[-1]
-            assert n_mels == self.log_freq_coord.shape[-1], (
-                f"mel_profile has {n_mels} bins but parameter head expects {self.log_freq_coord.shape[-1]}"
+        if type_mel_context is not None and self.type_fusion_proj is not None:
+            type_input = self.type_fusion_proj(
+                torch.cat([trunk_out, type_mel_context], dim=-1)
             )
-
-            # Normalize mel profile (std-only to preserve absolute level for gain sign)
-            mp_mean = mel_profile.mean(dim=-1, keepdim=True)
-            mp_std = mel_profile.std(dim=-1, keepdim=True).clamp(min=1e-4)
-            mel_profile_normed = (mel_profile - mp_mean) / mp_std
-
-            # Build CNN input
-            pos = self.log_freq_coord.expand(embedding.shape[0], -1, -1)
-            cnn_in = torch.cat([mel_profile_normed.unsqueeze(1), pos], dim=1)
-
-            if self.input_downsample is not None:
-                cnn_in = self.input_downsample(cnn_in)
-
-            cnn_local = self.mel_cnn(cnn_in)
-            cnn_wide = self.mel_cnn_dilated(cnn_in)
-            cnn_feat = self.cnn_merge(torch.cat([cnn_local, cnn_wide], dim=1))
-
-            # Attention frequency
-            queries = self.query_proj(trunk_out)
-            content = torch.einsum("bnf,bfm->bnm", queries, cnn_feat)
-            attn_logits = content + self.attn_position_bias.unsqueeze(0)
-            attn = F.softmax(
-                attn_logits.float() / self.attn_temperature.clamp(min=0.01).float(),
-                dim=-1,
-            ).to(attn_logits.dtype)
-
-            n_bins = cnn_feat.shape[-1]
-            mel_log_freqs = torch.linspace(
-                self.log_f_min, self.log_f_max, n_bins, device=mel_profile.device
-            )
-            log_freq_attn = (attn * mel_log_freqs.view(1, 1, n_bins)).sum(-1)
-            freq_attn = torch.exp(log_freq_attn)
-
-            # Direct regression frequency
-            raw_freq_direct = self.freq_direct(trunk_out).squeeze(-1)
-            prior = self.freq_prior_scale * self.freq_prior_raw
-            blended_direct = raw_freq_direct + prior.unsqueeze(0)
-            log_freq_direct = (
-                torch.sigmoid(blended_direct) * (self.log_f_max - self.log_f_min)
-                + self.log_f_min
-            )
-            freq_direct = torch.exp(log_freq_direct)
-
-            alpha = torch.sigmoid(self.freq_blend_weight)
-            freq = alpha * freq_attn + (1 - alpha) * freq_direct
-            freq = torch.nan_to_num(freq, nan=1000.0, posinf=20000.0, neginf=20.0)
-            freq = freq.clamp(min=20.0, max=20000.0)
-
-            # --- Gain: MLP from trunk embedding + ste_clamp (D-01: mel-residual removed) ---
-            gain_db = self.gain_mlp(trunk_out).squeeze(-1) * self.gain_output_scale
-            gain_db = torch.nan_to_num(gain_db, nan=0.0, posinf=24.0, neginf=-24.0)
-            gain_db = ste_clamp(gain_db, -24.0, 24.0)
-
-        else:
-            raw_freq = self.freq_fallback(trunk_out).squeeze(-1)
-            prior = self.freq_prior_scale * self.freq_prior_raw
-            blended = raw_freq + prior.unsqueeze(0)
-            log_freq = (
-                torch.sigmoid(blended) * (self.log_f_max - self.log_f_min)
-                + self.log_f_min
-            )
-            freq = torch.exp(log_freq)
-
-            # No mel profile: use gain_mlp (same path as mel case, D-01: single clean gain path)
-            gain_db = self.gain_mlp(trunk_out).squeeze(-1) * self.gain_output_scale
-            gain_db = torch.nan_to_num(gain_db, nan=0.0, posinf=24.0, neginf=-24.0)
-            gain_db = ste_clamp(gain_db, -24.0, 24.0)
-
-        # Q from 3-layer MLP: log-linear output + STE clamp (per D-01, D-02)
-        # STE clamp gives identity gradients within [log(0.1), log(10.0)] bounds,
-        # unlike sigmoid->exp which saturates at extremes.
-        q_log = self.q_mlp(trunk_out).squeeze(-1)
-        q_log = torch.nan_to_num(q_log, nan=0.0, posinf=math.log(10.0), neginf=math.log(0.1))
-        q_log = ste_clamp(q_log, math.log(0.1), math.log(10.0))
-        q = torch.exp(q_log)  # Convert back to Q space for downstream consumption
-
-        # Type classification: trunk + mel spectral shape
-        if self.type_mel_proj is not None and mel_profile is not None:
-            mel_type_feat = self.type_mel_proj(mel_profile.unsqueeze(1))
-            mel_type_feat = mel_type_feat.unsqueeze(1).expand(-1, self.num_bands, -1)
-            type_input = torch.cat([trunk_out, mel_type_feat], dim=-1)
         else:
             type_input = trunk_out
-        type_logits = self.classification_head(type_input)
-
-        if self.training and not hard_types:
-            # Generate Gumbel noise in float32 to avoid bf16 underflow:
-            # bf16 normal min ~1.2e-7, so log(exp_draw) can produce -inf
-            gumbels_fp32 = (
-                -torch.empty_like(type_logits, dtype=torch.float32).exponential_().log()
-            )
-            gumbels = gumbels_fp32.clamp(-10.0, 10.0).to(type_logits.dtype)
-            tau = torch.clamp(self.gumbel_temperature, min=self.min_tau)
-            type_probs = ((type_logits + gumbels) / tau).softmax(dim=-1)
+        if mel_profile is not None and self.n_shelf_bands > 0:
+            shelf_feats = self._compute_shelf_features(mel_profile)  # (B, 3)
+            # Expand to per-band: (B, 3) -> (B, num_bands, 3)
+            shelf_feats_expanded = shelf_feats.unsqueeze(1).expand(-1, self.num_bands, -1)
+            type_input_with_shelf = torch.cat([type_input, shelf_feats_expanded], dim=-1)
         else:
-            type_probs = F.softmax(type_logits, dim=-1)
+            # Pad with zeros if mel_profile unavailable (keeps type_head input dim consistent)
+            shelf_feats_expanded = torch.zeros(
+                type_input.shape[0], self.num_bands, 3,
+                device=type_input.device, dtype=type_input.dtype
+            )
+            type_input_with_shelf = torch.cat([type_input, shelf_feats_expanded], dim=-1)
+        type_logits = self.type_head(type_input_with_shelf)
+        type_probs = F.softmax(type_logits, dim=-1)
         filter_type = type_logits.argmax(dim=-1)
+        type_probs_for_params = type_probs
+
+        if gain_aux is not None and self.gain_context_proj is not None:
+            gain_hidden = self.gain_context_proj(torch.cat([trunk_out, gain_aux], dim=-1))
+        else:
+            gain_hidden = trunk_out
+        gain_raw = self.gain_head(gain_hidden).squeeze(-1)
+        gain_db_raw = ste_clamp(gain_raw * 24.0, -24.0, 24.0)
+        if hard_types:
+            # Inference: hard-zero HP/LP gain via argmax type mask.
+            gain_db = gain_db_raw * self.gainful_type_mask[filter_type]
+        else:
+            # Training: do NOT apply soft gain mask.
+            # Soft mask = gain_db_raw * (sum of gainful type probs) chains
+            # ∂L/∂gain_db_raw = gain_mask * ∂L/∂gain_db.  When the type head
+            # is wrong (e.g. predicts HP for a peaking band), gain_mask≈0 and
+            # gain_head gets near-zero gradient — it cannot learn sign or scale.
+            # The zero-gain constraint for HP/LP is handled explicitly by
+            # lambda_gain_zero in SimplifiedEQLoss instead.
+            gain_db = gain_db_raw
+
+        if type_mel_context is not None and self.freq_context_proj is not None:
+            freq_hidden = self.freq_context_proj(
+                torch.cat([trunk_out, type_mel_context], dim=-1)
+            )
+        else:
+            freq_hidden = trunk_out
+        freq_unit = torch.sigmoid(self.freq_head(freq_hidden).squeeze(-1))
+        if self.type_conditioned_frequency:
+            if hard_types:
+                log_f_min = self.type_log_f_min[filter_type]
+                log_f_max = self.type_log_f_max[filter_type]
+            else:
+                log_f_min = (type_probs_for_params * self.type_log_f_min.view(1, 1, -1)).sum(dim=-1)
+                log_f_max = (type_probs_for_params * self.type_log_f_max.view(1, 1, -1)).sum(dim=-1)
+        else:
+            log_f_min = torch.full_like(freq_unit, self.log_f_min)
+            log_f_max = torch.full_like(freq_unit, self.log_f_max)
+        log_freq = log_f_min + freq_unit * (log_f_max - log_f_min)
+        freq = torch.exp(log_freq)
+
+        q_log = self.q_head(trunk_out).squeeze(-1)
+        q_log = ste_clamp(q_log, math.log(0.1), math.log(10.0))
+        q = torch.exp(q_log)
+
+        if return_aux:
+            aux = {
+                "mel_profile_centered": mel_profile_centered,
+                "gain_aux_summary": (
+                    gain_aux.mean(dim=1) if gain_aux is not None else None
+                ),
+            }
+            return gain_db, freq, q, type_logits, type_probs, filter_type, aux
 
         return gain_db, freq, q, type_logits, type_probs, filter_type

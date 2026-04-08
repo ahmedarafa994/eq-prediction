@@ -39,7 +39,7 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 from torch.utils.checkpoint import checkpoint
-from differentiable_eq import DifferentiableBiquadCascade, MultiTypeEQParameterHead
+from differentiable_eq import DifferentiableBiquadCascade, MultiTypeEQParameterHead, NUM_FILTER_TYPES
 
 # Fused Triton kernels disabled: runtime compilation fails on this Triton version
 # (tl.math.tanh AttributeError). Use native PyTorch ops instead.
@@ -104,7 +104,7 @@ class SpectralConvBlock2D(nn.Module):
             dilation=dilation,
             padding=0,  # manual padding below
         )
-        self.bn = nn.BatchNorm2d(out_channels, momentum=0.05)
+        self.norm = nn.LayerNorm([out_channels])
 
     def forward(self, x):
         """
@@ -112,7 +112,12 @@ class SpectralConvBlock2D(nn.Module):
         returns: (B, C_out, n_mels, T)  -- same spatial dims via symmetric-freq / causal-time padding
         """
         x = F.pad(x, (self.time_pad, 0, self.freq_pad, self.freq_pad))
-        return F.gelu(self.bn(self.conv(x)))
+        x = self.conv(x)
+        # LayerNorm over channel dim: (B, C, F, T) → norm over C, per-sample
+        # Replaces BatchNorm which memorizes training-set statistics and causes
+        # train/val distribution shift (the root cause of val loss plateauing).
+        x = self.norm(x.permute(0, 2, 3, 1)).permute(0, 3, 1, 2)
+        return F.gelu(x)
 
 
 class SpectralFrontend2D(nn.Module):
@@ -208,14 +213,17 @@ class FrequencyPreservingTCNBlock(nn.Module):
     sub-band structure.  Includes residual and skip connections.
     """
 
-    def __init__(self, channels, num_groups, kernel_size=3, dilation=1):
+    def __init__(self, channels, num_groups, kernel_size=3, dilation=1, dropout_p=0.1):
         super().__init__()
         self.gated_block = GroupedGatedBlock(
             channels, num_groups, kernel_size, dilation
         )
         self.residual_conv = nn.Conv1d(channels, channels, 1)
         self.skip_conv = nn.Conv1d(channels, channels, 1)
-        self.bn = nn.BatchNorm1d(channels, momentum=0.05)
+        self.norm = nn.LayerNorm(channels)
+        # Dropout after normalization on the residual path.  Applied only during training
+        # (nn.Dropout is a no-op in eval mode), so streaming inference is unaffected.
+        self.dropout = nn.Dropout(p=dropout_p)
 
     def forward(self, x):
         """
@@ -224,7 +232,7 @@ class FrequencyPreservingTCNBlock(nn.Module):
         """
         gated = self.gated_block(x)
         skip = self.skip_conv(gated)
-        residual = self.bn(self.residual_conv(x) + gated)
+        residual = self.dropout(self.norm((self.residual_conv(x) + gated).transpose(1, 2)).transpose(1, 2))
         return residual, skip
 
 
@@ -247,6 +255,7 @@ class FrequencyPreservingTCN(nn.Module):
         num_groups=8,
         kernel_size=3,
         base_dilation=1,
+        dropout_p=0.1,
         use_gradient_checkpointing=False,
     ):
         super().__init__()
@@ -254,7 +263,7 @@ class FrequencyPreservingTCN(nn.Module):
         for i in range(num_blocks):
             dilation = base_dilation * (2**i)
             self.blocks.append(
-                FrequencyPreservingTCNBlock(channels, num_groups, kernel_size, dilation)
+                FrequencyPreservingTCNBlock(channels, num_groups, kernel_size, dilation, dropout_p=dropout_p)
             )
         self.use_gradient_checkpointing = use_gradient_checkpointing
 
@@ -315,9 +324,6 @@ class AttentionTemporalPool(nn.Module):
         if HAS_FUSED_KERNELS and fused_attention_pool_torch is not None:
             return fused_attention_pool_torch(x, self.query, self.scale)
 
-        if HAS_FUSED_KERNELS and fused_attention_pool_torch is not None:
-            return fused_attention_pool_torch(x, self.query, self.scale)
-
         # Transpose to (B, T, D) for linear projection
         x_t = x.permute(0, 2, 1)  # (B, T, D)
         keys = self.key_proj(x_t)  # (B, T, D)
@@ -374,6 +380,8 @@ class FrequencyAwareEncoder(nn.Module):
         spectral_channels=64,
         use_gradient_checkpointing=False,
         use_activation_quantization=False,
+        dropout_p=0.1,
+        mel_noise_std=0.0,
     ):
         super().__init__()
         self.n_mels = n_mels
@@ -385,6 +393,8 @@ class FrequencyAwareEncoder(nn.Module):
         self.num_freq_groups = num_freq_groups
         self.use_gradient_checkpointing = use_gradient_checkpointing
         self.use_activation_quantization = use_activation_quantization
+        self.dropout_p = dropout_p
+        self.mel_noise_std = mel_noise_std
 
         # --- Stage 1: 2D spectral feature extraction ---
         self.spectral_frontend = SpectralFrontend2D(n_mels, spectral_channels)
@@ -403,6 +413,7 @@ class FrequencyAwareEncoder(nn.Module):
                     num_blocks,
                     num_freq_groups,
                     kernel_size,
+                    dropout_p=dropout_p,
                     use_gradient_checkpointing=use_gradient_checkpointing,
                 )
             )
@@ -458,9 +469,13 @@ class FrequencyAwareEncoder(nn.Module):
         """
         B, n_mels, T = mel_frames.shape
 
-        # --- Spectral residual bypass: mean mel profile ---
-        # This ensures the param head always has spectral information
-        # even if the encoder collapses.  Computed from raw input.
+        # --- Mel noise injection: Gaussian noise on input for regularization ---
+        if self.training and self.mel_noise_std > 0:
+            mel_frames = mel_frames + torch.randn_like(mel_frames) * self.mel_noise_std
+
+        # --- Spectral bypass: retain the mean profile for the parameter head.
+        # The head recenters this profile before the auxiliary readouts so
+        # global loudness shifts do not masquerade as filter shape.
         mel_profile = mel_frames.mean(dim=-1)  # (B, n_mels)
 
         # --- Stage 1: 2D spectral features ---
@@ -528,6 +543,10 @@ class StreamingTCNModel(nn.Module):
         n_fft=2048,
         kernel_size=3,
         num_filter_types=5,
+        type_conditioned_frequency=True,
+        dropout=0.1,
+        mel_noise_std=0.0,
+        n_shelf_bands=16,
     ):
         super().__init__()
         self.n_mels = n_mels
@@ -535,6 +554,7 @@ class StreamingTCNModel(nn.Module):
         self.num_bands = num_bands
         self.sample_rate = sample_rate
         self.n_fft = n_fft
+        self.n_shelf_bands = n_shelf_bands
 
         # Number of frequency groups for grouped convolutions
         # Use 8 groups by default; this keeps ~16 mel bins per group
@@ -554,6 +574,8 @@ class StreamingTCNModel(nn.Module):
             num_stacks=num_stacks,
             kernel_size=kernel_size,
             num_freq_groups=num_freq_groups,
+            dropout_p=dropout,
+            mel_noise_std=mel_noise_std,
         )
 
         # Parameter head -- receives both embedding AND mel_profile
@@ -562,6 +584,8 @@ class StreamingTCNModel(nn.Module):
             num_bands,
             num_filter_types=num_filter_types,
             n_mels=n_mels,
+            type_conditioned_frequency=type_conditioned_frequency,
+            n_shelf_bands=n_shelf_bands,
         )
 
         # DSP layer
@@ -603,13 +627,25 @@ class StreamingTCNModel(nn.Module):
             return torch.zeros(embedding.shape[-1], device=embedding.device)
         return embedding.var(dim=0)
 
-    def forward(self, mel_frames, refine: bool = False):
+    def load_compatible_state_dict(self, state_dict):
+        """Load only checkpoint tensors whose keys and shapes still match."""
+        current_state = self.state_dict()
+        compatible_state = {}
+        skipped = []
+        for key, value in state_dict.items():
+            if key in current_state and current_state[key].shape == value.shape:
+                compatible_state[key] = value
+            else:
+                skipped.append(key)
+        result = self.load_state_dict(compatible_state, strict=False)
+        return result, skipped
+
+    def forward(self, mel_frames, hard_types=None, force_soft_response=False):
         """
         Batch-mode forward pass for training.
 
         Args:
             mel_frames: (B, n_mels, T) -- full mel-spectrogram sequence
-            refine: if True, runs MC-Dropout confidence + gradient refinement
 
         Returns:
             dict with:
@@ -621,31 +657,41 @@ class StreamingTCNModel(nn.Module):
                 embedding: (B, embedding_dim)
                 mel_profile: (B, n_mels) -- spectral bypass
                 attn_weights: (B, T) -- temporal attention weights
-                [refine=True only]
-                confidence: dict of per-band confidence tensors
-                refined_params: (gain_db, freq, q) post-refinement
-                refinement_loss_history: list of loss values per step
         """
+        if hard_types is None:
+            hard_types = not self.training
+
         # 1. Encode -- now returns mel_profile and attn_weights too
         embedding, mel_profile, skip_sum, attn_weights = self.encoder(mel_frames)
 
         # 2. Predict parameters -- pass mel_profile to param head
-        #    This is the critical change: the param head now receives
-        #    spectral information directly via the bypass, ensuring it
-        #    can read gain/frequency even if the encoder embedding is poor.
-        gain_db, freq, q, type_logits, type_probs, filter_type = self.param_head(
-            embedding, mel_profile=mel_profile, hard_types=not self.training
+        gain_db, freq, q, type_logits, type_probs, filter_type, param_aux = self.param_head(
+            embedding,
+            mel_profile=mel_profile,
+            hard_types=hard_types,
+            return_aux=True,
         )
 
         # 3. Compute frequency response
-        # Always compute hard-typed H_mag for hmag_loss (prevents soft shortcut)
-        H_mag_hard = self.dsp_cascade(gain_db, freq, q, self.n_fft, filter_type)
-        if self.training:
-            H_mag = self.dsp_cascade.forward_soft(
-                gain_db, freq, q, type_probs, self.n_fft
-            )
+        H_mag = self.dsp_cascade(gain_db, freq, q, self.n_fft, filter_type)
+
+        # Soft H_mag path: differentiable w.r.t. type_logits (used for spectral loss during training)
+        if self.training or force_soft_response:
+            type_probs_soft = F.softmax(type_logits, dim=-1)  # (B, N, 5)
+            H_per_type = []
+            for t in range(NUM_FILTER_TYPES):
+                ft = torch.full_like(filter_type, t)
+                b0, b1, b2, a1, a2 = self.dsp_cascade.compute_biquad_coeffs_multitype(
+                    gain_db, freq, q, ft
+                )
+                H_t = self.dsp_cascade.freq_response(b0, b1, b2, a1, a2, self.n_fft)  # (B, N, F)
+                H_per_type.append(H_t)
+            H_stack = torch.stack(H_per_type, dim=2)  # (B, N, 5, F)
+            weights = type_probs_soft.unsqueeze(-1)     # (B, N, 5, 1)
+            H_soft_bands = (H_stack * weights).sum(dim=2)  # (B, N, F)
+            H_mag_soft = torch.clamp(H_soft_bands.prod(dim=1), min=1e-6, max=1e4)  # (B, F)
         else:
-            H_mag = H_mag_hard
+            H_mag_soft = H_mag
 
         result = {
             "params": (gain_db, freq, q),
@@ -653,198 +699,15 @@ class StreamingTCNModel(nn.Module):
             "type_probs": type_probs,
             "filter_type": filter_type,
             "H_mag": H_mag,
-            "H_mag_hard": H_mag_hard,
+            "H_mag_soft": H_mag_soft,
             "embedding": embedding,
             "mel_profile": mel_profile,
+            "mel_profile_centered": param_aux.get("mel_profile_centered"),
+            "gain_aux_summary": param_aux.get("gain_aux_summary"),
             "attn_weights": attn_weights,
         }
 
-        # Phase 5: refine=True triggers MC-Dropout confidence then gradient refinement
-        if refine:
-            mc_cfg = self._refinement_config()
-            gain_stack, freq_stack, q_stack, type_probs_stack = self._run_mc_dropout_passes(
-                mel_frames, n_passes=mc_cfg["mc_dropout_passes"]
-            )
-            result["confidence"] = self._compute_confidence(
-                type_probs_stack, gain_stack, freq_stack, q_stack
-            )
-            refine_out = self.refine_forward(
-                mel_frames,
-                refine_steps=mc_cfg["grad_refine_steps"],
-                refine_lr=mc_cfg["grad_lr"],
-            )
-            result["refined_params"] = refine_out["refined_params"]
-            result["refinement_loss_history"] = refine_out["refinement_loss_history"]
-
         return result
-
-
-    def _refinement_config(self) -> dict:
-        """Return refinement hyperparameters from config if available, else defaults."""
-        defaults = {
-            "mc_dropout_passes": 5,
-            "grad_refine_steps": 5,
-            "grad_lr": 0.01,
-        }
-        try:
-            import yaml as _yaml, os as _os
-            cfg_path = _os.path.join(_os.path.dirname(__file__), "conf", "config.yaml")
-            with open(cfg_path) as f:
-                cfg = _yaml.safe_load(f)
-            ref = cfg.get("refinement", {})
-            return {
-                "mc_dropout_passes": ref.get("mc_dropout_passes", defaults["mc_dropout_passes"]),
-                "grad_refine_steps": ref.get("grad_refine_steps", defaults["grad_refine_steps"]),
-                "grad_lr": ref.get("grad_lr", defaults["grad_lr"]),
-            }
-        except Exception:
-            return defaults
-
-    def _run_mc_dropout_passes(
-        self, mel_frames: torch.Tensor, n_passes: int = 5
-    ) -> tuple:
-        """
-        Run N stochastic forward passes with dropout enabled for MC-Dropout.
-
-        BatchNorm layers stay in eval mode; only nn.Dropout modules are set to train mode.
-
-        Args:
-            mel_frames: (B, n_mels, T)
-            n_passes: number of stochastic forward passes (default: 5)
-
-        Returns:
-            gain_stack: (n_passes, B, num_bands)
-            freq_stack: (n_passes, B, num_bands)
-            q_stack: (n_passes, B, num_bands)
-            type_probs_stack: (n_passes, B, num_bands, num_filter_types)
-        """
-        self.eval()
-        for m in self.modules():
-            if isinstance(m, nn.Dropout):
-                m.train()
-
-        gain_preds, freq_preds, q_preds, type_probs_preds = [], [], [], []
-
-        with torch.no_grad():
-            for _ in range(n_passes):
-                out = self.forward(mel_frames, refine=False)
-                gain_db, freq, q = out["params"]
-                gain_preds.append(gain_db)
-                freq_preds.append(freq)
-                q_preds.append(q)
-                type_probs_preds.append(out["type_probs"])
-
-        self.eval()
-
-        return (
-            torch.stack(gain_preds, dim=0),
-            torch.stack(freq_preds, dim=0),
-            torch.stack(q_preds, dim=0),
-            torch.stack(type_probs_preds, dim=0),
-        )
-
-    def _compute_confidence(
-        self,
-        type_probs_stack: torch.Tensor,
-        gain_stack: torch.Tensor,
-        freq_stack: torch.Tensor,
-        q_stack: torch.Tensor,
-    ) -> dict:
-        """
-        Compute per-band confidence from MC-Dropout statistics.
-
-        Returns dict of tensors, each (B, num_bands):
-            type_entropy, gain_variance, freq_variance, q_variance, overall_confidence
-        """
-        import math
-
-        mean_type_probs = type_probs_stack.mean(0)
-        entropy = -(mean_type_probs * (mean_type_probs + 1e-8).log()).sum(-1)
-        max_entropy = math.log(type_probs_stack.shape[-1])
-        type_entropy = (entropy / max_entropy).clamp(0.0, 1.0)
-
-        gain_variance = gain_stack.var(0)
-        freq_log_variance = freq_stack.log().var(0)
-        q_log_variance = q_stack.log().var(0)
-
-        type_conf = 1.0 - type_entropy
-        gain_std = gain_variance.sqrt()
-        freq_log_std = freq_log_variance.sqrt()
-        q_log_std = q_log_variance.sqrt()
-        gain_conf = 1.0 / (1.0 + gain_std / 6.0)
-        freq_conf = 1.0 / (1.0 + freq_log_std / 0.5)
-        q_conf = 1.0 / (1.0 + q_log_std / 0.5)
-
-        overall_confidence = (
-            0.4 * type_conf +
-            0.2 * gain_conf +
-            0.2 * freq_conf +
-            0.2 * q_conf
-        ).clamp(0.0, 1.0)
-
-        return {
-            "type_entropy": type_entropy,
-            "gain_variance": gain_variance,
-            "freq_variance": freq_log_variance,
-            "q_variance": q_log_variance,
-            "overall_confidence": overall_confidence,
-        }
-
-    def _spectral_consistency_loss(
-        self, H_mag_pred: torch.Tensor, mel_profile: torch.Tensor
-    ) -> torch.Tensor:
-        n_fft_bins = H_mag_pred.shape[-1]
-        indices = torch.linspace(
-            0, n_fft_bins - 1, mel_profile.shape[-1],
-            device=H_mag_pred.device
-        ).long()
-        H_mag_mel = torch.log(H_mag_pred[:, indices].clamp(min=1e-6))
-        return torch.nn.functional.l1_loss(H_mag_mel, mel_profile)
-
-    def refine_forward(
-        self,
-        mel_frames: torch.Tensor,
-        refine_steps: int = 5,
-        refine_lr: float = 0.01,
-    ) -> dict:
-        self.eval()
-
-        with torch.no_grad():
-            out = self.forward(mel_frames)
-
-        gain_db_init, freq_init, q_init = out["params"]
-        filter_type = out["filter_type"] 
-        mel_profile = out["mel_profile"] 
-
-        gain_db = gain_db_init.detach().clone().requires_grad_(True)
-        freq = freq_init.detach().clone().requires_grad_(True)
-        q = q_init.detach().clone().requires_grad_(True)
-
-        optimizer = torch.optim.Adam([gain_db, freq, q], lr=refine_lr)
-
-        loss_history = []
-        for _ in range(refine_steps):
-            optimizer.zero_grad()
-
-            H_mag_pred = self.dsp_cascade(gain_db, freq, q, self.n_fft, filter_type)
-
-            loss = self._spectral_consistency_loss(H_mag_pred, mel_profile)
-            loss.backward()
-            optimizer.step()
-
-            loss_history.append(loss.item())
-
-            with torch.no_grad():
-                gain_db.clamp_(-24.0, 24.0)
-                freq.clamp_(20.0, 20000.0)
-                q.clamp_(0.1, 10.0)
-
-        return {
-            "refined_params": (gain_db.detach(), freq.detach(), q.detach()),
-            "initial_params": (gain_db_init, freq_init, q_init),
-            "filter_type": filter_type,
-            "refinement_loss_history": loss_history,
-        }
 
     def init_streaming(self, batch_size=1):
         """Initialize streaming state."""
@@ -923,8 +786,11 @@ class StreamingTCNModel(nn.Module):
         embedding = self.encoder.output_proj(pooled)
 
         # --- Predict parameters ---
-        gain_db, freq, q, type_logits, type_probs, filter_type = self.param_head(
-            embedding, mel_profile=mel_profile, hard_types=True
+        gain_db, freq, q, type_logits, type_probs, filter_type, param_aux = self.param_head(
+            embedding,
+            mel_profile=mel_profile,
+            hard_types=True,
+            return_aux=True,
         )
 
         H_mag = self.dsp_cascade(gain_db, freq, q, self.n_fft, filter_type)
@@ -937,6 +803,8 @@ class StreamingTCNModel(nn.Module):
             "H_mag": H_mag,
             "embedding": embedding,
             "mel_profile": mel_profile,
+            "mel_profile_centered": param_aux.get("mel_profile_centered"),
+            "gain_aux_summary": param_aux.get("gain_aux_summary"),
         }
 
         # Restore training mode if we forced eval for BatchNorm safety
