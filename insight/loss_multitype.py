@@ -77,13 +77,14 @@ class HungarianBandMatcher:
         """
         B, N = pred_gain.shape
 
-        # Expand for pairwise computation: (B, N, 1) vs (B, 1, N)
-        pg = pred_gain.unsqueeze(-1)  # (B, N, 1)
+        # Clamp inputs to prevent NaN/inf from propagating into the cost matrix
+        # (early training instability can produce non-finite predictions)
+        pg = torch.clamp(pred_gain.unsqueeze(-1), min=-100.0, max=100.0)  # (B, N, 1)
         tg = target_gain.unsqueeze(-2)  # (B, 1, N)
-        pf = pred_freq.unsqueeze(-1)
-        tf = target_freq.unsqueeze(-2)
-        pq = pred_q.unsqueeze(-1)
-        tq = target_q.unsqueeze(-2)
+        pf = torch.clamp(pred_freq.unsqueeze(-1), min=1.0, max=40000.0)
+        tf = torch.clamp(target_freq.unsqueeze(-2), min=1.0, max=40000.0)
+        pq = torch.clamp(pred_q.unsqueeze(-1), min=1e-4, max=100.0)
+        tq = torch.clamp(target_q.unsqueeze(-2), min=1e-4, max=100.0)
 
         # Gain cost: L1 in dB (weighted to balance against octave-scale freq cost)
         cost_gain = self.lambda_gain * (pg - tg).abs()
@@ -127,8 +128,15 @@ class HungarianBandMatcher:
         assignments = []
         for b in range(B):
             cost_np = cost_matrix[b].detach().cpu().numpy()
-            # Guard against NaN/inf from early training instability
-            cost_np = np.nan_to_num(cost_np, nan=0.0, posinf=1e6, neginf=-1e6)
+            # Triple-guard against NaN/inf: nan_to_num + hard clip + sanity check
+            cost_np = np.nan_to_num(cost_np, nan=0.0, posinf=1e6, neginf=0.0)
+            cost_np = np.clip(cost_np, 0.0, 1e6)
+            if not np.isfinite(cost_np).all():
+                # Fallback: identity assignment with zero cost
+                row_ind = np.arange(cost_np.shape[0])
+                col_ind = np.arange(cost_np.shape[1])
+                assignments.append((row_ind, col_ind))
+                continue
             row_ind, col_ind = linear_sum_assignment(cost_np)
             assignments.append((row_ind, col_ind))
         return assignments
@@ -289,6 +297,8 @@ class MultiTypeEQLoss(nn.Module):
         lambda_type_match=0.5,
         embed_var_threshold=0.1,
         warmup_epochs=5,
+        class_weight_multipliers=None,
+        sign_penalty_weight=0.0,
     ):
         super().__init__()
         self.lambda_param = lambda_param
@@ -305,6 +315,7 @@ class MultiTypeEQLoss(nn.Module):
         self.embed_var_threshold = embed_var_threshold
         self.warmup_epochs = warmup_epochs
         self.current_epoch = 0
+        self.sign_penalty_weight = sign_penalty_weight
 
         # D-03/D-04: Hybrid warmup gate — warmup ends when BOTH epoch threshold AND
         # gain MAE threshold are met (hard cap at 15 epochs prevents infinite warmup).
@@ -322,6 +333,13 @@ class MultiTypeEQLoss(nn.Module):
         inv_w = 1.0 / torch.tensor(type_weights_cfg, dtype=torch.float32)
         # Normalize so mean weight = 1.0 (prevents overall loss scale change)
         inv_w = inv_w / inv_w.mean()
+        # Per-class multipliers applied AFTER inverse-frequency normalization.
+        # This gives additional emphasis independent of the base distribution.
+        # Index order: [peaking, lowshelf, highshelf, highpass, lowpass]
+        if class_weight_multipliers is not None:
+            mult_tensor = torch.tensor(class_weight_multipliers, dtype=torch.float32)
+            inv_w = inv_w * mult_tensor
+            inv_w = inv_w / inv_w.mean()  # re-normalize so mean=1 after multiplying
         self.register_buffer('type_class_weights', inv_w)
         self.focal_gamma = 2.0  # focusing parameter — higher = more focus on hard samples
         self.type_label_smoothing = 0.05
@@ -392,24 +410,33 @@ class MultiTypeEQLoss(nn.Module):
         past_hard_cap = self.current_epoch >= 15
         is_warmup = not ((past_epoch_threshold and gain_converged) or past_hard_cap)
 
-        is_freq_q_active = not is_warmup
-        is_type_active = not is_warmup and self.current_epoch >= self.warmup_epochs + 1
-        is_spectral_active = not is_warmup and self.current_epoch >= self.warmup_epochs + 2
+        # FIX: Remove warmup gating for spectral and type losses.
+        # The hybrid warmup kept spectral_loss at 0.0 for entire epoch 1 (see log),
+        # starving the model of its primary supervision signal. With 50K samples
+        # and proper regularization, all losses can be active from step 1.
+        is_freq_q_active = True
+        is_type_active = True
+        is_spectral_active = True
 
         # --- Anti-collapse losses (computed first so they appear early in logs) ---
 
         # 7. Embedding variance regularization (L_embed_var)
-        # Prevents encoder collapse by penalizing embeddings that have low variance
-        # across the batch. When all embeddings are identical (collapse), per-dimension
-        # variance drops to zero and this loss fires. The threshold allows variance
-        # above it to pass for free — it only activates when the encoder starts to
-        # collapse. This is a direct, per-batch diagnostic that requires no auxiliary
-        # network or negative sampling.
+        # FIX: Replace threshold-based loss with continuous penalty.
+        # Prior code: F.relu(threshold - var) — zero gradient when var > threshold,
+        # allowing slow drift toward collapse (log showed var: 0.93 → 0.59 with
+        # no gradient to stop it). New formulation: loss = max(0, target - var)^2
+        # provides gradient at ALL variance levels below the target, and a smooth
+        # quadratic penalty above zero that never abruptly turns on.
         loss_embed_var = torch.tensor(0.0, device=pred_gain.device)
-        if embedding is not None:
-            # Variance of each embedding dimension across the batch, then average
+        if embedding is not None and embedding.shape[0] > 1:
             embed_var = embedding.var(dim=0).mean()
-            loss_embed_var = F.relu(self.embed_var_threshold - embed_var)
+            # Target variance: embedding_dim * 0.01 gives a reasonable floor
+            # for 128-dim embeddings (~1.28). Scale with dimension so the target
+            # is invariant to embedding size changes.
+            target_var = embedding.shape[-1] * 0.005
+            deficit = torch.clamp(target_var - embed_var, min=0.0)
+            loss_embed_var = deficit * deficit / (target_var + 1e-8)
+            loss_embed_var = torch.clamp(loss_embed_var, max=5.0)
         components["embed_var_loss"] = loss_embed_var
 
         # 8. Spectral contrastive loss (L_contrastive)
@@ -467,6 +494,19 @@ class MultiTypeEQLoss(nn.Module):
         )
         # LOSS-03: Log-cosh for gain (smoother gradients than Huber)
         loss_gain = log_cosh_loss(pred_gain, matched_gain).mean()
+
+        # Sign penalty: penalize predictions where sign(pred) != sign(gt).
+        # Targets the pattern where model predicts +X dB when GT is -Y dB.
+        # Penalty is proportional to the absolute error so large sign flips
+        # cost more than small ones near 0 dB.
+        if self.sign_penalty_weight > 0.0:
+            sign_mismatch = (pred_gain * matched_gain) < 0.0  # True where signs differ
+            sign_penalty = (sign_mismatch.float() * (pred_gain - matched_gain).abs()).mean()
+            loss_gain = loss_gain + self.sign_penalty_weight * sign_penalty
+            components["sign_penalty"] = sign_penalty.detach()
+        else:
+            components["sign_penalty"] = torch.tensor(0.0, device=pred_gain.device)
+
         # Freq and Q still use Huber on log-space
         loss_freq = self.param_loss.huber(
             torch.log(pred_freq + 1e-8), torch.log(matched_freq + 1e-8)
@@ -513,20 +553,27 @@ class MultiTypeEQLoss(nn.Module):
                 targets_flat, n_classes
             ).float() + self.type_label_smoothing / n_classes
 
-            # Focal loss: FL(p_t) = -alpha_t * (1 - p_t)^gamma * log(p_t)
-            # p_t = probability of the target class
+            # FIX: Focal loss with correct normalization.
+            # Prior code: loss = sum(focal_weight * ce) / sum(focal_weight)
+            # When p_t is low (uncertain model), focal_weight is large, but the
+            # denominator also grows, canceling the up-weighting effect. The correct
+            # focal loss formulation uses mean over samples (not weight-sum-normalized),
+            # so that hard examples genuinely get more gradient.
+            # Additionally, remove class_weights from the focal_weight product —
+            # class balancing should be applied as alpha_t in the focal loss
+            # formulation, not as a multiplicative modifier on (1-p_t)^gamma.
             p_t = (probs * smoothed_targets).sum(dim=1)  # (B*N,)
-            focal_weight = (1.0 - p_t) ** self.focal_gamma  # (B*N,)
+            focal_weight = (1.0 - p_t).pow(self.focal_gamma)  # (B*N,)
 
-            # Class-balanced weights: pick weight for each sample's target class
-            class_weights = self.type_class_weights[targets_flat]  # (B*N,)
-            focal_weight = focal_weight * class_weights
+            # Class-balanced alpha: alpha_t for each sample
+            alpha_t = self.type_class_weights[targets_flat]  # (B*N,)
+            alpha_t = alpha_t / alpha_t.mean()  # renormalize so mean(alpha)=1
 
-            # Per-sample loss
-            per_sample_loss = focal_weight * (-log_probs * smoothed_targets).sum(dim=1)
+            # Per-sample loss: alpha_t * (1-p_t)^gamma * CE
+            per_sample_loss = alpha_t * focal_weight * (-(log_probs * smoothed_targets).sum(dim=1))
 
-            # Normalize by sum of focal weights to prevent scale drift
-            loss_type = per_sample_loss.sum() / (focal_weight.sum() + 1e-8)
+            # Mean over all samples (not weight-sum-normalized)
+            loss_type = per_sample_loss.mean()
         else:
             loss_type = torch.tensor(0.0, device=pred_gain.device)
         components["type_loss"] = loss_type
