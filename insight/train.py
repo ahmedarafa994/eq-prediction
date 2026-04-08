@@ -17,10 +17,13 @@ Optimization features (QLoRA/Unsloth/DeepSpeed-inspired):
 
 import torch
 import torch.nn as nn
+import torch.nn.functional as F
 from torch.utils.data import DataLoader, random_split
 from model_tcn import StreamingTCNModel
 from dsp_frontend import STFTFrontend
-from loss_multitype import MultiTypeEQLoss, HungarianBandMatcher
+from loss_v2 import SimplifiedEQLoss
+from loss_multitype import HungarianBandMatcher
+from metrics import compute_eq_metrics
 from dataset import SyntheticEQDataset, collate_fn
 from dataset_musdb import MUSDB18EQDataset
 import yaml
@@ -48,7 +51,27 @@ except ImportError:
 
 def load_config(path="conf/config.yaml"):
     with open(path, "r") as f:
-        return yaml.safe_load(f)
+        cfg = yaml.safe_load(f)
+    validate_config(cfg)
+    return cfg
+
+
+def validate_config(cfg):
+    data_cfg = cfg.get("data", {})
+    loss_cfg = cfg.get("loss", {})
+    lambda_param = loss_cfg.get("lambda_param", 1.0)
+    lambda_spectral = loss_cfg.get("lambda_spectral", 5.0)
+    hp_lp_gain_target = data_cfg.get("hp_lp_gain_target", "zero")
+    if hp_lp_gain_target != "zero":
+        raise ValueError(
+            "Only `data.hp_lp_gain_target: zero` is supported for the "
+            "multi-type EQ label contract."
+        )
+    if lambda_param <= 0.0 and lambda_spectral <= 0.0:
+        raise ValueError(
+            "SimplifiedEQLoss requires at least one of "
+            "`loss.lambda_param` or `loss.lambda_spectral` to be > 0."
+        )
 
 
 class Trainer:
@@ -66,6 +89,7 @@ class Trainer:
         self.max_epochs = trainer_cfg["max_epochs"]
         self.log_every = trainer_cfg["log_every_n_steps"]
         self.n_fft = data_cfg.get("n_fft", 2048)
+        self.monitor_val_metric = trainer_cfg.get("monitor_val_metric", "val_loss_soft")
 
         # Optimization flags from config
         self.use_8bit_optimizer = (
@@ -100,13 +124,17 @@ class Trainer:
             num_bands=self.num_bands,
             sample_rate=self.sample_rate,
             duration=data_cfg.get("audio_duration", 1.5),
+            duration_range=tuple(data_cfg["duration_range"])
+            if data_cfg.get("duration_range") is not None
+            else None,
             n_fft=self.n_fft,
             size=dataset_size,
             gain_range=tuple(data_cfg["gain_bounds"]),
             freq_range=tuple(data_cfg["freq_bounds"]),
             q_range=tuple(data_cfg["q_bounds"]),
             type_weights=data_cfg.get("type_weights", None),
-            precompute_mels=True,
+            hp_lp_gain_target=data_cfg.get("hp_lp_gain_target", "zero"),
+            precompute_mels=data_cfg.get("precompute_mels", True),
             n_mels=data_cfg.get("n_mels", 128),
         )
 
@@ -128,12 +156,14 @@ class Trainer:
             self.precompute_cache_path
         ):
             print(f"  [data] Loaded cached dataset from {self.precompute_cache_path}")
-        else:
+        elif data_cfg.get("precompute_mels", True):
             # Precompute all samples with mel-spectrograms upfront
             self.train_dataset.precompute()
             # Save cache if path specified
             if self.precompute_cache_path:
                 self.train_dataset.save_precomputed(self.precompute_cache_path)
+        else:
+            print(f"  [data] On-the-fly generation (no precompute)")
 
         # Fixed validation dataset — generated once with full type distribution.
         if dataset_type == "musdb":
@@ -146,7 +176,10 @@ class Trainer:
             self.val_dataset = SyntheticEQDataset(
                 **{**ds_kwargs, "size": val_dataset_size},
             )
-        self.val_dataset.precompute()
+        if data_cfg.get("precompute_mels", True) or data_cfg.get(
+            "freeze_val_set", True
+        ):
+            self.val_dataset.precompute()
 
         # Train split: fold val portion into training since we have a separate val set.
         n_train = int(
@@ -196,6 +229,11 @@ class Trainer:
             num_stacks=enc_cfg.get("num_stacks", 2),
             sample_rate=self.sample_rate,
             n_fft=self.n_fft,
+            type_conditioned_frequency=model_cfg.get(
+                "type_conditioned_frequency", True
+            ),
+            dropout=enc_cfg.get("dropout", 0.1),
+            mel_noise_std=enc_cfg.get("mel_noise_std", 0.0),
         ).to(self.device)
 
         # STFT frontend
@@ -207,33 +245,38 @@ class Trainer:
             sample_rate=self.sample_rate,
         ).to(self.device)
 
-        # Loss
-        self.criterion = MultiTypeEQLoss(
-            n_fft=self.n_fft,
-            sample_rate=self.sample_rate,
-            lambda_param=loss_cfg.get("lambda_param", 0.0),
-            lambda_gain=loss_cfg.get("lambda_gain", 3.0),
+        # Loss — simplified 3-term (spectral-dominant, ICASSP 2024 BE-AFX)
+        self.criterion = SimplifiedEQLoss(
+            lambda_spectral=loss_cfg.get("lambda_spectral", 5.0),
+            lambda_param=loss_cfg.get("lambda_param", 1.0),
+            lambda_type=loss_cfg.get("lambda_type", 2.0),
+            lambda_gain=loss_cfg.get("lambda_gain", 1.0),
             lambda_freq=loss_cfg.get("lambda_freq", 1.0),
-            lambda_q=loss_cfg.get("lambda_q", 0.5),
-            lambda_type=loss_cfg.get("lambda_type", 0.5),
-            lambda_spectral=loss_cfg.get("lambda_spectral", 1.0),
-            lambda_hmag=loss_cfg.get("lambda_hmag", 0.3),
-            lambda_activity=loss_cfg.get("lambda_activity", 0.1),
-            lambda_spread=loss_cfg.get("lambda_spread", 0.05),
-            lambda_embed_var=loss_cfg.get("lambda_embed_var", 0.3),
-            lambda_contrastive=loss_cfg.get("lambda_contrastive", 0.05),
-            lambda_type_match=loss_cfg.get("lambda_type_match", 0.5),
+            lambda_q=loss_cfg.get("lambda_q", 1.0),
+            lambda_gain_zero=loss_cfg.get("lambda_gain_zero", 1.0),
+            label_smoothing=loss_cfg.get("label_smoothing", 0.02),
+            focal_gamma=loss_cfg.get("focal_gamma", 2.0),
+            type_class_priors=data_cfg.get("type_weights", None),
+            lambda_type_match=loss_cfg.get("lambda_type_match", 0.0),
+            lambda_type_prior=loss_cfg.get("lambda_type_prior", 0.0),
+            lambda_embed_var=loss_cfg.get("lambda_embed_var", 0.0),
+            lambda_contrastive=loss_cfg.get("lambda_contrastive", 0.0),
             embed_var_threshold=loss_cfg.get("embed_var_threshold", 0.1),
-            warmup_epochs=loss_cfg.get("warmup_epochs", 5),
+            class_weight_multipliers=self.cfg.get("loss", {}).get("class_weight_multipliers", None),
+            sign_penalty_weight=self.cfg.get("loss", {}).get("sign_penalty_weight", 0.0),
         )
+        self.metric_lambda_type_match = loss_cfg.get("lambda_type_match", 0.0)
 
         # Hungarian matcher for fair validation metrics (matches target ordering to predictions)
         self.matcher = HungarianBandMatcher(
-            lambda_gain=1.0, lambda_freq=1.0, lambda_q=1.0, lambda_type_match=0.5
+            lambda_gain=1.0,
+            lambda_freq=1.0,
+            lambda_q=1.0,
+            lambda_type_match=loss_cfg.get("lambda_type_match", 0.0),
         )
 
-        # Optimizer: per-group learning rates to handle the ~17,000x gradient imbalance
-        # between the mel_cnn encoder (large grads) and gain_mlp head (tiny grads).
+        # Optimizer: the parameter head runs at a higher LR than the encoder
+        # because the spectral trunk is deeper and adapts more slowly.
         base_lr = model_cfg["learning_rate"]
         wd = model_cfg["weight_decay"]
         head_lr_mult = model_cfg.get("head_lr_multiplier", 3.0)
@@ -270,19 +313,9 @@ class Trainer:
             self.optimizer = bnb.optim.AdamW8bit(param_groups)
         else:
             self.optimizer = torch.optim.AdamW(param_groups, fused=True)
+        # CosineAnnealing LR schedule — steps once per epoch
         self.scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(
             self.optimizer, T_max=self.max_epochs, eta_min=1e-6
-        )
-
-        # LR warmup: linear warmup over first 500 steps, then hand off to CosineAnnealing
-        warmup_steps = 500
-        warmup_scheduler = torch.optim.lr_scheduler.LinearLR(
-            self.optimizer, start_factor=1e-3, end_factor=1.0, total_iters=warmup_steps
-        )
-        self.scheduler = torch.optim.lr_scheduler.SequentialLR(
-            self.optimizer,
-            schedulers=[warmup_scheduler, self.scheduler],
-            milestones=[warmup_steps],
         )
 
         self.gradient_accumulation_steps = trainer_cfg.get(
@@ -306,16 +339,6 @@ class Trainer:
             self.autocast_ctx = torch.autocast(device_type, dtype=torch.bfloat16)
         else:
             self.autocast_ctx = nullcontext()
-
-        # Curriculum stages from config
-        self.curriculum_stages = self.cfg.get("curriculum", {}).get("stages", [])
-        self._current_stage_idx = -1
-        self._last_metrics = {}  # D-06/D-07: Updated after each validate() call
-
-        # Per-stage LR warmup state
-        self._stage_warmup_active = False
-        self._stage_warmup_step_count = 0
-        self._target_type_weights = None
 
         # DeepSpeed initialization
         if self.use_deepspeed:
@@ -352,44 +375,28 @@ class Trainer:
         mel_spec = self.frontend.mel_spectrogram(wet_audio)
         return mel_spec.squeeze(1)
 
-    def _spec_augment(self, mel_frames):
-        """
-        Apply SpecAugment to mel-spectrograms for training data augmentation.
-        Uses frequency masking and time masking to improve model robustness.
-
-        Args:
-            mel_frames: (B, n_mels, T) mel-spectrogram
-
-        Returns:
-            Augmented mel-spectrogram of same shape
-        """
-        B, n_mels, T = mel_frames.shape
-        device = mel_frames.device
-
-        # Frequency masking: mask up to 15 consecutive mel bins, 2 masks
-        freq_mask_param = 15
-        num_freq_masks = 2
-        for _ in range(num_freq_masks):
-            f = torch.randint(0, freq_mask_param + 1, size=(B,)).to(device)
-            f0 = torch.randint(0, max(n_mels - f.max().item(), 1), size=(B,)).to(device)
-            for i in range(B):
-                mel_frames[i, f0[i]:f0[i] + f[i], :] = 0
-
-        # Time masking: mask up to 30 consecutive time frames, 2 masks
-        time_mask_param = 30
-        num_time_masks = 2
-        for _ in range(num_time_masks):
-            t = torch.randint(0, time_mask_param + 1, size=(B,)).to(device)
-            t0 = torch.randint(0, max(T - t.max().item(), 1), size=(B,)).to(device)
-            for i in range(B):
-                mel_frames[i, :, t0[i]:t0[i] + t[i]] = 0
-
-        return mel_frames
+    def _gain_aux_alignment(self, batch, wet_mel, output):
+        gain_aux_summary = output.get("gain_aux_summary")
+        if "dry_audio" not in batch or gain_aux_summary is None:
+            return None
+        model_ref = self.model.module if hasattr(self.model, "module") else self.model
+        dry_audio = batch["dry_audio"].to(self.device, non_blocking=True)
+        with torch.no_grad():
+            dry_mel = self.frontend.mel_spectrogram(dry_audio).squeeze(1).float()
+            mel_delta = (wet_mel.detach().float() - dry_mel).mean(dim=-1)
+            gain_delta_summary = model_ref.param_head.summarize_gain_aux_features(
+                mel_delta
+            )
+            if gain_delta_summary is None:
+                return None
+            lhs = F.normalize(gain_aux_summary.detach().float(), dim=-1)
+            rhs = F.normalize(gain_delta_summary.detach().float(), dim=-1)
+            alignment = F.cosine_similarity(lhs, rhs, dim=-1).mean()
+            if torch.isfinite(alignment):
+                return alignment.item()
+        return None
 
     def train_one_epoch(self, epoch):
-        # Enable anomaly detection during warmup for precise NaN backtrace
-        # (incompatible with torch.compile — compiled backward is a fused kernel)
-        torch.autograd.set_detect_anomaly(epoch <= 2 and not self.use_torch_compile)
         self.model.train()
         epoch_loss = 0.0
         n_batches = 0
@@ -402,15 +409,10 @@ class Trainer:
 
         for batch_idx, batch in enumerate(self.train_loader):
             mel_frames = self._prepare_input(batch)
-            # Apply SpecAugment during training only
-            mel_frames = self._spec_augment(mel_frames)
             target_gain = batch["gain"].to(self.device, non_blocking=True)
             target_freq = batch["freq"].to(self.device, non_blocking=True)
             target_q = batch["q"].to(self.device, non_blocking=True)
             target_ft = batch["filter_type"].to(self.device, non_blocking=True)
-            active_band_mask = batch.get("active_band_mask", None)
-            if active_band_mask is not None:
-                active_band_mask = active_band_mask.to(self.device, non_blocking=True)
 
             # Forward (wrapped in autocast for bf16-mixed precision)
             with self.autocast_ctx:
@@ -426,35 +428,18 @@ class Trainer:
                     filter_type=target_ft,
                 )
 
-                # LOSS-04: Dual H_mag path — model outputs both soft (Gumbel) and hard (argmax)
-                pred_H_mag_soft = output["H_mag"]       # soft path for spectral_loss gradient
-                pred_H_mag_hard = output["H_mag_hard"]  # hard path for hmag_loss (detached inside loss)
-
-                # LOSS-05: Spectral reconstruction — pass H_mag_soft when spectral is active
-                is_spectral_active = (
-                    hasattr(self.criterion, 'current_epoch') and
-                    hasattr(self.criterion, 'warmup_epochs') and
-                    self.criterion.current_epoch >= self.criterion.warmup_epochs + 2
-                )
-                pred_audio_for_loss = pred_H_mag_soft if is_spectral_active else None
-                target_audio_for_loss = target_H_mag if is_spectral_active else None
-
-                # Loss (dual H_mag path, active_band_mask, spectral reconstruction)
+                # Use soft H_mag (differentiable w.r.t. type_logits) for spectral loss
                 total_loss, components = self.criterion(
                     pred_gain,
                     pred_freq,
                     pred_q,
                     output["type_logits"],
-                    pred_H_mag_soft,
-                    pred_H_mag_hard,
+                    output["H_mag_soft"],
                     target_gain,
                     target_freq,
                     target_q,
                     target_ft,
                     target_H_mag,
-                    pred_audio=pred_audio_for_loss,
-                    target_audio=target_audio_for_loss,
-                    active_band_mask=active_band_mask,
                     embedding=output["embedding"],
                 )
 
@@ -509,24 +494,13 @@ class Trainer:
                         grad_parts = []
                         for name, param in self.model.named_parameters():
                             if param.grad is not None and param.grad.norm() > 0:
-                                # D-03: Fixed parameter name matching to actual model structure
-                                # Verified parameter name prefixes from StreamingTCNModel.named_parameters():
-                                #   param_head.gain_mlp.*         -> gain prediction MLP
-                                #   param_head.q_head.*           -> Q prediction
-                                #   param_head.classification_head.* -> type classification
-                                #   param_head.freq_direct.*      -> frequency prediction
-                                #   param_head.freq_fallback.*    -> frequency fallback
-                                #   param_head.trunk.*            -> shared parameter trunk
-                                #   param_head.type_mel_proj.*    -> type mel projection
-                                #   param_head.mel_cnn.*          -> mel CNN features
-                                #   encoder.*                     -> TCN encoder
-                                if "gain_mlp" in name:
+                                if "gain_head" in name:
                                     grad_parts.append(("gain", param.grad.norm().item()))
                                 elif "q_head" in name:
                                     grad_parts.append(("q", param.grad.norm().item()))
-                                elif "classification_head" in name or "type_mel_proj" in name:
+                                elif "type_head" in name or "type_mel_proj" in name:
                                     grad_parts.append(("type", param.grad.norm().item()))
-                                elif "freq_direct" in name or "freq_fallback" in name:
+                                elif "freq_head" in name or "freq_context_proj" in name:
                                     grad_parts.append(("freq", param.grad.norm().item()))
                                 elif "param_head" in name:
                                     # Catch-all for trunk, cnn_merge, query_proj, etc.
@@ -546,13 +520,6 @@ class Trainer:
 
                     self.optimizer.step()
 
-                    # D-04: Update gain MAE EMA for hybrid warmup gate in loss function.
-                    # Use raw gain MAE (not log_cosh) so the threshold (2.5 dB) has physical meaning.
-                    if hasattr(self.criterion, 'update_gain_mae'):
-                        with torch.no_grad():
-                            batch_gain_mae = (pred_gain - target_gain).abs().mean().item()
-                        self.criterion.update_gain_mae(batch_gain_mae)
-
                     # Sanitize optimizer state: reset any Adam momentum/variance
                     # buffers that contain NaN (prevents permanent training death)
                     for state in self.optimizer.state.values():
@@ -564,21 +531,6 @@ class Trainer:
 
                 self.optimizer.zero_grad(set_to_none=True)
                 self.global_step += 1
-
-                # Stage warmup: linearly ramp LR from start to target over N steps
-                if self._stage_warmup_active:
-                    self._stage_warmup_step_count += 1
-                    progress = min(
-                        1.0,
-                        self._stage_warmup_step_count
-                        / max(self._stage_warmup_steps, 1),
-                    )
-                    for pg_idx, pg in enumerate(self.optimizer.param_groups):
-                        start_lr = self._stage_warmup_start_lrs[pg_idx]
-                        target_lr = self._stage_warmup_target_lrs[pg_idx]
-                        pg["lr"] = start_lr + (target_lr - start_lr) * progress
-                    if progress >= 1.0:
-                        self._stage_warmup_active = False
 
             epoch_loss += total_loss.item()
             n_batches += 1
@@ -599,6 +551,9 @@ class Trainer:
                 if "embed_var_loss" in components:
                     embed_var = output["embedding"].var(dim=0).mean().item()
                     parts.append(f"embed_var={embed_var:.4f}")
+                gain_aux_alignment = self._gain_aux_alignment(batch, mel_frames, output)
+                if gain_aux_alignment is not None:
+                    parts.append(f"gain_aux_delta_cos={gain_aux_alignment:.4f}")
                 print(f"  [train] " + " | ".join(parts))
 
         if n_nan_batches > 0:
@@ -616,15 +571,22 @@ class Trainer:
 
     @torch.no_grad()
     def validate(self, epoch):
-        # Set curriculum epoch on criterion for consistent validation losses
-        if hasattr(self.criterion, 'current_epoch'):
-            self.criterion.current_epoch = epoch
-
         self.model.eval()
-        val_loss = 0.0
+        val_loss_soft = 0.0
+        val_loss_hard = 0.0
         n_batches = 0
-        param_maes = {"gain": [], "gain_raw": [], "freq": [], "q": [], "type_acc": []}
-        val_component_accum = {}  # D-02: accumulate loss components during validation
+        metric_tensors = {
+            "gain_pred": [],
+            "gain_gt": [],
+            "freq_pred": [],
+            "freq_gt": [],
+            "q_pred": [],
+            "q_gt": [],
+            "type_pred": [],
+            "type_gt": [],
+            "type_logits": [],
+        }
+        val_component_accum = {}
 
         for batch in self.val_loader:
             mel_frames = self._prepare_input(batch)
@@ -632,30 +594,30 @@ class Trainer:
             target_freq = batch["freq"].to(self.device, non_blocking=True)
             target_q = batch["q"].to(self.device, non_blocking=True)
             target_ft = batch["filter_type"].to(self.device, non_blocking=True)
-            active_band_mask = batch.get("active_band_mask", None)
-            if active_band_mask is not None:
-                active_band_mask = active_band_mask.to(self.device, non_blocking=True)
 
             with self.autocast_ctx:
-                output = self.model(mel_frames)
-                pred_gain, pred_freq, pred_q = output["params"]
+                output_hard = self.model(mel_frames)
+                output_soft = self.model(
+                    mel_frames,
+                    hard_types=False,
+                    force_soft_response=True,
+                )
+                pred_gain, pred_freq, pred_q = output_hard["params"]
 
-                # NaN diagnostic: check model outputs before loss
-                if not torch.isfinite(pred_gain).all():
-                    print(f"  [nan] pred_gain has NaN/inf at val batch {n_batches}")
-                if not torch.isfinite(pred_freq).all():
-                    print(f"  [nan] pred_freq has NaN/inf at val batch {n_batches}")
-                if not torch.isfinite(pred_q).all():
-                    print(f"  [nan] pred_q has NaN/inf at val batch {n_batches}")
-                if not torch.isfinite(output["embedding"]).all():
-                    print(f"  [nan] embedding has NaN/inf at val batch {n_batches}")
-                if (
-                    output["H_mag"] is not None
-                    and not torch.isfinite(output["H_mag"]).all()
-                ):
-                    print(f"  [nan] H_mag has NaN/inf at val batch {n_batches}")
+                # NaN diagnostic
+                for name, tensor in [
+                    ("pred_gain", pred_gain),
+                    ("pred_freq", pred_freq),
+                    ("pred_q", pred_q),
+                    ("embedding", output_hard["embedding"]),
+                    ("H_mag", output_hard["H_mag"]),
+                    ("H_mag_soft", output_soft["H_mag_soft"]),
+                ]:
+                    if not torch.isfinite(tensor).all():
+                        print(f"  [nan] {name} has NaN/inf at val batch {n_batches}")
 
-                target_H_mag = self.model.dsp_cascade(
+                model_ref = self.model.module if hasattr(self.model, "module") else self.model
+                target_H_mag = model_ref.dsp_cascade(
                     target_gain,
                     target_freq,
                     target_q,
@@ -663,39 +625,35 @@ class Trainer:
                     filter_type=target_ft,
                 )
 
-                # Dual H_mag path for validation (matching training)
-                pred_H_mag_soft = output["H_mag"]
-                pred_H_mag_hard = output["H_mag_hard"]
-
-                # Spectral reconstruction for validation (matching training)
-                is_spectral_active = (
-                    hasattr(self.criterion, 'current_epoch') and
-                    hasattr(self.criterion, 'warmup_epochs') and
-                    self.criterion.current_epoch >= self.criterion.warmup_epochs + 2
-                )
-                pred_audio_for_loss = pred_H_mag_soft if is_spectral_active else None
-                target_audio_for_loss = target_H_mag if is_spectral_active else None
-
-                total_loss, components = self.criterion(
-                    pred_gain,
-                    pred_freq,
-                    pred_q,
-                    output["type_logits"],
-                    pred_H_mag_soft,
-                    pred_H_mag_hard,
+                total_loss_soft, components = self.criterion(
+                    output_soft["params"][0],
+                    output_soft["params"][1],
+                    output_soft["params"][2],
+                    output_soft["type_logits"],
+                    output_soft["H_mag_soft"],
                     target_gain,
                     target_freq,
                     target_q,
                     target_ft,
                     target_H_mag,
-                    pred_audio=pred_audio_for_loss,
-                    target_audio=target_audio_for_loss,
-                    active_band_mask=active_band_mask,
-                    embedding=output["embedding"],
+                    embedding=output_soft["embedding"],
+                )
+                total_loss_hard, _ = self.criterion(
+                    output_hard["params"][0],
+                    output_hard["params"][1],
+                    output_hard["params"][2],
+                    output_hard["type_logits"],
+                    output_hard["H_mag"],
+                    target_gain,
+                    target_freq,
+                    target_q,
+                    target_ft,
+                    target_H_mag,
+                    embedding=output_hard["embedding"],
                 )
 
                 # NaN diagnostic: identify which loss component causes NaN
-                if not torch.isfinite(total_loss):
+                if not torch.isfinite(total_loss_soft):
                     nan_components = [
                         k
                         for k, v in components.items()
@@ -705,11 +663,12 @@ class Trainer:
                         f"  [nan] Non-finite loss at val batch {n_batches}: "
                         f"components={nan_components}"
                     )
-                    # Clamp NaN loss to a large finite value to prevent checkpoint corruption
-                    # and avoid breaking the validation average (inf would corrupt avg_val_loss)
-                    total_loss = torch.tensor(1e4, device=total_loss.device)
+                    total_loss_soft = torch.tensor(1e4, device=pred_gain.device)
+                if not torch.isfinite(total_loss_hard):
+                    total_loss_hard = torch.tensor(1e4, device=pred_gain.device)
 
-            val_loss += total_loss.item()
+            val_loss_soft += total_loss_soft.item()
+            val_loss_hard += total_loss_hard.item()
             n_batches += 1
 
             # D-02: Accumulate loss components for validation logging
@@ -717,45 +676,38 @@ class Trainer:
                 val = v.item() if isinstance(v, torch.Tensor) else float(v)
                 val_component_accum[k] = val_component_accum.get(k, 0.0) + val
 
-            # Hungarian matching for fair MAE computation — also matches filter types
-            # so type_acc is compared against the correctly-permuted ground truth.
-            matched_gain, matched_freq, matched_q, matched_ft = self.matcher(
-                pred_gain,
-                pred_freq,
-                pred_q,
-                target_gain,
-                target_freq,
-                target_q,
-                target_filter_type=target_ft,
-                pred_type_logits=output["type_logits"],
+            metric_tensors["gain_pred"].append(pred_gain.detach().float().cpu())
+            metric_tensors["gain_gt"].append(target_gain.detach().float().cpu())
+            metric_tensors["freq_pred"].append(pred_freq.detach().float().cpu())
+            metric_tensors["freq_gt"].append(target_freq.detach().float().cpu())
+            metric_tensors["q_pred"].append(pred_q.detach().float().cpu())
+            metric_tensors["q_gt"].append(target_q.detach().float().cpu())
+            metric_tensors["type_pred"].append(output_hard["filter_type"].detach().cpu())
+            metric_tensors["type_gt"].append(target_ft.detach().cpu())
+            metric_tensors["type_logits"].append(
+                output_hard["type_logits"].detach().float().cpu()
             )
 
-            # Metrics (matched = fair, raw = for comparison)
-            param_maes["gain"].append((pred_gain - matched_gain).abs().mean().item())
-            param_maes["gain_raw"].append((pred_gain - target_gain).abs().mean().item())
-            param_maes["freq"].append(
-                (torch.log2(pred_freq / (matched_freq + 1e-8))).abs().mean().item()
+        avg_val_loss_soft = val_loss_soft / max(n_batches, 1)
+        avg_val_loss_hard = val_loss_hard / max(n_batches, 1)
+        if metric_tensors["gain_pred"]:
+            metrics = compute_eq_metrics(
+                torch.cat(metric_tensors["gain_pred"]),
+                torch.cat(metric_tensors["freq_pred"]),
+                torch.cat(metric_tensors["q_pred"]),
+                torch.cat(metric_tensors["type_pred"]),
+                torch.cat(metric_tensors["type_logits"]),
+                torch.cat(metric_tensors["gain_gt"]),
+                torch.cat(metric_tensors["freq_gt"]),
+                torch.cat(metric_tensors["q_gt"]),
+                torch.cat(metric_tensors["type_gt"]),
+                lambda_type_match=self.metric_lambda_type_match,
             )
-            param_maes["q"].append(
-                (torch.log10(pred_q / (matched_q + 1e-8))).abs().mean().item()
-            )
-            param_maes["type_acc"].append(
-                (output["filter_type"] == matched_ft).float().mean().item()
-            )
-
-            # D-11: Per-type accuracy breakdown
-            from differentiable_eq import FILTER_NAMES
-            pred_ft = output["filter_type"]
-            for type_idx, type_name in enumerate(FILTER_NAMES):
-                mask = (matched_ft == type_idx)
-                if mask.sum() > 0:
-                    per_type_acc = (pred_ft[mask] == matched_ft[mask]).float().mean().item()
-                else:
-                    per_type_acc = 0.0
-                param_maes.setdefault(f"type_{type_name}", []).append(per_type_acc)
-
-        avg_val_loss = val_loss / max(n_batches, 1)
-        metrics = {k: sum(v) / len(v) for k, v in param_maes.items() if v}
+        else:
+            metrics = {}
+        metrics["val_loss_soft"] = avg_val_loss_soft
+        metrics["val_loss_hard"] = avg_val_loss_hard
+        metrics["val_loss"] = avg_val_loss_soft
 
         # D-02: Log averaged validation loss components
         if n_batches > 0 and val_component_accum:
@@ -765,25 +717,26 @@ class Trainer:
                 comp_strs.append(f"{k}={avg:.4f}")
             print(f"  [val] epoch={epoch} components: " + " | ".join(comp_strs))
 
-        # Matched MAE is the primary/trustworthy metric (D-04)
-        # gain_raw is kept for debug comparison only
         print(
-            f"  [val] epoch={epoch} val_loss={avg_val_loss:.4f} "
-            f"gain_mae={metrics.get('gain', 0):.2f}dB "
-            f"gain_raw={metrics.get('gain_raw', 0):.2f}dB "
-            f"freq_mae={metrics.get('freq', 0):.3f}oct "
-            f"q_mae={metrics.get('q', 0):.3f}dec "
-            f"type_acc={metrics.get('type_acc', 0):.1%}"
+            f"  [val] epoch={epoch} val_loss_soft={avg_val_loss_soft:.4f} "
+            f"val_loss_hard={avg_val_loss_hard:.4f} "
+            f"gain_mae_db_matched={metrics.get('gain_mae_db_matched', 0):.2f} "
+            f"gain_mae_db_raw={metrics.get('gain_mae_db_raw', 0):.2f} "
+            f"freq_mae_oct_matched={metrics.get('freq_mae_oct_matched', 0):.3f} "
+            f"freq_mae_oct_raw={metrics.get('freq_mae_oct_raw', 0):.3f} "
+            f"q_mae_dec_matched={metrics.get('q_mae_dec_matched', 0):.3f} "
+            f"type_accuracy_matched={metrics.get('type_accuracy_matched', 0):.1%} "
+            f"type_accuracy_raw={metrics.get('type_accuracy_raw', 0):.1%}"
         )
         # D-11: Per-type accuracy reporting
         per_type_parts = []
         for tn in ["peaking", "lowshelf", "highshelf", "highpass", "lowpass"]:
-            v = metrics.get(f"type_{tn}", 0)
+            v = metrics.get(f"type_accuracy_{tn}_matched", 0)
             per_type_parts.append(f"{tn}={v:.1%}")
         print(f"  [val] per-type: {' | '.join(per_type_parts)}")
-        return avg_val_loss, metrics
+        return avg_val_loss_soft, metrics
 
-    def save_checkpoint(self, epoch, val_loss, is_best=False):
+    def save_checkpoint(self, epoch, val_loss, is_best=False, metrics=None):
         ckpt_dir = Path("checkpoints")
         ckpt_dir.mkdir(exist_ok=True)
 
@@ -802,6 +755,9 @@ class Trainer:
                 "val_loss": val_loss,
                 "global_step": self.global_step,
             }
+            if metrics is not None:
+                state["val_loss_soft"] = metrics.get("val_loss_soft", val_loss)
+                state["val_loss_hard"] = metrics.get("val_loss_hard", val_loss)
             path = ckpt_dir / f"epoch_{epoch:03d}.pt"
             torch.save(state, path)
             if is_best:
@@ -828,18 +784,16 @@ class Trainer:
         if any(k.startswith("_orig_mod.") for k in sd):
             sd = {k.replace("_orig_mod.", "", 1): v for k, v in sd.items()}
         self.model.to(self.device)
-        result = self.model.load_state_dict(sd, strict=False)
+        result, skipped_keys = self.model.load_compatible_state_dict(sd)
+        if skipped_keys:
+            print(
+                f"  [resume] Dropped {len(skipped_keys)} incompatible keys "
+                f"(shape/name mismatch after architecture change)"
+            )
         if result.unexpected_keys:
             print(f"  [resume] Dropped {len(result.unexpected_keys)} extra keys from checkpoint (architecture change): {[k.split('.')[-1] for k in result.unexpected_keys]}")
         if result.missing_keys:
             print(f"  [resume] {len(result.missing_keys)} keys initialized randomly (not in checkpoint): {[k.split('.')[-1] for k in result.missing_keys]}")
-        # FIX-5: Reset gain_output_scale regardless of checkpoint value.
-        # The saved scale was learned under a corrupt regime (type loss absent 17 epochs).
-        # STE clamps output to ±24 dB regardless, so resetting to 12.0 only reduces noise.
-        if hasattr(self.model, 'param_head') and hasattr(self.model.param_head, 'gain_output_scale'):
-            with torch.no_grad():
-                self.model.param_head.gain_output_scale.fill_(12.0)
-            print("  [resume] Reset gain_output_scale to 12.0 (fix for overfit scale)")
         try:
             self.optimizer.load_state_dict(state["optimizer_state_dict"])
         except Exception as e:
@@ -925,110 +879,6 @@ class Trainer:
         print(f"  [recovery] No clean checkpoint found. Cannot recover.")
         return False
 
-    def _update_type_transition(self, epoch):
-        """No-op: data distribution stays fixed across stages."""
-        pass
-
-    def _apply_curriculum_stage(self, epoch):
-        """Determine and apply curriculum stage based on epoch number."""
-        # Handle gradual type weight transition at the start of each epoch
-        self._update_type_transition(epoch)
-
-        if not self.curriculum_stages:
-            return
-
-        # Determine stage from cumulative epoch boundaries
-        cumulative = 0
-        stage_idx = 0
-        stage_start_epoch = 0
-        for i, stage in enumerate(self.curriculum_stages):
-            prev_cumulative = cumulative
-            cumulative += stage["epochs"]
-            if epoch <= cumulative:
-                stage_idx = i
-                stage_start_epoch = prev_cumulative + 1
-                break
-        else:
-            stage_idx = len(self.curriculum_stages) - 1
-
-        # Skip if stage hasn't changed (but still do intra-stage annealing)
-        stage = self.curriculum_stages[stage_idx]
-        stage_epochs = stage["epochs"]
-
-        # Intra-stage Gumbel temperature annealing
-        target_tau = stage.get("gumbel_temperature", 1.0)
-        epoch_in_stage = epoch - stage_start_epoch
-        if stage_idx > 0:
-            prev_tau = self.curriculum_stages[stage_idx - 1].get(
-                "gumbel_temperature", 1.0
-            )
-        else:
-            prev_tau = 1.0
-
-        # Smooth linear annealing from prev_tau to target_tau within stage
-        progress = epoch_in_stage / max(stage_epochs - 1, 1)
-        current_tau = prev_tau + (target_tau - prev_tau) * progress
-        current_tau = max(current_tau, 0.1)  # floor — prevent vanishing gradients
-        self.model.param_head.gumbel_temperature.fill_(current_tau)
-
-        # Only re-precompute data when stage changes
-        if stage_idx == self._current_stage_idx:
-            return
-
-        # D-06/D-07/D-08: Metric-gated curriculum transitions
-        thresholds = stage.get("metric_thresholds", {})
-        if thresholds and self._last_metrics:
-            all_met = True
-            for metric_name, threshold in thresholds.items():
-                current_val = self._last_metrics.get(metric_name)
-                if current_val is None:
-                    all_met = False
-                    break
-                if "mae" in metric_name:
-                    if current_val > threshold:
-                        all_met = False
-                        break
-                elif "acc" in metric_name:
-                    if current_val < threshold:
-                        all_met = False
-                        break
-            epoch_cap = stage.get("epoch_cap", stage_epochs * 2)
-            epochs_in_current = epoch - stage_start_epoch
-            if not all_met and epochs_in_current < epoch_cap:
-                print(
-                    f"  [curriculum] Stage transition to '{stage['name']}' blocked: "
-                    f"metrics not met (epoch {epochs_in_current}/{epoch_cap})"
-                )
-                return
-
-        self._current_stage_idx = stage_idx
-
-        # Per-stage LR warmup: restore LR to fraction of initial, short linear warmup
-        stage_lr_scale = stage.get("learning_rate_scale", 0.3)
-        for pg in self.optimizer.param_groups:
-            pg["lr"] = pg.get("initial_lr", pg["lr"]) * stage_lr_scale
-        self._stage_warmup_active = True
-        self._stage_warmup_steps = 200
-        self._stage_warmup_step_count = 0
-        self._stage_warmup_start_lrs = [pg["lr"] for pg in self.optimizer.param_groups]
-        self._stage_warmup_target_lrs = [
-            pg.get("initial_lr", pg["lr"]) for pg in self.optimizer.param_groups
-        ]
-
-        # Apply per-stage loss weight overrides (NO data re-precompute)
-        # The curriculum now controls only loss weights, Gumbel temperature,
-        # and LR warmup. Data distribution stays fixed for the entire run.
-        # This prevents the fatal distribution shift that destroyed optimizer
-        # state alignment at stage boundaries (epoch 30→31 never recovered).
-        stage_lambda_type = stage.get("lambda_type", None)
-        if stage_lambda_type is not None:
-            self.criterion.lambda_type = stage_lambda_type
-
-        print(
-            f"  [curriculum] Epoch {epoch}: stage '{stage['name']}' "
-            f"(gumbel_tau={target_tau:.2f}, lambda_type={self.criterion.lambda_type}, lr_warmup={self._stage_warmup_steps} steps)"
-        )
-
     def fit(self):
         total_params = sum(p.numel() for p in self.model.parameters())
         print(f"IDSP Multi-Type EQ Estimator Training")
@@ -1046,21 +896,6 @@ class Trainer:
         for epoch in range(self.start_epoch, self.max_epochs + 1):
             t0 = time.time()
 
-            # Set curriculum epoch on criterion for warmup gating
-            if hasattr(self.criterion, 'current_epoch'):
-                self.criterion.current_epoch = epoch
-                if hasattr(self.criterion, 'warmup_epochs'):
-                    warmup = self.criterion.warmup_epochs
-                    if epoch < warmup:
-                        print(f"  [curriculum] Epoch {epoch}: GAIN-ONLY WARMUP ({warmup - epoch} remaining)")
-                    elif epoch < warmup + 1:
-                        print(f"  [curriculum] Epoch {epoch}: Gain + Freq + Q active")
-                    elif epoch < warmup + 2:
-                        print(f"  [curriculum] Epoch {epoch}: + Type loss activated")
-                    else:
-                        print(f"  [curriculum] Epoch {epoch}: All losses active")
-
-            self._apply_curriculum_stage(epoch)
             train_loss = self.train_one_epoch(epoch)
 
             # Check for NaN in weights AND buffers (BatchNorm running stats)
@@ -1077,7 +912,6 @@ class Trainer:
                     break
 
             val_loss, metrics = self.validate(epoch)
-            self._last_metrics = metrics  # D-06/D-07: Store for metric-gated curriculum
             self.scheduler.step()
             elapsed = time.time() - t0
 
@@ -1098,19 +932,20 @@ class Trainer:
             else:
                 consecutive_nan_epochs = 0
 
-            is_best = val_loss < self.best_val_loss
+            monitor_value = metrics.get(self.monitor_val_metric, val_loss)
+            is_best = monitor_value < self.best_val_loss
             if is_best:
-                self.best_val_loss = val_loss
+                self.best_val_loss = monitor_value
                 self.patience_counter = 0
             else:
                 self.patience_counter += 1
-            self.save_checkpoint(epoch, val_loss, is_best)
+            self.save_checkpoint(epoch, monitor_value, is_best, metrics=metrics)
 
             self.history.append(
                 {
                     "epoch": epoch,
                     "train_loss": train_loss,
-                    "val_loss": val_loss,
+                    "val_loss": monitor_value,
                     "metrics": metrics,
                     "time_s": elapsed,
                 }
@@ -1118,7 +953,9 @@ class Trainer:
 
             print(
                 f"Epoch {epoch}/{self.max_epochs} ({elapsed:.1f}s) "
-                f"train={train_loss:.4f} val={val_loss:.4f}"
+                f"train={train_loss:.4f} "
+                f"{self.monitor_val_metric}={monitor_value:.4f} "
+                f"val_loss_hard={metrics.get('val_loss_hard', float('nan')):.4f}"
             )
 
             # Early stopping: stop if no improvement for patience epochs

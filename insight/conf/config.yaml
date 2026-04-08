@@ -1,12 +1,16 @@
 # Configuration for the IDSP Multi-Type EQ Blind Estimator
+# Phase 1+2 + Fix: Simplified 3-term loss with class-balanced focal loss,
+# mean-gain penalty, and direct log-freq regression.
 
-experiment_name: "idsp-eq-multitype-blind-estimator"
+experiment_name: "idsp-eq-multitype-fixed"
 seed: 42
 
 data:
   num_bands: 5
   sample_rate: 44100
   audio_duration: 3.0
+  dataset_size: 50000
+  val_dataset_size: 2000
   n_fft: 2048
   hop_length: 256
   n_mels: 128
@@ -15,13 +19,15 @@ data:
   q_bounds: [0.1, 10.0]
   filter_types: ["peaking", "lowshelf", "highshelf", "highpass", "lowpass"]
   type_weights: [0.5, 0.15, 0.15, 0.1, 0.1]
-  dataset_size: 200000
-  val_dataset_size: 2000
+  hp_lp_gain_target: "zero"
+  duration_range: [1.0, 5.0]
   train_split: 0.8
   val_split: 0.1
   test_split: 0.1
-  batch_size: 512
+  batch_size: 256
   num_workers: 8
+  precompute_mels: false
+  freeze_val_set: true
 
 model:
   encoder:
@@ -32,90 +38,48 @@ model:
     num_blocks: 4
     num_stacks: 2
     kernel_size: 3
+    dropout: 0.2              # was 0.1 (default) — stronger regularization
+    mel_noise_std: 0.05       # Gaussian noise on mel input for regularization
   num_bands: 5
-  learning_rate: 0.0001   # Reduced from 2e-4 to prevent oscillation
-  weight_decay: 0.02
+  type_conditioned_frequency: true
+  learning_rate: 0.0001
+  weight_decay: 0.05          # was 0.02 — stronger regularization for overfitting
+  head_lr_multiplier: 1.5
 
+# Rebalanced loss: type and embed-var get priority; param reduced to stop
+# over-competing with type signal; weight_decay increased for regularization.
 loss:
-  # Combined param weight disabled — use independent per-parameter weights
-  lambda_param: 0.0
-  lambda_gain: 1.0       # Increased from 1.5 (strengthen gain signal, was 6dB plateau)
-  lambda_freq: 1.5       # Increased from 1.0 (freq learning is critical)
-  lambda_q: 1.5          # Increased from 1.0
-  lambda_type: 3.0       # Increased to combat type collapse (was starving gain, type stuck at ~50%)
-  lambda_spectral: 0.1  # Reduced from 0.1 (spectral too strong relative to gain)
-  lambda_hmag: 0.5       # Increased from 0.3 (drives freq/type via spectral shape)
-  lambda_activity: 0.0    # Disabled (all bands always active, dead weight)
-  lambda_spread: 0.005    # Reduced from 0.02 (fights freq learning, gated in loss)
-  lambda_freq_match: 1.0
-  lambda_q_match: 0.5
-  lambda_type_match: 2.0
-  # Anti-collapse regularization
-  lambda_embed_var: 1.0
-  lambda_contrastive: 0.5  # Increased from 0.05
-  embed_var_threshold: 0.1
-  warmup_epochs: 5       # Gain-only warmup: epochs 0-4 gain only, 5+ freq/Q, 6+ type, 7+ spectral
+  lambda_spectral: 2.0
+  lambda_param: 1.0        # was 2.0 — reduced so type loss dominates early
+  lambda_type: 8.0         # was 2.0 — 4x increase to break type collapse
+  lambda_gain: 1.0
+  lambda_freq: 1.0
+  lambda_q: 0.5            # was 1.0 — Q is least diagnostic, reduce weight
+  lambda_gain_zero: 6.0
+  label_smoothing: 0.02
+  focal_gamma: 2.0
+  lambda_type_match: 1.0
+  lambda_type_prior: 2.0   # was 0.0 — KL penalty prevents distribution collapse
+  # Per-class focal loss multipliers (applied after inverse-frequency normalization).
+  # Index order: [peaking, lowshelf, highshelf, highpass, lowpass]
+  # Lowshelf gets 5x extra weight because it collapses to 5.5% accuracy (epoch 20).
+  class_weight_multipliers: [1.0, 5.0, 1.0, 1.0, 1.0]
+  # Penalty for predicting gain with wrong sign vs ground truth.
+  # 0.5 = half the log-cosh gain term contribution for each sign-flipped band.
+  sign_penalty_weight: 0.5
+  lambda_embed_var: 1.0    # was 0.3 — stronger anti-collapse (continuous penalty)
+  lambda_contrastive: 0.1
 
 trainer:
-  max_epochs: 120
+  max_epochs: 30
   accelerator: "auto"
   devices: 1
   precision: "bf16-mixed"
   log_every_n_steps: 10
   fast_dev_run: false
   gradient_accumulation_steps: 1
-  # Optimization flags (QLoRA/Unsloth/DeepSpeed-inspired)
-  use_8bit_optimizer: false
-  use_torch_compile: false
-  use_gradient_checkpointing: false
-  use_activation_quantization: false
-  use_deepspeed: false
-  deepspeed_config: "conf/deepspeed_config.json"
-  precompute_cache_path: "data/dataset_phase3_200k.pt"
   early_stopping_patience: 30
-  monitor_val_metric: "val_loss"
+  monitor_val_metric: "val_loss_soft"
   mode: "min"
 
-curriculum:
-  stages:
-    - name: "warmup"
-      epochs: 10
-      metric_thresholds: {}  # First stage: no gating
-      epoch_cap: 20
-      lambda_type: 1.5
-      gumbel_temperature: 0.5  # FIX-2: was 1.5; tau=0.5 sharpens type predictions → cleaner gradients
-      learning_rate_scale: 1.0
-    - name: "type_learning"
-      epochs: 20
-      metric_thresholds:
-        gain_mae: 6.5    # FIX-3: was 4.0; model at 5.8 dB — unblocks curriculum immediately
-      epoch_cap: 40
-      lambda_type: 2.0
-      gumbel_temperature: 0.8
-      learning_rate_scale: 1.0
-    - name: "consolidation"
-      epochs: 30
-      metric_thresholds:
-        gain_mae: 3.0
-        type_acc: 0.7   # Type accuracy must be > 70%
-      epoch_cap: 60
-      lambda_type: 5.0           # Increased from 2.0 to combat peaking filter collapse
-      gumbel_temperature: 0.3
-      learning_rate_scale: 1.0
-    - name: "finetune"
-      epochs: 10
-      metric_thresholds:
-        gain_mae: 2.5
-        type_acc: 0.85
-        q_mae: 0.4     # Q must be < 0.4 decades
-      epoch_cap: 20
-      lambda_type: 1.5
-      gumbel_temperature: 0.05
-      learning_rate_scale: 0.1
-
-refinement:
-  enabled: true
-  mc_dropout_passes: 5        # Number of stochastic forward passes for MC-Dropout
-  grad_refine_steps: 5        # Adam gradient steps for parameter refinement
-  grad_lr: 0.01               # Adam learning rate for refinement
-  refine_loss: "log_l1_mel"   # Spectral consistency loss type
+# Curriculum removed — trains all parameters jointly from epoch 0
