@@ -301,8 +301,44 @@ class DifferentiableBiquadCascade(nn.Module):
         H_mag_total = torch.clamp(H_mag_total, min=1e-6, max=1e4)
         return H_mag_total
 
+    def forward_soft(self, gain_db, freq, q, type_probs, n_fft=2048):
+        """
+        Differentiable soft-type frequency response.
+
+        Each filter type's band response is evaluated exactly, then mixed by
+        the predicted type probabilities before cascading the bands.
+        """
+        if type_probs is None:
+            raise ValueError("`type_probs` must be provided for soft response.")
+
+        H_per_type = []
+        for filter_idx in range(NUM_FILTER_TYPES):
+            filter_type = torch.full(
+                type_probs.shape[:2],
+                filter_idx,
+                dtype=torch.long,
+                device=type_probs.device,
+            )
+            b0, b1, b2, a1, a2 = self.compute_biquad_coeffs_multitype(
+                gain_db, freq, q, filter_type
+            )
+            H_per_type.append(self.freq_response(b0, b1, b2, a1, a2, n_fft))
+
+        H_stack = torch.stack(H_per_type, dim=2)
+        H_soft_bands = (H_stack * type_probs.unsqueeze(-1)).sum(dim=2)
+        H_mag_total = torch.clamp(H_soft_bands.prod(dim=1), min=1e-6, max=1e4)
+        return H_mag_total
+
     def process_audio(
-        self, audio, gain_db, freq, q, filter_type=None, n_fft=2048, hop_length=512
+        self,
+        audio,
+        gain_db,
+        freq,
+        q,
+        filter_type=None,
+        type_probs=None,
+        n_fft=2048,
+        hop_length=512,
     ):
         """
         Apply the differentiable EQ cascade to a time-domain audio signal.
@@ -329,7 +365,10 @@ class DifferentiableBiquadCascade(nn.Module):
         )
 
         # 2. Get magnitude response of the EQ curve
-        H_mag = self.forward(gain_db, freq, q, n_fft=n_fft, filter_type=filter_type)
+        if type_probs is not None:
+            H_mag = self.forward_soft(gain_db, freq, q, type_probs, n_fft=n_fft)
+        else:
+            H_mag = self.forward(gain_db, freq, q, n_fft=n_fft, filter_type=filter_type)
 
         # 3. Multiply standard complex spectrum by the magnitude response
         # H_mag shape: (Batch, FreqBins). Broadcast over time frames.
@@ -401,6 +440,70 @@ class EQParameterHead(nn.Module):
         return gain_db, freq, q
 
 
+def compute_per_type_shape_features(pred_gain, pred_freq, pred_q, dsp_cascade,
+                                     n_fft=512):
+    """
+    Fix 5: Per-type "what-if" spectral shape features for type classifier.
+
+    For each band, compute frequency response for ALL 5 filter types using
+    the current gain/freq/Q predictions. Extract 4 discriminative features
+    from each → 20 features per band total.
+
+    Features:
+    1. Energy asymmetry (low vs high frequency) — shelves have strong asymmetry
+    2. Roll-off slope — HP/LP have steep slopes, peaking ≈ 0
+    3. Peak-to-plateau ratio — peaking = high, shelf = low
+    4. Edge energy ratio — HP/LP have extreme values (near-zero on one side)
+
+    Args:
+        pred_gain: (B, N) gain in dB
+        pred_freq: (B, N) frequency in Hz
+        pred_q: (B, N) Q factor
+        dsp_cascade: DifferentiableBiquadCascade instance
+        n_fft: FFT size for evaluation (512 = fast + sufficient resolution)
+
+    Returns:
+        (B, N, 20) — 4 features × 5 types, all differentiable
+    """
+    B, N = pred_gain.shape
+    all_features = []
+
+    for type_idx in range(5):  # peaking, lowshelf, highshelf, hp, lp
+        type_tensor = torch.full((B, N), type_idx, device=pred_gain.device, dtype=torch.long)
+
+        # Compute per-band frequency response for this type
+        b0, b1, b2, a1, a2 = dsp_cascade.compute_biquad_coeffs_multitype(
+            pred_gain, pred_freq, pred_q, type_tensor)
+        H_mag = dsp_cascade.freq_response(b0, b1, b2, a1, a2, n_fft=n_fft)  # (B, N, n_fft_bins)
+        H_db = 20 * torch.log10(H_mag.clamp(min=1e-6))
+
+        n_bins = H_mag.shape[-1]
+        mid = n_bins // 2
+        q25 = n_bins // 4
+        q75 = 3 * n_bins // 4
+
+        # 1. Energy asymmetry — low vs high frequency
+        low_e = H_mag[..., :mid].pow(2).mean(-1)
+        high_e = H_mag[..., mid:].pow(2).mean(-1)
+        asymmetry = (low_e - high_e) / (low_e + high_e).clamp(min=1e-8)
+
+        # 2. Roll-off slope
+        slope = (H_db[..., q75:].mean(-1) - H_db[..., :q25].mean(-1)) / 40.0
+
+        # 3. Peak-to-plateau ratio (peaking = high, shelf = low)
+        peak_val = H_db.max(dim=-1).values
+        mean_val = H_db.mean(dim=-1)
+        peak_ratio = (peak_val - mean_val) / 12.0
+
+        # 4. Edge energy ratio (HP/LP have near-zero energy on one side)
+        edge_ratio = H_mag[..., :q25].pow(2).mean(-1) / H_mag[..., q75:].pow(2).mean(-1).clamp(min=1e-8)
+        edge_ratio = torch.log10(edge_ratio.clamp(min=1e-4, max=1e4)) / 4.0
+
+        all_features.append(torch.stack([asymmetry, slope, peak_ratio, edge_ratio], dim=-1))
+
+    return torch.cat(all_features, dim=-1)  # (B, N, 20)
+
+
 class MultiTypeEQParameterHead(nn.Module):
     """
     Parameter head for multi-type EQ estimation.
@@ -421,6 +524,7 @@ class MultiTypeEQParameterHead(nn.Module):
         n_shelf_bands=16,
         n_fft=2048,
         sample_rate=44100,
+        dsp_cascade=None,
     ):
         super().__init__()
         self.num_bands = num_bands
@@ -430,6 +534,7 @@ class MultiTypeEQParameterHead(nn.Module):
         self.n_shelf_bands = n_shelf_bands
         self.n_fft_bins = n_fft // 2 + 1
         self.sample_rate = sample_rate
+        self._dsp_cascade = dsp_cascade  # for Fix 5 shape features (plain attr, not submodule)
         self.log_f_min = FILTER_LOG_FREQ_BOUNDS[FILTER_PEAKING][0]
         self.log_f_max = FILTER_LOG_FREQ_BOUNDS[FILTER_PEAKING][1]
         hidden_dim = 64
@@ -441,20 +546,47 @@ class MultiTypeEQParameterHead(nn.Module):
             nn.ReLU(),
         )
 
-        # Hybrid spectral-parametric: predict H_db directly from embedding
-        # (spectral pretrain model achieves 0.20 dB MAE this way)
-        self.h_db_head = nn.Linear(embedding_dim, self.n_fft_bins)
-        nn.init.xavier_uniform_(self.h_db_head.weight, gain=0.1)
-        nn.init.zeros_(self.h_db_head.bias)
+        # Per-band H_db prediction from trunk features — expanded MLP decoder.
+        # Three-layer 64→256→512→1025 with GELU. Rank 512 allows complex
+        # spectral shapes (multi-peak shelves, asymmetric Q bumps).
+        self.h_db_head = nn.Sequential(
+            nn.Linear(hidden_dim, 256),
+            nn.GELU(),
+            nn.Linear(256, 512),
+            nn.GELU(),
+            nn.Linear(512, self.n_fft_bins),
+        )
+        nn.init.xavier_uniform_(self.h_db_head[0].weight, gain=0.1)
+        nn.init.xavier_uniform_(self.h_db_head[2].weight, gain=0.1)
+        nn.init.xavier_uniform_(self.h_db_head[4].weight, gain=0.1)
+        nn.init.zeros_(self.h_db_head[4].bias)
 
         # Learned mixing weight for gain: sigmoid(alpha) * gain_hdb + (1-sigmoid(alpha)) * gain_raw
         # Start at 0.0 (all H_db) since spectral path is proven better
         self.register_buffer('gain_mix_value', torch.tensor(0.1))
 
-        # Gain head: single linear + ste_clamp (kept as fallback/residual)
-        self.gain_head = nn.Linear(hidden_dim, 1)
-        nn.init.zeros_(self.gain_head.bias)
-        nn.init.xavier_uniform_(self.gain_head.weight, gain=0.1)
+        # FiLM: type probabilities → affine transform on trunk features
+        self.type_film_gamma = nn.Parameter(torch.ones(num_filter_types, hidden_dim) * 0.1)
+        self.type_film_beta = nn.Parameter(torch.zeros(num_filter_types, hidden_dim))
+
+        # Gumbel-Softmax temperature for differentiable type selection
+        self.register_buffer('gumbel_tau', torch.tensor(1.0))
+
+        # DC/Nyquist gain scale for shelf type evidence from per-band H_db.
+        # DC gain is the analytically exact discriminant: lowshelf has gain at DC,
+        # highshelf has gain at Nyquist, peaking has ~0 dB at both.
+        self.dc_shelf_scale = nn.Parameter(torch.tensor(1.0))
+
+        # Gain head: 2-layer MLP + ste_clamp (complements H_db interpolation path)
+        self.gain_head = nn.Sequential(
+            nn.Linear(hidden_dim, 32),
+            nn.GELU(),
+            nn.Linear(32, 1),
+        )
+        nn.init.xavier_uniform_(self.gain_head[0].weight, gain=0.1)
+        nn.init.zeros_(self.gain_head[0].bias)
+        nn.init.xavier_uniform_(self.gain_head[2].weight, gain=0.1)
+        nn.init.zeros_(self.gain_head[2].bias)
 
         self.freq_context_proj = (
             nn.Sequential(
@@ -603,7 +735,7 @@ class MultiTypeEQParameterHead(nn.Module):
         #   → strongly positive for highshelf boost (treble-heavy)
         self.direct_shelf_scale = nn.Parameter(torch.tensor(2.0))
 
-        type_input_dim = hidden_dim
+        type_input_dim = hidden_dim + (20 if dsp_cascade is not None else 0)
         self.type_head = nn.Sequential(
             nn.Linear(type_input_dim, 128),
             nn.ReLU(),
@@ -613,9 +745,12 @@ class MultiTypeEQParameterHead(nn.Module):
             nn.Linear(64, num_filter_types),
         )
         with torch.no_grad():
-            self.type_head[-1].bias.copy_(
-                torch.log(torch.tensor(DEFAULT_TYPE_PRIORS[:num_filter_types]))
-            )
+            # Small peaking bias to counteract shelf_bias_head which adds
+            # logits to lowshelf/highshelf during forward. Without this,
+            # peaking gets systematically outcompeted. Bias: [peaking=0.5,
+            # lowshelf=0, highshelf=0, highpass=0, lowpass=0]
+            self.type_head[-1].bias.zero_()
+            self.type_head[-1].bias[FILTER_PEAKING] = 0.5
         self.register_buffer(
             "gainful_type_mask",
             torch.tensor(FILTER_GAINFUL_MASK, dtype=torch.float32),
@@ -791,9 +926,25 @@ class MultiTypeEQParameterHead(nn.Module):
         gain_raw = self.gain_head(gain_hidden).squeeze(-1)
         gain_db_raw = ste_clamp(gain_raw * 24.0, -24.0, 24.0)
 
-        # ── Hybrid spectral-parametric: predict H_db from embedding ────────
-        h_db_pred = self.h_db_head(embedding)  # (B, n_fft_bins)
+        # ── Per-band H_db prediction from trunk features ────────────────
+        h_db_pred = self.h_db_head(trunk_out)  # (B, num_bands, n_fft_bins)
         shelf_context, shelf_attention = self._build_shelf_context(trunk_out, mel_profile)
+
+        # Fix 5: Compute per-type shape features using preliminary params
+        # (before FiLM conditioning, since type_probs aren't available yet)
+        if self._dsp_cascade is not None:
+            # Preliminary freq: use peaking bounds (full range), no type conditioning
+            freq_unit_prelim = torch.sigmoid(self.freq_head(trunk_out).squeeze(-1))
+            log_freq_prelim = self.log_f_min + freq_unit_prelim * (self.log_f_max - self.log_f_min)
+            freq_prelim = torch.exp(log_freq_prelim)
+            # Preliminary Q from un-FiLMed trunk
+            q_log_prelim = self.q_head(trunk_out).squeeze(-1)
+            q_log_prelim = ste_clamp(q_log_prelim, math.log(0.1), math.log(10.0))
+            q_prelim = torch.exp(q_log_prelim)
+            shape_features = compute_per_type_shape_features(
+                gain_db_raw, freq_prelim, q_prelim, self._dsp_cascade, n_fft=512)
+            type_input = torch.cat([type_input, shape_features], dim=-1)
+
         type_logits = self.type_head(type_input)
         shelf_bias = type_logits.new_zeros(type_logits.shape[0], self.num_bands, 2)
         if shelf_context is not None and self.shelf_bias_head is not None:
@@ -802,13 +953,13 @@ class MultiTypeEQParameterHead(nn.Module):
             shelf_attention = type_logits.new_zeros(
                 type_logits.shape[0], self.num_bands, self.n_mels
             )
-        low_shelf_bias = shelf_bias[..., 0]
-        high_shelf_bias = shelf_bias[..., 1]
+        low_shelf_bias = shelf_bias[..., 0] * 0.1
+        high_shelf_bias = shelf_bias[..., 1] * 0.1
         type_logits = type_logits.clone()
         type_logits[..., FILTER_LOWSHELF] += low_shelf_bias
         type_logits[..., FILTER_HIGHSHELF] += high_shelf_bias
-        type_logits[..., FILTER_PEAKING] -= 0.5 * (
-            low_shelf_bias + high_shelf_bias
+        type_logits[..., FILTER_PEAKING] -= 0.15 * (
+            shelf_bias[..., 0] + shelf_bias[..., 1]
         )
 
         # Direct non-learned shelf evidence from the feature map.
@@ -832,14 +983,52 @@ class MultiTypeEQParameterHead(nn.Module):
             type_logits[..., FILTER_LOWSHELF] += direct_lo  # broadcast over bands
             type_logits[..., FILTER_HIGHSHELF] += direct_hi
             type_logits[..., FILTER_PEAKING] -= 0.5 * (direct_lo + direct_hi)
-        type_probs = F.softmax(type_logits, dim=-1)
+
+        # DC/Nyquist gain from per-band H_db — analytically exact shelf evidence.
+        # Lowshelf: DC gain ≈ shelf gain (nonzero), Nyquist ≈ 0 dB
+        # Highshelf: DC ≈ 0 dB, Nyquist gain ≈ shelf gain (nonzero)
+        # Peaking: both DC and Nyquist ≈ 0 dB
+        # Gradients flow back to H_db head so it learns shelf spectral signatures
+        # driven by the type classification loss — virtuous cycle.
+        dc_gain = h_db_pred[:, :, 0]         # (B, N) gain at DC per band
+        nyquist_gain = h_db_pred[:, :, -1]   # (B, N) gain at Nyquist per band
+
+        # BUG FIX (circular reasoning): Previously, dc_gain and nyquist_gain
+        # were used directly as type evidence (+= gain * scale). This created a
+        # feedback loop: h_db_head (trained for reconstruction on ALL types)
+        # could produce small nonzero DC values even for non-shelf filters,
+        # which then incorrectly boosted shelf logits. The model learned to
+        # inflate DC gain to game the type classifier.
+        #
+        # FIX: Gate DC/Nyquist evidence with a sigmoid that only passes values
+        # above a meaningful threshold (~0.5 dB). Small DC gains (< 0.2 dB) from
+        # noise or non-shelf filters are suppressed; genuine shelf gains (> 1 dB)
+        # pass through fully. Breaks the circular dependency.
+        # Lower threshold to 0.5 dB and soften the slope from 3.0 to 2.0
+        # This allows gradients to flow for small shelf gains while still
+        # preventing gaming at near-zero gains.
+        dc_gate = torch.sigmoid((dc_gain.abs() - 0.5) * 2.0)
+        nyq_gate = torch.sigmoid((nyquist_gain.abs() - 0.5) * 2.0)
+
+        type_logits[..., FILTER_LOWSHELF] += dc_gain * dc_gate * self.dc_shelf_scale
+        type_logits[..., FILTER_HIGHSHELF] += nyquist_gain * nyq_gate * self.dc_shelf_scale
+        # Peaking bonus: only when BOTH DC and Nyquist are genuinely near zero
+        peaking_gate = (1.0 - dc_gate) * (1.0 - nyq_gate)
+        type_logits[..., FILTER_PEAKING] += peaking_gate * self.dc_shelf_scale
+
+        type_probs = F.gumbel_softmax(type_logits, tau=self.gumbel_tau.clamp(min=0.05), hard=False, dim=-1)
         filter_type = type_logits.argmax(dim=-1)
         type_probs_for_params = type_probs
+
+        # FiLM conditioning: modulate trunk features by predicted type
+        film_gamma = torch.einsum('bnt,td->bnd', type_probs, self.type_film_gamma)
+        film_beta = torch.einsum('bnt,td->bnd', type_probs, self.type_film_beta)
+        trunk_filmed = trunk_out * (1.0 + film_gamma) + film_beta
 
         # ── Final frequency computation ───────────────────────────────────
         if type_mel_context is not None and self.freq_context_proj is not None:
             freq_hidden = self.freq_context_proj(
-                torch.cat([trunk_out, type_mel_context], dim=-1)
+                torch.cat([trunk_filmed, type_mel_context], dim=-1)
             )
         else:
             freq_hidden = trunk_out
@@ -858,7 +1047,7 @@ class MultiTypeEQParameterHead(nn.Module):
         freq = torch.exp(log_freq)
 
         # ── Q computation ─────────────────────────────────────────────────
-        q_log = self.q_head(trunk_out).squeeze(-1)
+        q_log = self.q_head(trunk_filmed).squeeze(-1)
         q_log = ste_clamp(q_log, math.log(0.1), math.log(10.0))
         q = torch.exp(q_log)
 
@@ -870,10 +1059,12 @@ class MultiTypeEQParameterHead(nn.Module):
         bin_ceil = bin_floor + 1
         weight = (bin_continuous - bin_floor.float()).clamp(0.0, 1.0)  # (B, N)
 
-        # Gather H_db values at floor and ceil bins for each band
+        # Gather H_db values at floor and ceil bins for each band (per-band dim=2)
         B = h_db_pred.shape[0]
-        hdb_floor = h_db_pred.gather(1, bin_floor)  # (B, N)
-        hdb_ceil = h_db_pred.gather(1, bin_ceil)     # (B, N)
+        idx_floor = bin_floor.unsqueeze(-1)  # (B, N, 1)
+        idx_ceil = bin_ceil.unsqueeze(-1)    # (B, N, 1)
+        hdb_floor = h_db_pred.gather(2, idx_floor).squeeze(-1)  # (B, N)
+        hdb_ceil = h_db_pred.gather(2, idx_ceil).squeeze(-1)    # (B, N)
         # Differentiable interpolation
         gain_from_hdb = (1.0 - weight) * hdb_floor + weight * hdb_ceil  # (B, N)
 
@@ -897,6 +1088,269 @@ class MultiTypeEQParameterHead(nn.Module):
                 "shelf_bias": shelf_bias,
                 "shelf_attention": shelf_attention,
                 "h_db_pred": h_db_pred,
+                "band_embedding": trunk_out,
+            }
+            return gain_db, freq, q, type_logits, type_probs, filter_type, aux
+
+        return gain_db, freq, q, type_logits, type_probs, filter_type
+class ParameterSubHead(nn.Module):
+    """
+    Sub-head predicting gain, freq, Q for a specific group of filter types.
+    """
+    def __init__(self, input_dim, num_bands, gain_enabled=True, q_min=0.05, q_max=15.0):
+        super().__init__()
+        self.num_bands = num_bands
+        self.gain_enabled = gain_enabled
+        self.q_min = q_min
+        self.q_max = q_max
+
+        if gain_enabled:
+            self.gain_head = nn.Sequential(
+                nn.Linear(input_dim, 64),
+                nn.LayerNorm(64),
+                nn.GELU(),
+                nn.Linear(64, 1)
+            )
+
+        self.freq_head = nn.Sequential(
+            nn.Linear(input_dim, 64),
+            nn.LayerNorm(64),
+            nn.GELU(),
+            nn.Linear(64, 1)
+        )
+
+        self.q_head = nn.Sequential(
+            nn.Linear(input_dim, 64),
+            nn.LayerNorm(64),
+            nn.GELU(),
+            nn.Linear(64, 1)
+        )
+
+    def forward(self, x):
+        """
+        x: (B, num_bands, input_dim)
+        Returns: gain_db, freq_unit, q
+        """
+        if self.gain_enabled:
+            gain_raw = self.gain_head(x).squeeze(-1)
+            gain_db_raw = ste_clamp(gain_raw * 24.0, -24.0, 24.0)
+        else:
+            gain_db_raw = x.new_zeros(x.shape[0], self.num_bands)
+
+        freq_unit = torch.sigmoid(self.freq_head(x).squeeze(-1))
+
+        q_log = self.q_head(x).squeeze(-1)
+        q_log = ste_clamp(q_log, math.log(self.q_min), math.log(self.q_max))
+        q = torch.exp(q_log)
+
+        return gain_db_raw, freq_unit, q
+
+
+class TypeGroupedParameterHead(nn.Module):
+    """
+    Two-stage parameter head that classifies type first, then routes to
+    specialized sub-heads (peaking, shelf, pass) for parameter prediction.
+    """
+    def __init__(
+        self,
+        embedding_dim,
+        num_bands=5,
+        num_filter_types=NUM_FILTER_TYPES,
+        n_mels=0,
+        type_conditioned_frequency=True,
+        n_shelf_bands=16,
+        n_fft=2048,
+        sample_rate=44100,
+        dsp_cascade=None,
+    ):
+        super().__init__()
+        self.num_bands = num_bands
+        self.num_filter_types = num_filter_types
+        self.n_mels = n_mels
+        self.type_conditioned_frequency = type_conditioned_frequency
+        self.n_shelf_bands = n_shelf_bands
+        self.n_fft_bins = n_fft // 2 + 1
+        self.sample_rate = sample_rate
+        self._dsp_cascade = dsp_cascade
+
+        self.log_f_min = math.log(20.0)
+        self.log_f_max = math.log(20000.0)
+
+        self.register_buffer("gumbel_tau", torch.tensor(1.0))
+
+        # Trunk for base band embeddings
+        self.trunk = nn.Sequential(
+            nn.Linear(embedding_dim, embedding_dim),
+            nn.LayerNorm(embedding_dim),
+            nn.GELU(),
+            nn.Linear(embedding_dim, num_bands * 64),
+        )
+
+        # 1. Type Classification Stage (Stage 1)
+        # -----------------------------------------------------
+        type_input_dim = 64
+
+        # Optional mel context for type
+        self.type_mel_proj = None
+        if n_mels > 0:
+            self.type_mel_proj = nn.Linear(n_mels, 32)
+            type_input_dim += 32
+
+        self.type_classifier = nn.Sequential(
+            nn.Linear(type_input_dim, 128),
+            nn.LayerNorm(128),
+            nn.GELU(),
+            nn.Linear(128, 64),
+            nn.LayerNorm(64),
+            nn.GELU(),
+            nn.Linear(64, 32),
+            nn.LayerNorm(32),
+            nn.GELU(),
+            nn.Linear(32, num_filter_types)
+        )
+
+        # 2. Parameter Stage (Stage 2)
+        # -----------------------------------------------------
+        # FiLM conditioning
+        self.type_film_gamma = nn.Parameter(torch.randn(num_filter_types, 64) * 0.02)
+        self.type_film_beta = nn.Parameter(torch.randn(num_filter_types, 64) * 0.02)
+
+        # Sub-heads for specific parameter groups
+        self.peaking_head = ParameterSubHead(64, num_bands, gain_enabled=True, q_min=0.05, q_max=15.0)
+        self.shelf_head = ParameterSubHead(64, num_bands, gain_enabled=True, q_min=0.3, q_max=3.0)
+        self.pass_head = ParameterSubHead(64, num_bands, gain_enabled=False, q_min=0.1, q_max=1.0)
+
+        # Still keep h_db_pred for spectral loss, predicting per-band magnitude responses
+        self.h_db_head = nn.Sequential(
+            nn.Linear(64, 128),
+            nn.LayerNorm(128),
+            nn.GELU(),
+            nn.Linear(128, self.n_fft_bins)
+        )
+
+        self.register_buffer("gain_mix_value", torch.tensor(0.5))
+
+        self.register_buffer(
+            "type_log_f_min",
+            torch.tensor([bounds[0] for bounds in FILTER_LOG_FREQ_BOUNDS], dtype=torch.float32)
+        )
+        self.register_buffer(
+            "type_log_f_max",
+            torch.tensor([bounds[1] for bounds in FILTER_LOG_FREQ_BOUNDS], dtype=torch.float32)
+        )
+        self.register_buffer(
+            "gainful_type_mask",
+            torch.tensor(FILTER_GAINFUL_MASK, dtype=torch.float32)
+        )
+
+    def _center_mel_profile(self, mel_profile):
+        if mel_profile is None:
+            return None
+        return mel_profile - mel_profile.mean(dim=-1, keepdim=True)
+
+    def forward(
+        self,
+        embedding,
+        mel_profile=None,
+        hard_types=False,
+        return_aux=False,
+    ):
+        trunk_out = self.trunk(embedding)  # (B, num_bands * 64)
+        trunk_out = trunk_out.view(-1, self.num_bands, 64)
+
+        # ── STAGE 1: Type Classification ──────────────────────────────────────
+        type_input = trunk_out
+        mel_profile_centered = self._center_mel_profile(mel_profile)
+
+        if self.type_mel_proj is not None and mel_profile_centered is not None:
+            # Simple global context
+            global_mel = self.type_mel_proj(mel_profile_centered.unsqueeze(1))
+            global_mel = global_mel.expand(-1, self.num_bands, -1)
+            type_input = torch.cat([trunk_out, global_mel], dim=-1)
+
+        type_logits = self.type_classifier(type_input)
+        type_probs = F.gumbel_softmax(type_logits, tau=self.gumbel_tau.clamp(min=0.05), hard=False, dim=-1)
+        filter_type = type_logits.argmax(dim=-1)
+
+        # ── STAGE 2: Parameter Prediction ─────────────────────────────────────
+        # Modulate trunk features by predicted type (soft for training, hard for inference)
+        probs_for_film = F.one_hot(filter_type, self.num_filter_types).float() if hard_types else type_probs
+
+        film_gamma = torch.einsum('bnt,td->bnd', probs_for_film, self.type_film_gamma)
+        film_beta = torch.einsum('bnt,td->bnd', probs_for_film, self.type_film_beta)
+        trunk_filmed = trunk_out * (1.0 + film_gamma) + film_beta
+
+        # Predict from each sub-head
+        gain_peaking, freq_unit_peaking, q_peaking = self.peaking_head(trunk_filmed)
+        gain_shelf, freq_unit_shelf, q_shelf = self.shelf_head(trunk_filmed)
+        gain_pass, freq_unit_pass, q_pass = self.pass_head(trunk_filmed)
+
+        # Group probabilities
+        prob_peaking = probs_for_film[..., FILTER_PEAKING:FILTER_PEAKING+1]  # (B, N, 1)
+        prob_shelf = probs_for_film[..., FILTER_LOWSHELF:FILTER_HIGHSHELF+1].sum(dim=-1, keepdim=True)  # (B, N, 1)
+        prob_pass = probs_for_film[..., FILTER_HIGHPASS:FILTER_LOWPASS+1].sum(dim=-1, keepdim=True)  # (B, N, 1)
+
+        # Soft mixture of outputs
+        gain_db_raw = (gain_peaking * prob_peaking.squeeze(-1) +
+                       gain_shelf * prob_shelf.squeeze(-1) +
+                       gain_pass * prob_pass.squeeze(-1))
+
+        freq_unit = (freq_unit_peaking * prob_peaking.squeeze(-1) +
+                     freq_unit_shelf * prob_shelf.squeeze(-1) +
+                     freq_unit_pass * prob_pass.squeeze(-1))
+
+        q = (q_peaking * prob_peaking.squeeze(-1) +
+             q_shelf * prob_shelf.squeeze(-1) +
+             q_pass * prob_pass.squeeze(-1))
+
+        # ── Final Conversions & Output ────────────────────────────────────────
+        # H_db prediction for spectral loss
+        h_db_pred = self.h_db_head(trunk_out)  # (B, num_bands, n_fft_bins)
+
+        if self.type_conditioned_frequency:
+            if hard_types:
+                log_f_min = self.type_log_f_min[filter_type]
+                log_f_max = self.type_log_f_max[filter_type]
+            else:
+                log_f_min = (type_probs * self.type_log_f_min.view(1, 1, -1)).sum(dim=-1)
+                log_f_max = (type_probs * self.type_log_f_max.view(1, 1, -1)).sum(dim=-1)
+        else:
+            log_f_min = torch.full_like(freq_unit, self.log_f_min)
+            log_f_max = torch.full_like(freq_unit, self.log_f_max)
+
+        log_freq = log_f_min + freq_unit * (log_f_max - log_f_min)
+        freq = torch.exp(log_freq)
+
+        # Hybrid gain interpolation
+        freq_clamped = freq.clamp(min=1.0, max=self.sample_rate / 2.0 - 1.0)
+        bin_continuous = freq_clamped / (self.sample_rate / 2.0) * (self.n_fft_bins - 1)
+        bin_floor = bin_continuous.long().clamp(0, self.n_fft_bins - 2)
+        bin_ceil = bin_floor + 1
+        weight = (bin_continuous - bin_floor.float()).clamp(0.0, 1.0)
+
+        B = h_db_pred.shape[0]
+        idx_floor = bin_floor.unsqueeze(-1)
+        idx_ceil = bin_ceil.unsqueeze(-1)
+        hdb_floor = h_db_pred.gather(2, idx_floor).squeeze(-1)
+        hdb_ceil = h_db_pred.gather(2, idx_ceil).squeeze(-1)
+        gain_from_hdb = (1.0 - weight) * hdb_floor + weight * hdb_ceil
+
+        mix = self.gain_mix_value.clamp(0.0, 1.0)
+        gain_db_mixed = mix * gain_from_hdb + (1.0 - mix) * gain_db_raw
+
+        if hard_types:
+            gain_db = gain_db_mixed * self.gainful_type_mask[filter_type]
+        else:
+            gain_db = gain_db_mixed
+
+        if return_aux:
+            aux = {
+                "mel_profile_centered": mel_profile_centered,
+                "h_db_pred": h_db_pred,
+                "band_embedding": trunk_out,
+                "gain_aux_summary": None,
+                "shelf_bias": type_logits.new_zeros(type_logits.shape[0], self.num_bands, 2),
+                "shelf_attention": type_logits.new_zeros(type_logits.shape[0], self.num_bands, self.n_mels)
             }
             return gain_db, freq, q, type_logits, type_probs, filter_type, aux
 
