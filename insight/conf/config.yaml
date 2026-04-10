@@ -1,91 +1,125 @@
-# Configuration for the IDSP Multi-Type EQ Blind Estimator
-# Phase 1+2 + Fix: Simplified 3-term loss with class-balanced focal loss,
-# mean-gain penalty, and direct log-freq regression.
+# Configuration for the audio-first IDSP multi-type EQ estimator.
 
-experiment_name: "idsp-eq-multitype-fixed"
+experiment_name: "idsp-eq-audio-first"
 seed: 42
 
 data:
   num_bands: 5
   sample_rate: 44100
   audio_duration: 3.0
-  dataset_size: 50000
-  val_dataset_size: 2000
+  dataset_size: 200000
+  val_dataset_size: 5000
   n_fft: 2048
   hop_length: 256
   n_mels: 128
-  gain_bounds: [-24.0, 24.0]
+  gain_bounds: [-12.0, 12.0]
   freq_bounds: [20.0, 20000.0]
-  q_bounds: [0.1, 10.0]
+  q_bounds: [0.05, 15.0]
   filter_types: ["peaking", "lowshelf", "highshelf", "highpass", "lowpass"]
-  type_weights: [0.5, 0.15, 0.15, 0.1, 0.1]
+  type_weights: [0.20, 0.20, 0.20, 0.20, 0.20]
+  adversarial_fraction: 0.25
   hp_lp_gain_target: "zero"
   duration_range: [1.0, 5.0]
   train_split: 0.8
   val_split: 0.1
   test_split: 0.1
-  batch_size: 256
-  num_workers: 8
+  batch_size: 2048
+  num_workers: 4
   precompute_mels: false
   freeze_val_set: true
 
 model:
+  two_stage: true
+  type_pretrain_epochs: 5
   encoder:
+    backend: "ast"
+    ast_model_name: "vit_small_patch16_224"
+    freeze_epochs: 10
     type: "tcn"
+    wav2vec2_checkpoint: "facebook/wav2vec2-base"
     n_mels: 128
-    embedding_dim: 128
+    embedding_dim: 256
     channels: 128
     num_blocks: 4
     num_stacks: 2
     kernel_size: 3
-    dropout: 0.2              # was 0.1 (default) — stronger regularization
-    mel_noise_std: 0.05       # Gaussian noise on mel input for regularization
+    dropout: 0.2
+    mel_noise_std: 0.05
   num_bands: 5
   type_conditioned_frequency: true
-  n_shelf_bands: 16        # mel bands used for lo/hi energy ratio shelf detection (out of 128)
-  # Per-band shelf features: localized energy ratios at each band's predicted frequency
-  # Replaces old global 3-scalar broadcast with 6 per-band + 5 multi-scale global features
-  shelf_feature_gaussian_sigma: 8.0   # mel band width for per-band energy window
-  shelf_feature_n_scales: 5          # multi-scale global energy ratio cutoffs [4,8,16,32,64]
+  n_shelf_bands: 16
   learning_rate: 0.0001
-  weight_decay: 0.05          # was 0.02 — stronger regularization for overfitting
+  weight_decay: 0.05
   head_lr_multiplier: 1.5
+  spectral_pretrain_path: "checkpoints/spectral_pretrain_best.pt"
 
-# Rebalanced loss: type and embed-var get priority; param reduced to stop
-# over-competing with type signal; weight_decay increased for regularization.
 loss:
-  lambda_spectral: 2.0
-  lambda_param: 1.0        # was 2.0 — reduced so type loss dominates early
-  lambda_type: 8.0         # was 2.0 — 4x increase to break type collapse
-  lambda_gain: 4.0         # was 1.0 — 4x increase to prioritize gain regression
+  lambda_hmag: 0.25
+  lambda_type: 4.0
+  lambda_gain: 2.0
   lambda_freq: 1.0
-  lambda_q: 0.5            # was 1.0 — Q is least diagnostic, reduce weight
-  lambda_gain_zero: 6.0
-  label_smoothing: 0.02
+  lambda_q: 0.5
+  lambda_gain_zero: 0.25
+  lambda_spectral: 1.5
+  lambda_typed_spectral: 1.0
+  label_smoothing: 0.01
   focal_gamma: 2.0
+  type_loss_mode: "focal"
   lambda_type_match: 1.0
-  lambda_type_prior: 15.0  # strong KL prior to prevent any type collapse
-  # Per-class focal loss multipliers (applied after inverse-frequency normalization).
-  # Index order: [peaking, lowshelf, highshelf, highpass, lowpass]
-  # Equal multipliers — rely on KL prior + inverse-frequency focal weights for balance
-  class_weight_multipliers: [0.5, 5.0, 2.0, 2.0, 2.0]
-  # Penalty for predicting gain with wrong sign vs ground truth.
-  # 0.5 = half the log-cosh gain term contribution for each sign-flipped band.
+  lambda_type_prior: 0.05
+  lambda_type_entropy: 0.02
+  class_weight_multipliers: [1.0, 1.75, 1.25, 1.0, 1.0]
   sign_penalty_weight: 0.5
-  lambda_embed_var: 1.0    # was 0.3 — stronger anti-collapse (continuous penalty)
-  lambda_contrastive: 0.1
-  lambda_hdb: 2.0
+  lambda_embed_var: 0.1
+  lambda_contrastive: 0.05
+  lambda_hdb: 0.5
+  lambda_film_diversity: 0.1
+  audio_fft_sizes: [1024, 2048, 512]
+  audio_hop_sizes: [120, 240, 50]
+  audio_win_lengths: [600, 1200, 240]
+  audio_n_mels: 64
+  audio_n_mfcc: 20
 
 trainer:
-  max_epochs: 30
+  max_epochs: 60
   accelerator: "auto"
   devices: 1
   precision: "bf16-mixed"
   log_every_n_steps: 10
   fast_dev_run: false
-  gradient_accumulation_steps: 1
+  gradient_accumulation_steps: 2
   early_stopping_patience: 30
-  monitor_val_metric: "val_loss_soft"
+  monitor_val_metric: "primary_val_score"
   mode: "min"
 
-# Curriculum removed — trains all parameters jointly from epoch 0
+curriculum:
+  stages:
+    - name: "multitype_lowshelf_focus"
+      epochs: 10
+      filter_types: ["peaking", "lowshelf", "highshelf", "highpass", "lowpass"]
+      gain_bounds: [-6.0, 6.0]
+      q_bounds: [0.3, 5.0]
+      type_weights: [0.20, 0.35, 0.15, 0.15, 0.15]
+      adversarial_fraction: 0.40
+      lambda_type: 1.0
+    - name: "multitype_midrange"
+      epochs: 15
+      filter_types: ["peaking", "lowshelf", "highshelf", "highpass", "lowpass"]
+      gain_bounds: [-9.0, 9.0]
+      q_bounds: [0.2, 8.0]
+      type_weights: [0.25, 0.30, 0.20, 0.125, 0.125]
+      adversarial_fraction: 0.30
+      lambda_type: 1.0
+    - name: "multitype_full_range"
+      epochs: 35
+      filter_types: ["peaking", "lowshelf", "highshelf", "highpass", "lowpass"]
+      gain_bounds: [-12.0, 12.0]
+      q_bounds: [0.05, 15.0]
+      type_weights: [0.20, 0.20, 0.20, 0.20, 0.20]
+      adversarial_fraction: 0.20
+      lambda_type: 1.0
+
+gumbel:
+  start_tau: 2.0
+  min_tau: 0.1
+  warmup_epochs: 10
