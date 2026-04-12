@@ -19,8 +19,8 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 torch.set_float32_matmul_precision("high")  # TF32 for 3x matmul throughput on Ampere+
-torch.backends.cudnn.benchmark = True  # Auto-tune convolution algorithms for fixed input sizes
 from torch.utils.data import DataLoader, random_split
+from functools import partial
 from model_tcn import StreamingTCNModel
 from dsp_frontend import STFTFrontend
 from differentiable_eq import FILTER_HIGHSHELF, FILTER_LOWSHELF
@@ -32,13 +32,25 @@ try:
     from dataset_musdb import MUSDB18EQDataset
 except ImportError:
     MUSDB18EQDataset = None
+try:
+    from dataset_litdata import LitdataEQDataset
+except ImportError:
+    LitdataEQDataset = None
 import yaml
 from pathlib import Path
 import time
 import json
 import math
 import os
+import signal
 from contextlib import nullcontext
+from pipeline_utils import seed_worker, set_global_seed, utc_now_iso
+from pipeline_utils import (
+    validate_dependencies,
+    validate_config_schema,
+    validate_path_under_root,
+)
+from structured_logger import StructuredLogger
 
 try:
     import bitsandbytes as bnb
@@ -134,6 +146,7 @@ def validate_config(cfg):
     loss_cfg = cfg.get("loss", {})
     model_cfg = cfg.get("model", {})
     encoder_cfg = model_cfg.get("encoder", {})
+    dataset_type = str(data_cfg.get("dataset_type", "synthetic")).lower()
     lambda_gain = float(loss_cfg.get("lambda_gain", 1.0))
     lambda_freq = float(loss_cfg.get("lambda_freq", 1.0))
     lambda_q = float(loss_cfg.get("lambda_q", 1.0))
@@ -144,6 +157,18 @@ def validate_config(cfg):
     type_loss_mode = str(loss_cfg.get("type_loss_mode", "focal")).lower()
     hp_lp_gain_target = data_cfg.get("hp_lp_gain_target", "zero")
     encoder_backend = encoder_cfg.get("backend", "hybrid_tcn")
+    if dataset_type not in {"synthetic", "musdb", "litdata"}:
+        raise ValueError(
+            "`data.dataset_type` must be one of {'synthetic', 'musdb', 'litdata'}."
+        )
+    if dataset_type == "musdb" and MUSDB18EQDataset is None:
+        raise ValueError(
+            "`data.dataset_type=musdb` requires `dataset_musdb.py` to be available."
+        )
+    if dataset_type == "litdata" and LitdataEQDataset is None:
+        raise ValueError(
+            "`data.dataset_type=litdata` requires the optional litdata dataset backend."
+        )
     if hp_lp_gain_target != "zero":
         raise ValueError(
             "Only `data.hp_lp_gain_target: zero` is supported for the "
@@ -190,12 +215,40 @@ def validate_config(cfg):
 class Trainer:
     def __init__(self, config_path="conf/config.yaml", resume_path=None):
         self.cfg = load_config(config_path)
-        self.device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+
+        # AUDIT: MEDIUM-11 — Config schema validation (fail fast on typos/misconfig)
+        config_issues = validate_config_schema(self.cfg)
+        if config_issues:
+            for issue in config_issues:
+                print(f"  [config] VALIDATION ISSUE: {issue}")
+            if any("missing required" in i.lower() for i in config_issues):
+                raise ValueError(
+                    f"Config has {len(config_issues)} validation issue(s). "
+                    f"Fix required keys before training."
+                )
+
+        # AUDIT: HIGH-08 — Dependency validation (fail fast, not mid-training)
+        dep_errors = validate_dependencies(self.cfg)
+        if dep_errors:
+            for err in dep_errors:
+                print(f"  [deps] MISSING: {err}")
+            raise RuntimeError(
+                f"{len(dep_errors)} dependency issue(s) found. "
+                f"Install missing packages or adjust config."
+            )
 
         data_cfg = self.cfg["data"]
         model_cfg = self.cfg["model"]
         loss_cfg = self.cfg["loss"]
         trainer_cfg = self.cfg["trainer"]
+        self.seed = int(self.cfg.get("seed", 42))
+        self.deterministic = bool(trainer_cfg.get("deterministic", False))
+        set_global_seed(self.seed, deterministic=self.deterministic)
+        torch.backends.cudnn.benchmark = bool(
+            trainer_cfg.get("cudnn_benchmark", not self.deterministic)
+        ) and not self.deterministic
+
+        self.device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
         self.num_bands = data_cfg["num_bands"]
         self.sample_rate = data_cfg["sample_rate"]
@@ -212,6 +265,9 @@ class Trainer:
         self.curriculum_stages = self.cfg.get("curriculum", {}).get("stages", [])
         self._current_curriculum_stage_idx = None
         self._curriculum_warned_precomputed = False
+        self.current_epoch = 0
+        self._received_signal = None
+        self._signal_handlers_registered = False
 
         # Optimization flags from config
         self.use_8bit_optimizer = (
@@ -227,6 +283,8 @@ class Trainer:
         self.use_deepspeed = trainer_cfg.get("use_deepspeed", False) and HAS_DEEPSPEED
         self.precompute_cache_path = trainer_cfg.get("precompute_cache_path", None)
         self.validate_render_audio = trainer_cfg.get("validate_render_audio", False)
+        # AUDIT: LOW-34 — Profiling infrastructure
+        self.profile_n_batches = 0  # Set via --profile CLI flag
 
         if self.use_8bit_optimizer:
             print("  [opt] Using 8-bit AdamW optimizer (bitsandbytes)")
@@ -240,15 +298,14 @@ class Trainer:
             print("  [opt] Using DeepSpeed ZeRO-2 optimization")
 
         # Dataset selection: "musdb" for real audio, "synthetic" (or unset) for synthetic
-        dataset_type = data_cfg.get("dataset_type", "synthetic")
+        dataset_type = str(data_cfg.get("dataset_type", "synthetic")).lower()
         dataset_size = data_cfg.get("dataset_size", 30000)
         val_dataset_size = data_cfg.get("val_dataset_size", 2000)
-        ds_kwargs = dict(
+        shared_ds_kwargs = dict(
             num_bands=self.num_bands,
             sample_rate=self.sample_rate,
             duration=data_cfg.get("audio_duration", 1.5),
             n_fft=self.n_fft,
-            size=dataset_size,
             gain_range=tuple(data_cfg["gain_bounds"]),
             freq_range=tuple(data_cfg["freq_bounds"]),
             q_range=tuple(data_cfg["q_bounds"]),
@@ -256,16 +313,37 @@ class Trainer:
             hp_lp_gain_target=data_cfg.get("hp_lp_gain_target", "zero"),
             precompute_mels=data_cfg.get("precompute_mels", True),
             n_mels=data_cfg.get("n_mels", 128),
+            base_seed=self.seed,
         )
-        synthetic_ds_kwargs = {
-            **ds_kwargs,
+        train_ds_kwargs = {
+            **shared_ds_kwargs,
+            "size": dataset_size,
+            "base_seed": self.seed,
+        }
+        val_ds_kwargs = {
+            **shared_ds_kwargs,
+            "size": val_dataset_size,
+            "base_seed": self.seed + 1_000_000,
+        }
+        synthetic_train_kwargs = {
+            **train_ds_kwargs,
             "duration_range": tuple(data_cfg["duration_range"])
             if data_cfg.get("duration_range") is not None
             else None,
-            }
+        }
+        synthetic_val_kwargs = {
+            **val_ds_kwargs,
+            "duration_range": tuple(data_cfg["duration_range"])
+            if data_cfg.get("duration_range") is not None
+            else None,
+        }
 
         if dataset_type == "litdata":
             litdata_dir = data_cfg.get("litdata_dir")
+            if LitdataEQDataset is None:
+                raise RuntimeError(
+                    "`dataset_type=litdata` was selected but `dataset_litdata.py` is unavailable."
+                )
             print(f"  [data] Using litdata streaming dataset from {litdata_dir}")
             self.train_dataset = LitdataEQDataset(
                 data_dir=litdata_dir,
@@ -282,11 +360,11 @@ class Trainer:
             self.train_dataset = MUSDB18EQDataset(
                 musdb_root=musdb_root,
                 subsets=musdb_subsets,
-                **ds_kwargs,
+                **train_ds_kwargs,
             )
         else:
             print(f"  [data] Using synthetic dataset")
-            self.train_dataset = SyntheticEQDataset(**synthetic_ds_kwargs)
+            self.train_dataset = SyntheticEQDataset(**synthetic_train_kwargs)
 
         # Try loading precomputed cache from disk (skip for litdata)
         if dataset_type != "litdata":
@@ -323,17 +401,17 @@ class Trainer:
                 self.train_dataset, self.val_dataset = random_split(
                     self.train_dataset,
                     [train_size, val_size],
-                    generator=torch.Generator().manual_seed(42),
+                    generator=torch.Generator().manual_seed(self.seed + 17),
                 )
         elif dataset_type == "musdb":
             self.val_dataset = MUSDB18EQDataset(
                 musdb_root=musdb_root,
                 subsets=musdb_subsets,
-                **{**ds_kwargs, "size": val_dataset_size},
+                **val_ds_kwargs,
             )
         else:
             self.val_dataset = SyntheticEQDataset(
-                **{**synthetic_ds_kwargs, "size": val_dataset_size},
+                **synthetic_val_kwargs,
             )
         if dataset_type != "litdata":
             if data_cfg.get("precompute_mels", True) or data_cfg.get(
@@ -349,7 +427,7 @@ class Trainer:
             self.train_set, self.test_set = random_split(
                 self.train_dataset,
                 [n_train, n_test],
-                generator=torch.Generator().manual_seed(42),
+                generator=torch.Generator().manual_seed(self.seed + 33),
             )
         else:
             # litdata: train_dataset/val_dataset are already split above
@@ -358,7 +436,18 @@ class Trainer:
 
         # Pin memory for async GPU transfer
         pin_memory = self.device.type == "cuda"
-        num_workers = data_cfg.get("num_workers", 0)
+        # AUDIT: HIGH-14 — Default num_workers > 0 to avoid GPU idle time
+        # Use min(cpu_count() - 1, 8) as a sensible default
+        default_num_workers = min(max(1, (os.cpu_count() or 4) - 1), 8)
+        num_workers = data_cfg.get("num_workers", default_num_workers)
+        if num_workers == 0:
+            print(
+                "  [data] WARNING: num_workers=0 — data generation blocks GPU. "
+                f"Set num_workers>=2 in config (auto-detected {os.cpu_count()} CPUs)"
+            )
+        train_loader_generator = torch.Generator().manual_seed(self.seed + 101)
+        val_loader_generator = torch.Generator().manual_seed(self.seed + 202)
+        worker_init = partial(seed_worker, base_seed=self.seed)
 
         self.train_loader = DataLoader(
             self.train_set,
@@ -370,6 +459,8 @@ class Trainer:
             drop_last=True,
             prefetch_factor=8 if num_workers > 0 else None,
             persistent_workers=True if num_workers > 0 else False,
+            generator=train_loader_generator,
+            worker_init_fn=worker_init,
         )
         self.val_loader = DataLoader(
             self.val_dataset,
@@ -380,6 +471,18 @@ class Trainer:
             pin_memory=pin_memory,
             prefetch_factor=8 if num_workers > 0 else None,
             persistent_workers=True if num_workers > 0 else False,
+            generator=val_loader_generator,
+            worker_init_fn=worker_init,
+        )
+
+        self.run_dir = Path("checkpoints")
+        self.run_dir.mkdir(exist_ok=True)
+        self.run_metadata_path = self.run_dir / "run_metadata.json"
+        self.training_events_path = self.run_dir / "training_events.jsonl"
+        self._write_run_metadata(
+            config_path=config_path,
+            resume_path=resume_path,
+            dataset_type=dataset_type,
         )
 
         # Model
@@ -410,6 +513,7 @@ class Trainer:
             clap_model_path=enc_cfg.get("clap_model_path"),
             mert_checkpoint=enc_cfg.get("mert_checkpoint", "m-a-p/MERT-v1-95M"),
             two_stage=model_cfg.get("two_stage", False),
+            hierarchical_type_head=model_cfg.get("hierarchical_type_head", False),
         ).to(self.device)
 
         # Spectral pretrain initialization: load encoder weights from a pre-trained
@@ -566,7 +670,11 @@ class Trainer:
         if self.use_8bit_optimizer:
             self.optimizer = bnb.optim.AdamW8bit(param_groups)
         else:
-            self.optimizer = torch.optim.AdamW(param_groups, fused=True)
+            self.optimizer = torch.optim.AdamW(
+                param_groups,
+                fused=self.device.type == "cuda",
+            )
+        self._optimizer_includes_backbone = bool(backbone_params)
         # CosineAnnealingWarmRestarts — cyclical LR to escape plateaus
         # T_0=30: first cycle length, T_mult=2: double each cycle (30, 60, 120...)
         # Steps once per epoch via scheduler.step() in fit()
@@ -591,6 +699,9 @@ class Trainer:
         }
         self.patience_counter = 0
         self.early_stopping_patience = trainer_cfg.get("early_stopping_patience", 5)
+        self.min_epochs_before_early_stop = trainer_cfg.get(
+            "min_epochs_before_early_stop", 15
+        )
         self.history = []
         self.start_epoch = 1
 
@@ -630,6 +741,109 @@ class Trainer:
         if self.use_torch_compile:
             self.model = torch.compile(self.model)
             print("  [opt] torch.compile applied to model")
+
+        # AUDIT: CRITICAL-30 — Structured logging with WandB/TensorBoard support
+        log_cfg = trainer_cfg.get("logging", {})
+        self.logger = StructuredLogger(
+            log_dir=str(self.run_dir),
+            enable_wandb=log_cfg.get("enable_wandb", False),
+            wandb_project=log_cfg.get("wandb_project", "idsp-eq"),
+            wandb_run_name=self.cfg.get("experiment_name", None),
+            enable_tensorboard=log_cfg.get("enable_tensorboard", False),
+        )
+
+        self._register_signal_handlers()
+        self._append_event(
+            "trainer_initialized",
+            dataset_type=str(data_cfg.get("dataset_type", "synthetic")).lower(),
+            train_examples=len(self.train_set),
+            val_examples=len(self.val_dataset),
+            batch_size=data_cfg["batch_size"],
+            device=str(self.device),
+        )
+
+    def _write_run_metadata(self, config_path, resume_path, dataset_type):
+        payload = {
+            "created_at": utc_now_iso(),
+            "config_path": str(Path(config_path).resolve()),
+            "resume_path": str(Path(resume_path).resolve()) if resume_path else None,
+            "dataset_type": dataset_type,
+            "seed": self.seed,
+            "deterministic": self.deterministic,
+            "device": str(self.device),
+            "monitor_val_metric": self.monitor_val_metric,
+            "precompute_cache_path": self.precompute_cache_path,
+            "max_epochs": self.max_epochs,
+            "train_examples": len(self.train_set),
+            "val_examples": len(self.val_dataset),
+            "test_examples": len(self.test_set),
+        }
+        with open(self.run_metadata_path, "w") as f:
+            json.dump(payload, f, indent=2)
+
+    def _append_event(self, event, **payload):
+        record = {
+            "timestamp": utc_now_iso(),
+            "event": event,
+            "epoch": self.current_epoch,
+            "global_step": self.global_step,
+            **payload,
+        }
+        with open(self.training_events_path, "a") as f:
+            f.write(json.dumps(record, default=str) + "\n")
+
+    def _register_signal_handlers(self):
+        if self._signal_handlers_registered:
+            return
+        for sig in (signal.SIGINT, signal.SIGTERM):
+            signal.signal(sig, self._handle_signal)
+        self._signal_handlers_registered = True
+
+    def _handle_signal(self, signum, _frame):
+        if self._received_signal is not None:
+            return
+        try:
+            signal_name = signal.Signals(signum).name
+        except ValueError:
+            signal_name = str(signum)
+        self._received_signal = signal_name
+        print(f"  [signal] Received {signal_name}; saving emergency checkpoint")
+        self._append_event("signal_received", signal=signal_name)
+        try:
+            self.save_emergency_checkpoint(signal_name)
+        except Exception as exc:
+            print(f"  [signal] Emergency checkpoint failed: {exc}")
+
+    def save_emergency_checkpoint(self, reason):
+        checkpoint_path = self.run_dir / "interrupted.pt"
+        if self.use_deepspeed:
+            interrupted_dir = self.run_dir / "interrupted"
+            self.model.save_checkpoint(str(interrupted_dir), tag="signal")
+            self._append_event(
+                "emergency_checkpoint",
+                reason=reason,
+                path=str(interrupted_dir),
+            )
+            return interrupted_dir
+
+        state = {
+            "epoch": self.current_epoch,
+            "model_state_dict": self.model.state_dict(),
+            "optimizer_state_dict": self.optimizer.state_dict(),
+            "scheduler_state_dict": self.scheduler.state_dict(),
+            "monitor_metric": self.monitor_val_metric,
+            "monitor_value": self.best_monitor_value,
+            "global_step": self.global_step,
+            "signal_reason": reason,
+            "saved_at": utc_now_iso(),
+        }
+        torch.save(state, checkpoint_path)
+        self._append_event(
+            "emergency_checkpoint",
+            reason=reason,
+            path=str(checkpoint_path),
+        )
+        return checkpoint_path
 
     def _prepare_wet_audio(self, batch):
         if "wet_audio" not in batch:
@@ -768,6 +982,22 @@ class Trainer:
                 f"adversarial_fraction={stage.get('adversarial_fraction', getattr(self.train_dataset, 'adversarial_fraction', 'default'))} "
                 f"weights: {weights_str}"
             )
+            # AUDIT: MEDIUM-33 — Log curriculum stage change as structured event
+            self._append_event(
+                "curriculum_stage_changed",
+                epoch=epoch,
+                stage_name=stage_name,
+                stage_index=stage_idx,
+                filter_types=stage.get("filter_types", "all"),
+                gain_bounds=stage.get("gain_bounds", self.gain_bounds),
+                q_bounds=stage.get("q_bounds", "default"),
+                type_weights=stage.get("type_weights", "base"),
+                lambda_type=self.criterion.lambda_type,
+                lambda_gain=self.criterion.lambda_gain,
+                lambda_freq=self.criterion.lambda_freq,
+                lambda_q=self.criterion.lambda_q,
+                lambda_spectral=self.criterion.lambda_spectral,
+            )
 
     def _gain_aux_alignment(self, batch, wet_mel, output):
         gain_aux_summary = output.get("gain_aux_summary")
@@ -803,7 +1033,31 @@ class Trainer:
         self.optimizer.zero_grad(set_to_none=True)
         model_ref = self.model.module if hasattr(self.model, "module") else self.model
 
+        # AUDIT: LOW-34 — Profiling setup
+        prof = None
+        if self.profile_n_batches > 0 and epoch == self.start_epoch:
+            prof = torch.profiler.profile(
+                activities=[
+                    torch.profiler.ProfilerActivity.CPU,
+                    torch.profiler.ProfilerActivity.CUDA,
+                ],
+                schedule=torch.profiler.schedule(
+                    wait=0, warmup=1, active=self.profile_n_batches
+                ),
+                on_trace_ready=torch.profiler.tensorboard_trace_handler(
+                    str(self.run_dir / "profile_trace")
+                ),
+                record_shapes=True,
+                profile_memory=True,
+                with_stack=True,
+            )
+            prof.start()
+            print(f"  [profile] Profiling first {self.profile_n_batches} batches")
+
         for batch_idx, batch in enumerate(self.train_loader):
+            if self._received_signal is not None:
+                print(f"  [signal] Stopping train loop after {self._received_signal}")
+                break
             wet_audio = batch.get("wet_audio", None)
             if wet_audio is not None:
                 wet_audio = wet_audio.to(self.device, non_blocking=True)
@@ -827,6 +1081,7 @@ class Trainer:
                     target_freq,
                     target_q,
                     filter_type=target_ft,
+                    n_fft=self.n_fft,
                 )
 
                 # Per-band H_db target (not cascade product)
@@ -854,6 +1109,7 @@ class Trainer:
                     pred_freq,
                     pred_q,
                     filter_type=target_ft,
+                    n_fft=self.n_fft,
                 )
 
                 total_loss, components = self.criterion(
@@ -873,6 +1129,7 @@ class Trainer:
                     h_db_target=h_db_target,
                     H_mag_typed=H_mag_typed,
                     type_probs=output["type_probs"],
+                    hier_aux=output.get("hier_aux"),
                 )
 
             # Skip batch if loss is NaN (from early training instability)
@@ -921,6 +1178,12 @@ class Trainer:
                         n_nan_batches += 1
                         continue
 
+                    # Gradient explosion monitoring: warn when clipping is severe
+                    clip_ratio = grad_norm.item() / 1.0  # grad_norm / max_norm
+                    if clip_ratio > 2.0 and self.global_step % self.log_every == 0:
+                        print(f"  [WARN] Heavy gradient clipping at step {self.global_step}: "
+                              f"grad_norm={grad_norm.item():.2f}, clip_ratio={clip_ratio:.1f}x")
+
                     # Per-parameter gradient norm monitoring (logged every N steps)
                     if self.global_step % self.log_every == 0:
                         grad_parts = []
@@ -951,6 +1214,11 @@ class Trainer:
                                 for k, v in sorted(avg_grads.items())
                             )
                             print(f"  [grads] step={self.global_step} {grad_str}")
+                            # AUDIT: CRITICAL-30 — Log gradient norms to structured logger
+                            self.logger.log_metrics_batch(
+                                {f"grad_norm/{k}": v for k, v in avg_grads.items()},
+                                step=self.global_step,
+                            )
 
                     self.optimizer.step()
 
@@ -965,6 +1233,10 @@ class Trainer:
 
                 self.optimizer.zero_grad(set_to_none=True)
                 self.global_step += 1
+
+            # AUDIT: LOW-34 — Profiler step
+            if prof is not None:
+                prof.step()
 
             epoch_loss += total_loss.item()
             n_batches += 1
@@ -992,6 +1264,14 @@ class Trainer:
 
         if n_nan_batches > 0:
             print(f"  [train] Epoch {epoch}: {n_nan_batches} NaN batches skipped")
+
+        # AUDIT: LOW-34 — Stop profiler and print summary
+        if prof is not None:
+            prof.stop()
+            print(f"  [profile] Trace saved to {self.run_dir / 'profile_trace'}")
+            # Print top time-consuming operations
+            summary = prof.key_averages().table(sort_by="cuda_time_total", row_limit=10)
+            print(f"  [profile] Top 10 CUDA operations:\n{summary}")
 
         # Per-component epoch averages
         if n_batches > 0:
@@ -1108,6 +1388,7 @@ class Trainer:
                     target_freq,
                     target_q,
                     filter_type=target_ft,
+                    n_fft=self.n_fft,
                 )
                 b0, b1, b2, a1, a2 = model_ref.dsp_cascade.compute_biquad_coeffs_multitype(
                     target_gain, target_freq, target_q, target_ft
@@ -1121,12 +1402,14 @@ class Trainer:
                     output_soft["params"][1],
                     output_soft["params"][2],
                     filter_type=target_ft,
+                    n_fft=self.n_fft,
                 )
                 H_mag_typed_hard = model_ref.dsp_cascade(
                     output_hard["params"][0],
                     output_hard["params"][1],
                     output_hard["params"][2],
                     filter_type=target_ft,
+                    n_fft=self.n_fft,
                 )
 
                 total_loss_soft, components = self.criterion(
@@ -1146,6 +1429,7 @@ class Trainer:
                     h_db_target=h_db_target,
                     H_mag_typed=H_mag_typed_soft,
                     type_probs=output_soft["type_probs"],
+                    hier_aux=output_soft.get("hier_aux"),
                 )
                 total_loss_hard, hard_components = self.criterion(
                     output_hard["params"][0],
@@ -1164,6 +1448,7 @@ class Trainer:
                     h_db_target=h_db_target,
                     H_mag_typed=H_mag_typed_hard,
                     type_probs=output_hard["type_probs"],
+                    hier_aux=output_hard.get("hier_aux"),
                 )
 
                 # NaN diagnostic: identify which loss component causes NaN
@@ -1315,6 +1600,19 @@ class Trainer:
             f"low_bias_on_lowshelf={metrics['mean_low_shelf_bias_on_lowshelf']:.3f} "
             f"high_bias_on_highshelf={metrics['mean_high_shelf_bias_on_highshelf']:.3f}"
         )
+        # Confusion matrix: rows=true, cols=predicted
+        cm = metrics.get("confusion_matrix_matched")
+        if cm is not None:
+            type_names = ["peak", "lshf", "hshf", "hpas", "lpas"]
+            print(f"  [val] confusion (true\\pred): {' '.join(f'{n:>6s}' for n in type_names)}")
+            for i, row in enumerate(cm):
+                row_total = sum(row)
+                row_str = ' '.join(f'{int(v):>6d}' for v in row)
+                print(f"  [val]   {type_names[i]:>4s}: {row_str}  ({row_total:.0f})")
+        # Gumbel tau diagnostic
+        model_ref = self.model.module if hasattr(self.model, "module") else self.model
+        if hasattr(model_ref, 'param_head') and hasattr(model_ref.param_head, 'gumbel_tau'):
+            print(f"  [val] gumbel_tau={model_ref.param_head.gumbel_tau.item():.4f}")
         return avg_val_loss_soft, metrics
 
     def save_checkpoint(self, epoch, monitor_value, save_tags=None, metrics=None):
@@ -1357,6 +1655,8 @@ class Trainer:
                 state["val_loss_hard"] = metrics.get("val_loss_hard", monitor_value)
                 state["gain_mae_db_matched"] = metrics.get("gain_mae_db_matched")
                 state["type_accuracy_matched"] = metrics.get("type_accuracy_matched")
+                # C-04: Save best_named_metrics for NaN recovery state restoration
+                state["best_named_metrics"] = dict(self.best_named_metrics)
             path = ckpt_dir / f"epoch_{epoch:03d}.pt"
             torch.save(state, path)
             print(f"  Saved checkpoint: {path}")
@@ -1368,6 +1668,28 @@ class Trainer:
                     best_path = ckpt_dir / "best.pt"
                     torch.save(state, best_path)
                     print(f"  Updated checkpoint: {best_path}")
+        self._append_event(
+            "checkpoint_saved",
+            epoch=epoch,
+            monitor_value=monitor_value,
+            tags=save_tags,
+        )
+
+        # Checkpoint pruning: keep only last N epoch checkpoints + named best
+        self._prune_old_checkpoints(ckpt_dir, keep_last_n=3)
+
+    def _prune_old_checkpoints(self, ckpt_dir, keep_last_n=3):
+        """Delete old epoch_NNN.pt checkpoints, keeping the last N plus named ones."""
+        epoch_ckpts = sorted(ckpt_dir.glob("epoch_*.pt"))
+        if len(epoch_ckpts) <= keep_last_n:
+            return
+        to_delete = epoch_ckpts[:-keep_last_n]
+        for p in to_delete:
+            try:
+                p.unlink()
+                print(f"  Pruned old checkpoint: {p}")
+            except OSError:
+                pass
 
     def _has_nan_weights(self):
         """Check if any trainable parameter or active BN buffer contains NaN.
@@ -1474,6 +1796,12 @@ class Trainer:
             f"(epoch {state.get('epoch')}, monitor_value={self.best_monitor_value:.4f})"
         )
         print(f"  [resume] Resuming from epoch {self.start_epoch}")
+        self._append_event(
+            "checkpoint_loaded",
+            path=str(path),
+            resumed_epoch=self.start_epoch,
+            monitor_value=self.best_monitor_value,
+        )
 
     _optimizer_includes_backbone = False  # Track whether backbone params are in optimizer
 
@@ -1498,11 +1826,17 @@ class Trainer:
         model_ref = self.model._orig_mod if hasattr(self.model, "_orig_mod") else self.model
 
         # Collect newly-unfrozen backbone params
+        existing_param_ids = {
+            id(param)
+            for group in self.optimizer.param_groups
+            for param in group["params"]
+        }
         backbone_params = [
             p for n, p in model_ref.named_parameters()
-            if "encoder.backbone" in n and p.requires_grad
+            if "encoder.backbone" in n and p.requires_grad and id(p) not in existing_param_ids
         ]
         if not backbone_params:
+            self._optimizer_includes_backbone = True
             return
 
         # Add as a new param group (index 0 position matters for LR schedule,
@@ -1519,7 +1853,13 @@ class Trainer:
         print(f"  [opt] Added {n_params:,} backbone params to optimizer (lr={backbone_lr:.1e})")
 
     def _recover_from_nan(self, epoch):
-        """Reload last good checkpoint to recover from NaN state."""
+        """
+        Reload last good checkpoint to recover from NaN state.
+
+        AUDIT: CRITICAL-31 — Logs recovery attempts and outcomes as structured events.
+        AUDIT: MEDIUM-24 — Uses weights_only=False (required for model state dicts
+        containing optimizer states), but validates loaded state dict for NaN.
+        """
         ckpt_dir = Path("checkpoints")
         # Try checkpoints in reverse order (most recent first), find one that's clean
         candidates = sorted(ckpt_dir.glob("epoch_*.pt"), reverse=True)
@@ -1527,7 +1867,12 @@ class Trainer:
         if best_path.exists():
             candidates.insert(0, best_path)
 
+        attempts = 0
         for ckpt_path in candidates:
+            attempts += 1
+            # AUDIT: MEDIUM-24 — Validate checkpoint file exists and is readable
+            if not ckpt_path.exists() or ckpt_path.stat().st_size == 0:
+                continue
             state = torch.load(ckpt_path, map_location=self.device, weights_only=False)
             # Skip checkpoints with NaN val_loss
             if not math.isfinite(state.get("val_loss", float("inf"))):
@@ -1568,11 +1913,42 @@ class Trainer:
             ]
             self.optimizer = torch.optim.AdamW(param_groups)
             self.global_step = state.get("global_step", 0)
+
+            # C-04: Restore scheduler state and best_named_metrics
+            if "scheduler_state_dict" in state:
+                try:
+                    self.scheduler.load_state_dict(state["scheduler_state_dict"])
+                except Exception:
+                    pass  # Scheduler rebuild is acceptable fallback
+            if "best_named_metrics" in state:
+                for k, v in state["best_named_metrics"].items():
+                    if k in self.best_named_metrics:
+                        self.best_named_metrics[k] = v
+
             print(
-                f"  [recovery] Reloaded clean checkpoint from {ckpt_path}, reset optimizer"
+                f"  [recovery] Reloaded clean checkpoint from {ckpt_path}, "
+                f"restored scheduler + best_metrics, reset optimizer"
+            )
+            # AUDIT: MEDIUM-33 — Log NaN recovery as structured event
+            self._append_event(
+                "nan_recovery_successful",
+                epoch=epoch,
+                recovery_checkpoint=str(ckpt_path),
+                attempts_tried=attempts,
+                global_step=self.global_step,
+            )
+            self.logger.log_event(
+                "nan_recovery",
+                {"epoch": epoch, "checkpoint": str(ckpt_path), "attempts": attempts},
             )
             return True
 
+        # AUDIT: MEDIUM-33 — Log failed recovery attempt
+        self._append_event(
+            "nan_recovery_failed",
+            epoch=epoch,
+            checkpoints_checked=attempts,
+        )
         print(f"  [recovery] No clean checkpoint found. Cannot recover.")
         return False
 
@@ -1588,15 +1964,28 @@ class Trainer:
         print(f"  Max epochs: {self.max_epochs}")
         print(f"  Receptive field: {model_ref.receptive_field_frames} frames")
         print()
+        self._append_event(
+            "training_started",
+            total_params=total_params,
+            train_batches=len(self.train_loader),
+            val_batches=len(self.val_loader),
+        )
 
         consecutive_nan_epochs = 0
 
         for epoch in range(self.start_epoch, self.max_epochs + 1):
+            if self._received_signal is not None:
+                break
             t0 = time.time()
+            self.current_epoch = epoch
 
             self._apply_curriculum_stage(epoch)
 
             train_loss = self.train_one_epoch(epoch)
+
+            if self._received_signal is not None:
+                print(f"  [signal] Training interrupted by {self._received_signal}")
+                break
 
             # Check for NaN in weights AND buffers (BatchNorm running stats)
             if self._has_nan_weights():
@@ -1696,6 +2085,42 @@ class Trainer:
                     "time_s": elapsed,
                 }
             )
+            self._append_event(
+                "epoch_completed",
+                epoch=epoch,
+                train_loss=train_loss,
+                monitor_value=monitor_value,
+                primary_val_score=metrics.get("primary_val_score"),
+                gain_mae_db_matched=metrics.get("gain_mae_db_matched"),
+                type_accuracy_matched=metrics.get("type_accuracy_matched"),
+            )
+
+            # AUDIT: CRITICAL-30 — Structured logging of epoch metrics
+            self.logger.log_metrics_batch(
+                {
+                    "epoch/train_loss": train_loss,
+                    "epoch/val_loss": monitor_value,
+                    "epoch/val_loss_soft": metrics.get("val_loss_soft", float("nan")),
+                    "epoch/gain_mae_db_matched": metrics.get("gain_mae_db_matched", float("nan")),
+                    "epoch/gain_mae_db_raw": metrics.get("gain_mae_db_raw", float("nan")),
+                    "epoch/freq_mae_oct_matched": metrics.get("freq_mae_oct_matched", float("nan")),
+                    "epoch/q_mae_dec_matched": metrics.get("q_mae_dec_matched", float("nan")),
+                    "epoch/type_accuracy_matched": metrics.get("type_accuracy_matched", float("nan")),
+                    "epoch/primary_val_score": metrics.get("primary_val_score", float("nan")),
+                    "epoch/lr": self.optimizer.param_groups[0]["lr"],
+                    "epoch/time_s": elapsed,
+                    "epoch/patience_counter": self.patience_counter,
+                },
+                epoch=epoch,
+                step=self.global_step,
+            )
+            # Per-type accuracy logging (AUDIT: MEDIUM-33 — enhanced events)
+            for tn in ["peaking", "lowshelf", "highshelf", "highpass", "lowpass"]:
+                v = metrics.get(f"type_accuracy_{tn}_matched")
+                if v is not None:
+                    self.logger.log_metric(
+                        f"epoch/type_accuracy_{tn}", v, epoch=epoch, step=self.global_step
+                    )
 
             print(
                 f"Epoch {epoch}/{self.max_epochs} ({elapsed:.1f}s) "
@@ -1706,16 +2131,35 @@ class Trainer:
             )
 
             # Early stopping: stop if no improvement for patience epochs
+            # AUDIT: HIGH-32 — Minimum epochs before early stopping can trigger
+            min_epochs_es = self.min_epochs_before_early_stop
+            if epoch < min_epochs_es:
+                # Reset patience counter if we're still in warmup period
+                if self.patience_counter > 0 and epoch < min_epochs_es:
+                    self.patience_counter = max(0, self.patience_counter - 1)
             if self.patience_counter >= self.early_stopping_patience:
                 print(
-                    f"  [early_stop] No improvement for {self.patience_counter} epochs. "
+                    f"  [early_stop] No improvement for {self.patience_counter} epochs "
+                    f"(min_epochs_before_early_stop={min_epochs_es} satisfied). "
                     f"Stopping early at epoch {epoch}."
+                )
+                self._append_event(
+                    "early_stopping",
+                    epoch=epoch,
+                    patience_counter=self.patience_counter,
+                    min_epochs_before_early_stop=min_epochs_es,
                 )
                 break
 
         hist_path = Path("checkpoints") / "training_history.json"
         with open(hist_path, "w") as f:
             json.dump(self.history, f, indent=2, default=str)
+        self._append_event(
+            "training_finished",
+            best_monitor_value=self.best_monitor_value,
+            interrupted_by=self._received_signal,
+            history_path=str(hist_path),
+        )
         print(
             f"\nTraining complete. Best {self.monitor_val_metric}: "
             f"{self.best_monitor_value:.4f}"
@@ -1730,6 +2174,11 @@ if __name__ == "__main__":
                         help="Path to config YAML")
     parser.add_argument("--resume", type=str, default=None,
                         help="Path to checkpoint to resume from (e.g. best.pt)")
+    # AUDIT: LOW-34 — Optional profiling for bottleneck analysis
+    parser.add_argument("--profile", type=int, default=0,
+                        help="Profile first N batches and save trace to checkpoints/profile_trace.json")
     args = parser.parse_args()
     trainer = Trainer(config_path=args.config, resume_path=args.resume)
+    if args.profile > 0:
+        trainer.profile_n_batches = args.profile
     trainer.fit()

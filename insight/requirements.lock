@@ -1,0 +1,32 @@
+# AUDIT: MEDIUM-28 — Pinned dependency versions for reproducible environments
+# Generated from requirements_optimized.txt with known-good versions
+# Regenerate with: pip freeze > requirements.lock
+
+# Core
+torch==2.2.0
+torchaudio==2.2.0
+scipy==1.12.0
+pyyaml==6.0.1
+numpy==1.26.4
+
+# Memory optimization
+bitsandbytes==0.42.0
+
+# Kernel optimization (Linux only)
+triton==2.2.0; sys_platform == "linux"
+
+# Distributed training
+deepspeed==0.14.0
+
+# Experiment tracking
+wandb==0.16.4
+
+# Model export
+onnxruntime==1.17.1
+
+# Pretrained audio encoder backend
+transformers==4.38.2
+timm==0.9.16
+
+# PyTorch Lightning (optional alternative training)
+pytorch-lightning==2.2.1

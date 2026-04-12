@@ -4,6 +4,38 @@ import torch.nn as nn
 import torch.nn.functional as F
 
 
+# ---------------------------------------------------------------------------
+# AUDIT: LOW-29 — Math references for biquad coefficient formulas
+# ---------------------------------------------------------------------------
+# All biquad coefficient formulas below are derived from the Robert Bristow-Johnson
+# "Audio EQ Cookbook" (https://webaudio.github.io/Audio-EQ-Cookbook/):
+#
+#   General biquad transfer function:
+#       H(z) = (b0 + b1*z^-1 + b2*z^-2) / (1 + a1*z^-1 + a2*z^-2)
+#
+#   Key substitutions:
+#       A   = 10^(gain_dB / 40)          — amplitude ratio (sqrt of power ratio)
+#       w0  = 2*pi*f0 / Fs               — normalized center frequency
+#       α   = sin(w0) / (2*Q)            — bandwidth parameter
+#       cos = cos(w0)
+#
+#   Peaking EQ (Bristow-Johnson, eq. 15-20):
+#       b0 = 1 + α*A         b1 = -2*cos       b2 = 1 - α*A
+#       a0 = 1 + α/A         a1 = -2*cos       a2 = 1 - α/A
+#
+#   Low-Shelf (Bristow-Johnson, eq. 7-12):
+#       b0 = A*((A+1)-(A-1)*cos + 2*sqrt(A)*α)
+#       b1 = 2*A*((A-1)-(A+1)*cos)
+#       b2 = A*((A+1)-(A-1)*cos - 2*sqrt(A)*α)
+#       a0 = (A+1)+(A-1)*cos + 2*sqrt(A)*α
+#       a1 = -2*((A-1)+(A+1)*cos)
+#       a2 = (A+1)+(A-1)*cos - 2*sqrt(A)*α
+#
+#   High-Shelf: mirror of Low-Shelf (cos sign flipped)
+#   High-Pass / Low-Pass: standard forms with α for resonance control
+# ---------------------------------------------------------------------------
+
+
 class StraightThroughClamp(torch.autograd.Function):
     """
     Straight-through estimator clamp: forward uses torch.clamp (hard bounds),
@@ -504,6 +536,136 @@ def compute_per_type_shape_features(pred_gain, pred_freq, pred_q, dsp_cascade,
     return torch.cat(all_features, dim=-1)  # (B, N, 20)
 
 
+# ─── Broad class indices for hierarchical type head ─────────────────────
+BROAD_PASS = 0    # HP + LP
+BROAD_SHELF = 1   # LS + HS
+BROAD_PEAKING = 2  # Peaking
+NUM_BROAD_CLASSES = 3
+
+# Mapping from 5-class fine type to 3-class broad type
+FINE_TO_BROAD = {
+    FILTER_PEAKING: BROAD_PEAKING,
+    FILTER_LOWSHELF: BROAD_SHELF,
+    FILTER_HIGHSHELF: BROAD_SHELF,
+    FILTER_HIGHPASS: BROAD_PASS,
+    FILTER_LOWPASS: BROAD_PASS,
+}
+
+# Mapping from broad class + fine class to binary subclass index
+# Pass: HP=0, LP=1.  Shelf: LS=0, HS=1.
+PASS_HP_IDX = 0
+PASS_LP_IDX = 1
+SHELF_LS_IDX = 0
+SHELF_HS_IDX = 1
+
+
+class HierarchicalTypeHead(nn.Module):
+    """Two-stage hierarchical type classifier.
+
+    Stage 1: 3-class broad classification (pass / shelf / peaking).
+    Stage 2a: Binary HP vs LP (only for pass bands).
+    Stage 2b: Binary LS vs HS (only for shelf bands).
+
+    The shelf subhead receives extra asymmetry features (DC gain, Nyquist gain,
+    low/high energy ratio, spectral tilt) to resolve the hardest confusion.
+    """
+
+    def __init__(self, input_dim, num_filter_types=5):
+        super().__init__()
+        self.num_filter_types = num_filter_types
+
+        # Stage 1: Broad class classifier (3 classes)
+        self.broad_head = nn.Sequential(
+            nn.Linear(input_dim, 128),
+            nn.ReLU(),
+            nn.Dropout(0.1),
+            nn.Linear(128, 64),
+            nn.ReLU(),
+            nn.Linear(64, NUM_BROAD_CLASSES),
+        )
+        nn.init.xavier_uniform_(self.broad_head[0].weight, gain=0.5)
+        nn.init.zeros_(self.broad_head[-1].bias)
+
+        # Stage 2a: Pass subclassifier (HP vs LP) — binary
+        self.pass_head = nn.Sequential(
+            nn.Linear(input_dim, 64),
+            nn.ReLU(),
+            nn.Linear(64, 2),  # [HP_logit, LP_logit]
+        )
+        nn.init.xavier_uniform_(self.pass_head[0].weight, gain=0.3)
+        nn.init.zeros_(self.pass_head[-1].bias)
+
+        # Stage 2b: Shelf subclassifier (LS vs HS) — binary with extra features
+        # Extra features: dc_gain, nyquist_gain, low_high_ratio, spectral_tilt = 4
+        self.shelf_head = nn.Sequential(
+            nn.Linear(input_dim + 4, 64),
+            nn.ReLU(),
+            nn.Linear(64, 2),  # [LS_logit, HS_logit]
+        )
+        nn.init.xavier_uniform_(self.shelf_head[0].weight, gain=0.3)
+        nn.init.zeros_(self.shelf_head[-1].bias)
+
+    def forward(self, type_input, shelf_extra_features=None):
+        """
+        Args:
+            type_input: (B, N, input_dim) — trunk + shape + spectral features
+            shelf_extra_features: (B, N, 4) — [dc_gain, nyquist_gain, lo_hi_ratio, tilt]
+                                  or None (computed internally if needed)
+
+        Returns:
+            type_logits: (B, N, 5) — mapped back to 5-class logits
+            broad_logits: (B, N, 3) — Stage 1 output
+            pass_logits: (B, N, 2) — Stage 2a output
+            shelf_logits: (B, N, 2) — Stage 2b output
+        """
+        # Stage 1: Broad class
+        broad_logits = self.broad_head(type_input)  # (B, N, 3)
+
+        # Stage 2a: Pass subclass
+        pass_logits = self.pass_head(type_input)  # (B, N, 2)
+
+        # Stage 2b: Shelf subclass with extra features
+        if shelf_extra_features is not None:
+            shelf_input = torch.cat([type_input, shelf_extra_features], dim=-1)
+        else:
+            # Zero-pad if no extra features (shouldn't happen in practice)
+            shelf_input = torch.cat([type_input, type_input.new_zeros(type_input.shape[0], type_input.shape[1], 4)], dim=-1)
+        shelf_logits = self.shelf_head(shelf_input)  # (B, N, 2)
+
+        # ── Map hierarchical outputs to 5-class logits ──
+        # During training: use soft (differentiable) mapping via broad probabilities
+        # During inference: hard routing via argmax
+        B, N, _ = broad_logits.shape
+        type_logits = broad_logits.new_zeros(B, N, self.num_filter_types)
+
+        # Soft routing: weight Stage 2 outputs by broad probabilities
+        broad_probs = F.softmax(broad_logits, dim=-1)  # (B, N, 3)
+        pass_probs = F.softmax(pass_logits, dim=-1)    # (B, N, 2)
+        shelf_probs = F.softmax(shelf_logits, dim=-1)  # (B, N, 2)
+
+        # peaking logit = broad_peaking_logit
+        type_logits[..., FILTER_PEAKING] = broad_logits[..., BROAD_PEAKING]
+
+        # HP = broad_pass * pass_HP
+        type_logits[..., FILTER_HIGHPASS] = (
+            broad_logits[..., BROAD_PASS] + pass_logits[..., PASS_HP_IDX]
+        )
+        # LP = broad_pass * pass_LP
+        type_logits[..., FILTER_LOWPASS] = (
+            broad_logits[..., BROAD_PASS] + pass_logits[..., PASS_LP_IDX]
+        )
+        # LS = broad_shelf + shelf_LS
+        type_logits[..., FILTER_LOWSHELF] = (
+            broad_logits[..., BROAD_SHELF] + shelf_logits[..., SHELF_LS_IDX]
+        )
+        # HS = broad_shelf + shelf_HS
+        type_logits[..., FILTER_HIGHSHELF] = (
+            broad_logits[..., BROAD_SHELF] + shelf_logits[..., SHELF_HS_IDX]
+        )
+
+        return type_logits, broad_logits, pass_logits, shelf_logits
+
+
 class MultiTypeEQParameterHead(nn.Module):
     """
     Parameter head for multi-type EQ estimation.
@@ -525,6 +687,7 @@ class MultiTypeEQParameterHead(nn.Module):
         n_fft=2048,
         sample_rate=44100,
         dsp_cascade=None,
+        hierarchical_type_head=False,
     ):
         super().__init__()
         self.num_bands = num_bands
@@ -532,6 +695,7 @@ class MultiTypeEQParameterHead(nn.Module):
         self.n_mels = n_mels
         self.type_conditioned_frequency = type_conditioned_frequency
         self.n_shelf_bands = n_shelf_bands
+        self.hierarchical_type_head = hierarchical_type_head
         self.n_fft_bins = n_fft // 2 + 1
         self.sample_rate = sample_rate
         self._dsp_cascade = dsp_cascade  # for Fix 5 shape features (plain attr, not submodule)
@@ -735,7 +899,14 @@ class MultiTypeEQParameterHead(nn.Module):
         #   → strongly positive for highshelf boost (treble-heavy)
         self.direct_shelf_scale = nn.Parameter(torch.tensor(2.0))
 
-        type_input_dim = hidden_dim + (20 if dsp_cascade is not None else 0)
+        # Number of hand-crafted spectral shape features for type discrimination
+        self.n_shape_features = 7  # split_ratio, skewness, centroid_offset, rolloff, stopband, gain_mag, freq_pos
+
+        type_input_dim = (
+            hidden_dim
+            + (20 if dsp_cascade is not None else 0)
+            + (self.n_shape_features if n_mels > 0 else 0)
+        )
         self.type_head = nn.Sequential(
             nn.Linear(type_input_dim, 128),
             nn.ReLU(),
@@ -751,6 +922,13 @@ class MultiTypeEQParameterHead(nn.Module):
             # lowshelf=0, highshelf=0, highpass=0, lowpass=0]
             self.type_head[-1].bias.zero_()
             self.type_head[-1].bias[FILTER_PEAKING] = 0.5
+
+        # Hierarchical two-stage type head (optional)
+        if hierarchical_type_head:
+            self.hier_type_head = HierarchicalTypeHead(type_input_dim, num_filter_types)
+        else:
+            self.hier_type_head = None
+
         self.register_buffer(
             "gainful_type_mask",
             torch.tensor(FILTER_GAINFUL_MASK, dtype=torch.float32),
@@ -892,6 +1070,110 @@ class MultiTypeEQParameterHead(nn.Module):
         shelf_context = self.shelf_context_norm(shelf_context)
         return shelf_context, shelf_attention
 
+    def _compute_spectral_shape_features(
+        self, mel_profile, pred_gain_db, pred_freq_hz
+    ):
+        """
+        Hand-crafted spectral shape features for type discrimination.
+
+        These encode domain knowledge about EQ spectral morphologies:
+        - Pass filters: steep rolloff, near-zero stopband energy
+        - Shelf filters: asymmetric energy split, one-sided shift
+        - Peaking: symmetric bell, flat at both extremes
+
+        Args:
+            mel_profile: (B, n_mels) log-mel spectrogram (centered)
+            pred_gain_db: (B, N) predicted gain in dB
+            pred_freq_hz: (B, N) predicted frequency in Hz
+
+        Returns:
+            (B, N, 7) feature tensor:
+              [split_ratio, skewness, centroid_offset,
+               rolloff_steepness, stopband_ratio, gain_magnitude, freq_position]
+        """
+        B, n_mels = mel_profile.shape
+        N = pred_gain_db.shape[1]
+        device = mel_profile.device
+        dtype = mel_profile.dtype
+
+        # Normalize mel to linear energy for ratio computations
+        mel_energy = torch.exp(mel_profile.clamp(min=-12.0, max=12.0))
+        mel_energy = mel_energy / mel_energy.mean(dim=-1, keepdim=True).clamp(min=1e-6)
+
+        # Map predicted frequency to mel-bin index
+        freq_axis = torch.linspace(0, 1, n_mels, device=device, dtype=dtype)
+        freq_normalized = (pred_freq_hz / self.sample_rate).clamp(0.0, 0.5)
+        center_idx = (freq_normalized * 2.0 * (n_mels - 1)).long().clamp(1, n_mels - 2)
+
+        # Expand mel for per-band computation
+        mel_expanded = mel_energy.unsqueeze(1).expand(B, N, n_mels)  # (B, N, n_mels)
+        center_idx_exp = center_idx.unsqueeze(-1)  # (B, N, 1)
+
+        # 1. Energy split ratio at predicted center frequency
+        # Peaking: ~1.0 (symmetric). Lowshelf: >>1.0 (bass-heavy). Highshelf: <<1.0.
+        cumsum = torch.cumsum(mel_expanded, dim=-1)
+        arange = torch.arange(1, n_mels + 1, device=device, dtype=dtype)
+        left_counts = center_idx.float().clamp(min=1)  # (B, N)
+        right_counts = (n_mels - center_idx).float().clamp(min=1)
+
+        # Gather cumsum at center_idx for each band
+        idx = center_idx.clamp(0, n_mels - 1)  # (B, N)
+        left_energy = torch.gather(cumsum, 2, idx.unsqueeze(-1)).squeeze(-1)  # (B, N)
+        total_energy = cumsum[:, :, -1].squeeze(-1)  # (B, N)
+        right_energy = (total_energy - left_energy).clamp(min=1e-6)  # (B, N)
+
+        split_ratio = torch.log((left_energy / left_counts + 1e-6) /
+                                (right_energy / right_counts + 1e-6))
+
+        # 2. Spectral skewness (3rd moment of delta-spectrum)
+        # Peaking: ~0. Lowshelf: positive. Highshelf: negative.
+        delta = mel_expanded - mel_expanded.mean(dim=-1, keepdim=True)
+        delta_std = delta.std(dim=-1).clamp(min=1e-6)
+        skewness = ((delta ** 3).mean(dim=-1)) / (delta_std ** 3 + 1e-6)
+        skewness = skewness.clamp(-5.0, 5.0)
+
+        # 3. Centroid offset from predicted center
+        freq_axis_exp = freq_axis.unsqueeze(0).unsqueeze(0).expand(B, N, n_mels)
+        centroid = (delta.abs() * freq_axis_exp).sum(dim=-1) / (delta.abs().sum(dim=-1) + 1e-6)
+        center_normalized = freq_normalized.squeeze(-1) if freq_normalized.dim() == 3 else freq_normalized
+        centroid_offset = centroid - center_normalized
+
+        # 4. Rolloff steepness at predicted center (local gradient)
+        idx_clamped = center_idx.clamp(1, n_mels - 2)
+        mel_left = torch.gather(mel_profile.unsqueeze(1).expand(B, N, n_mels), 2,
+                                (idx_clamped - 1).unsqueeze(-1)).squeeze(-1)
+        mel_right = torch.gather(mel_profile.unsqueeze(1).expand(B, N, n_mels), 2,
+                                 (idx_clamped + 1).unsqueeze(-1)).squeeze(-1)
+        rolloff_steepness = (mel_right - mel_left).abs()  # HP/LP: large; peaking/shelf: small
+
+        # 5. Stopband energy ratio
+        # For HP: energy below cutoff should be near-zero
+        # For LP: energy above cutoff should be near-zero
+        # For peaking/shelf: roughly equal on both sides
+        stopband_below = left_energy / (total_energy.squeeze(-1) + 1e-6)
+        stopband_above = right_energy / (total_energy.squeeze(-1) + 1e-6)
+        stopband_ratio = torch.log(stopband_below.clamp(min=1e-6) /
+                                   stopband_above.clamp(min=1e-6) + 1e-6)
+
+        # 6. Gain magnitude (high gain = easier type discrimination)
+        gain_magnitude = pred_gain_db.abs() / 12.0  # normalized to [0, 2]
+
+        # 7. Frequency position (normalized log-frequency)
+        freq_position = (torch.log(pred_freq_hz.clamp(min=20.0, max=20000.0)) -
+                         math.log(20.0)) / (math.log(20000.0) - math.log(20.0))
+
+        features = torch.stack([
+            split_ratio.clamp(-3.0, 3.0),
+            skewness / 5.0,
+            centroid_offset.clamp(-1.0, 1.0),
+            rolloff_steepness / 20.0,
+            stopband_ratio.clamp(-3.0, 3.0),
+            gain_magnitude.clamp(0.0, 2.0),
+            freq_position,
+        ], dim=-1)  # (B, N, 7)
+
+        return features
+
     def summarize_gain_aux_features(self, mel_profile):
         if self.gain_mel_proj is None or mel_profile is None:
             return None
@@ -945,76 +1227,86 @@ class MultiTypeEQParameterHead(nn.Module):
                 gain_db_raw, freq_prelim, q_prelim, self._dsp_cascade, n_fft=512)
             type_input = torch.cat([type_input, shape_features], dim=-1)
 
-        type_logits = self.type_head(type_input)
-        shelf_bias = type_logits.new_zeros(type_logits.shape[0], self.num_bands, 2)
-        if shelf_context is not None and self.shelf_bias_head is not None:
-            shelf_bias = self.shelf_bias_head(shelf_context)
-        if shelf_attention is None:
-            shelf_attention = type_logits.new_zeros(
-                type_logits.shape[0], self.num_bands, self.n_mels
-            )
-        low_shelf_bias = shelf_bias[..., 0] * 0.1
-        high_shelf_bias = shelf_bias[..., 1] * 0.1
-        type_logits = type_logits.clone()
-        type_logits[..., FILTER_LOWSHELF] += low_shelf_bias
-        type_logits[..., FILTER_HIGHSHELF] += high_shelf_bias
-        type_logits[..., FILTER_PEAKING] -= 0.15 * (
-            shelf_bias[..., 0] + shelf_bias[..., 1]
-        )
+        # Hand-crafted spectral shape features for type discrimination
+        if mel_profile is not None and self.n_mels > 0:
+            freq_unit_prelim = torch.sigmoid(self.freq_head(trunk_out).squeeze(-1))
+            log_freq_prelim = self.log_f_min + freq_unit_prelim * (self.log_f_max - self.log_f_min)
+            freq_prelim_hz = torch.exp(log_freq_prelim)
+            spectral_shape = self._compute_spectral_shape_features(
+                mel_profile_centered if mel_profile_centered is not None else mel_profile,
+                gain_db_raw, freq_prelim_hz)
+            type_input = torch.cat([type_input, spectral_shape], dim=-1)
 
-        # Direct non-learned shelf evidence from the feature map.
-        # prefix_suffix_ratio at band 0 = global lo_ratio (positive → bass-heavy → lowshelf)
-        # prefix_suffix_ratio at last band = negated hi_ratio (positive → treble-heavy → highshelf)
-        # This bypasses the learned attention chain, giving the type classifier
-        # an immediate discriminative signal from the very first training step.
-        if mel_profile is not None and self.n_shelf_bands > 0:
-            feature_map = self._compute_shelf_feature_map(mel_profile)  # (B, 3, n_mels)
-            prefix_suffix = feature_map[:, 0, :]  # (B, n_mels)
-            # Global low evidence: ratio at first mel position (bass vs rest)
-            # Positive when bass-heavy → correctly boosts lowshelf logit
-            direct_lo = prefix_suffix[:, 0:1] * self.direct_shelf_scale  # (B, 1)
-            # Global high evidence: NEGATED ratio at last mel position
-            # prefix_suffix[-1] = log(E_before_last / E_last). For highshelf
-            # (treble-heavy), E_last is large so this is negative; negating
-            # gives positive highshelf evidence. For lowshelf (bass-heavy),
-            # E_before_last includes bass so this is positive; negating gives
-            # negative → correctly penalizes highshelf.
-            direct_hi = -prefix_suffix[:, -1:] * self.direct_shelf_scale  # (B, 1)
-            type_logits[..., FILTER_LOWSHELF] += direct_lo  # broadcast over bands
-            type_logits[..., FILTER_HIGHSHELF] += direct_hi
-            type_logits[..., FILTER_PEAKING] -= 0.5 * (direct_lo + direct_hi)
-
-        # DC/Nyquist gain from per-band H_db — analytically exact shelf evidence.
-        # Lowshelf: DC gain ≈ shelf gain (nonzero), Nyquist ≈ 0 dB
-        # Highshelf: DC ≈ 0 dB, Nyquist gain ≈ shelf gain (nonzero)
-        # Peaking: both DC and Nyquist ≈ 0 dB
-        # Gradients flow back to H_db head so it learns shelf spectral signatures
-        # driven by the type classification loss — virtuous cycle.
+        # ── Compute DC/Nyquist gain for shelf evidence (used by both paths) ──
         dc_gain = h_db_pred[:, :, 0]         # (B, N) gain at DC per band
         nyquist_gain = h_db_pred[:, :, -1]   # (B, N) gain at Nyquist per band
 
-        # BUG FIX (circular reasoning): Previously, dc_gain and nyquist_gain
-        # were used directly as type evidence (+= gain * scale). This created a
-        # feedback loop: h_db_head (trained for reconstruction on ALL types)
-        # could produce small nonzero DC values even for non-shelf filters,
-        # which then incorrectly boosted shelf logits. The model learned to
-        # inflate DC gain to game the type classifier.
-        #
-        # FIX: Gate DC/Nyquist evidence with a sigmoid that only passes values
-        # above a meaningful threshold (~0.5 dB). Small DC gains (< 0.2 dB) from
-        # noise or non-shelf filters are suppressed; genuine shelf gains (> 1 dB)
-        # pass through fully. Breaks the circular dependency.
-        # Lower threshold to 0.5 dB and soften the slope from 3.0 to 2.0
-        # This allows gradients to flow for small shelf gains while still
-        # preventing gaming at near-zero gains.
-        dc_gate = torch.sigmoid((dc_gain.abs() - 0.5) * 2.0)
-        nyq_gate = torch.sigmoid((nyquist_gain.abs() - 0.5) * 2.0)
+        # ── Type logits: hierarchical or flat ──
+        hier_aux = None  # Will hold (broad_logits, pass_logits, shelf_logits) if hierarchical
 
-        type_logits[..., FILTER_LOWSHELF] += dc_gain * dc_gate * self.dc_shelf_scale
-        type_logits[..., FILTER_HIGHSHELF] += nyquist_gain * nyq_gate * self.dc_shelf_scale
-        # Peaking bonus: only when BOTH DC and Nyquist are genuinely near zero
-        peaking_gate = (1.0 - dc_gate) * (1.0 - nyq_gate)
-        type_logits[..., FILTER_PEAKING] += peaking_gate * self.dc_shelf_scale
+        if self.hierarchical_type_head:
+            # Hierarchical two-stage type classification
+            # Compute shelf extra features for Stage 2b
+            shelf_extra = torch.stack([
+                dc_gain,           # DC gain — strong lowshelf evidence
+                nyquist_gain,      # Nyquist gain — strong highshelf evidence
+                dc_gain - nyquist_gain,  # Asymmetry: positive→lowshelf, negative→highshelf
+                (dc_gain + nyquist_gain).abs(),  # Total edge gain: high for shelves, low for peaking
+            ], dim=-1)  # (B, N, 4)
+
+            type_logits, broad_logits, pass_logits, shelf_logits = self.hier_type_head(
+                type_input, shelf_extra_features=shelf_extra
+            )
+            hier_aux = (broad_logits, pass_logits, shelf_logits)
+
+            # Add shelf bias from attention (same as flat path)
+            shelf_bias = type_logits.new_zeros(type_logits.shape[0], self.num_bands, 2)
+            if shelf_context is not None and self.shelf_bias_head is not None:
+                shelf_bias = self.shelf_bias_head(shelf_context)
+            # Apply DC/Nyquist gated evidence to the 5-class logits
+            dc_gate = torch.sigmoid((dc_gain.abs() - 0.5) * 2.0)
+            nyq_gate = torch.sigmoid((nyquist_gain.abs() - 0.5) * 2.0)
+            type_logits = type_logits.clone()
+            type_logits[..., FILTER_LOWSHELF] += dc_gain * dc_gate * self.dc_shelf_scale
+            type_logits[..., FILTER_HIGHSHELF] += nyquist_gain * nyq_gate * self.dc_shelf_scale
+            peaking_gate = (1.0 - dc_gate) * (1.0 - nyq_gate)
+            type_logits[..., FILTER_PEAKING] += peaking_gate * self.dc_shelf_scale
+        else:
+            # Original flat 5-class type head
+            type_logits = self.type_head(type_input)
+            shelf_bias = type_logits.new_zeros(type_logits.shape[0], self.num_bands, 2)
+            if shelf_context is not None and self.shelf_bias_head is not None:
+                shelf_bias = self.shelf_bias_head(shelf_context)
+            if shelf_attention is None:
+                shelf_attention = type_logits.new_zeros(
+                    type_logits.shape[0], self.num_bands, self.n_mels
+                )
+            low_shelf_bias = shelf_bias[..., 0] * 0.1
+            high_shelf_bias = shelf_bias[..., 1] * 0.1
+            type_logits = type_logits.clone()
+            type_logits[..., FILTER_LOWSHELF] += low_shelf_bias
+            type_logits[..., FILTER_HIGHSHELF] += high_shelf_bias
+            type_logits[..., FILTER_PEAKING] -= 0.15 * (
+                shelf_bias[..., 0] + shelf_bias[..., 1]
+            )
+
+            # Direct non-learned shelf evidence from the feature map.
+            if mel_profile is not None and self.n_shelf_bands > 0:
+                feature_map = self._compute_shelf_feature_map(mel_profile)  # (B, 3, n_mels)
+                prefix_suffix = feature_map[:, 0, :]  # (B, n_mels)
+                direct_lo = prefix_suffix[:, 0:1] * self.direct_shelf_scale  # (B, 1)
+                direct_hi = -prefix_suffix[:, -1:] * self.direct_shelf_scale  # (B, 1)
+                type_logits[..., FILTER_LOWSHELF] += direct_lo  # broadcast over bands
+                type_logits[..., FILTER_HIGHSHELF] += direct_hi
+                type_logits[..., FILTER_PEAKING] -= 0.5 * (direct_lo + direct_hi)
+
+            # DC/Nyquist gain — gated to prevent h_db_head gaming
+            dc_gate = torch.sigmoid((dc_gain.abs() - 0.5) * 2.0)
+            nyq_gate = torch.sigmoid((nyquist_gain.abs() - 0.5) * 2.0)
+            type_logits[..., FILTER_LOWSHELF] += dc_gain * dc_gate * self.dc_shelf_scale
+            type_logits[..., FILTER_HIGHSHELF] += nyquist_gain * nyq_gate * self.dc_shelf_scale
+            peaking_gate = (1.0 - dc_gate) * (1.0 - nyq_gate)
+            type_logits[..., FILTER_PEAKING] += peaking_gate * self.dc_shelf_scale
 
         type_probs = F.gumbel_softmax(type_logits, tau=self.gumbel_tau.clamp(min=0.05), hard=False, dim=-1)
         filter_type = type_logits.argmax(dim=-1)
@@ -1089,6 +1381,7 @@ class MultiTypeEQParameterHead(nn.Module):
                 "shelf_attention": shelf_attention,
                 "h_db_pred": h_db_pred,
                 "band_embedding": trunk_out,
+                "hier_aux": hier_aux,
             }
             return gain_db, freq, q, type_logits, type_probs, filter_type, aux
 

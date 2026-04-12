@@ -19,6 +19,7 @@ import numpy as np
 
 from loss import MultiResolutionSTFTLoss
 from differentiable_eq import FILTER_HIGHPASS, FILTER_LOWPASS, FILTER_LOWSHELF, FILTER_HIGHSHELF
+from differentiable_eq import FILTER_PEAKING, BROAD_PASS, BROAD_SHELF, BROAD_PEAKING, FINE_TO_BROAD
 
 
 def log_cosh_loss(pred, target):
@@ -400,6 +401,7 @@ class MultiTypeEQLoss(nn.Module):
         self.lambda_type_match = lambda_type_match
         self.lambda_type_entropy = lambda_type_entropy
         self.lambda_type_prior = lambda_type_prior
+        self.lambda_multi_scale = kwargs.get("lambda_multi_scale", 1.0)
         self.matcher_lambda_gain = kwargs.get("matcher_lambda_gain", lambda_gain)
         self.matcher_lambda_freq = kwargs.get("matcher_lambda_freq", lambda_freq)
         self.matcher_lambda_q = kwargs.get("matcher_lambda_q", lambda_q)
@@ -442,10 +444,10 @@ class MultiTypeEQLoss(nn.Module):
         self.mr_stft = MultiResolutionSTFTLoss()
 
         # Fix 2+3: Learned uncertainty weighting + multi-scale render loss
-        # Initial log_sigmas set so effective weights ≈ design spec static lambdas
+        # Uniform initial precisions — lambda values provide the static balance.
         self.uncertainty_loss = UncertaintyWeightedLoss(
             n_losses=7,
-            initial_log_sigmas=[-1.1, -0.7, -1.1, -0.4, 0.0, 0.7, -0.7],
+            initial_log_sigmas=[0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0],
         )
         self._dsp_cascade = dsp_cascade  # stored as plain attr, NOT nn.Module
 
@@ -463,11 +465,17 @@ class MultiTypeEQLoss(nn.Module):
         self.type_class_weights.copy_(inv_w)
 
     def update_type_priors(self, type_class_priors):
-        priors = torch.tensor(
-            type_class_priors,
-            dtype=self.type_class_priors.dtype,
-            device=self.type_class_priors.device,
-        )
+        if isinstance(type_class_priors, torch.Tensor):
+            priors = type_class_priors.to(
+                dtype=self.type_class_priors.dtype,
+                device=self.type_class_priors.device,
+            )
+        else:
+            priors = torch.tensor(
+                type_class_priors,
+                dtype=self.type_class_priors.dtype,
+                device=self.type_class_priors.device,
+            )
         priors = torch.clamp(priors, min=1e-6)
         priors = priors / priors.sum()
         self.type_class_priors.copy_(priors)
@@ -507,6 +515,7 @@ class MultiTypeEQLoss(nn.Module):
         h_db_target=None,
         H_mag_typed=None,
         type_probs=None,
+        hier_aux=None,
     ):
         """
         Compute total loss.
@@ -559,16 +568,15 @@ class MultiTypeEQLoss(nn.Module):
         # no gradient to stop it). New formulation: loss = max(0, target - var)^2
         # provides gradient at ALL variance levels below the target, and a smooth
         # quadratic penalty above zero that never abruptly turns on.
+        # LOGGED ONLY — not in core_losses, wrap in no_grad to skip gradient graph
         loss_embed_var = torch.tensor(0.0, device=pred_gain.device)
         if embedding is not None and embedding.shape[0] > 1:
-            embed_var = embedding.var(dim=0).mean()
-            # Target variance: embedding_dim * 0.01 gives a reasonable floor
-            # for 128-dim embeddings (~1.28). Scale with dimension so the target
-            # is invariant to embedding size changes.
-            target_var = embedding.shape[-1] * 0.005
-            deficit = torch.clamp(target_var - embed_var, min=0.0)
-            loss_embed_var = deficit * deficit / (target_var + 1e-8)
-            loss_embed_var = torch.clamp(loss_embed_var, max=5.0)
+            with torch.no_grad():
+                embed_var = embedding.var(dim=0).mean()
+                target_var = embedding.shape[-1] * 0.005
+                deficit = torch.clamp(target_var - embed_var, min=0.0)
+                loss_embed_var = deficit * deficit / (target_var + 1e-8)
+                loss_embed_var = torch.clamp(loss_embed_var, max=5.0)
         components["embed_var_loss"] = loss_embed_var
 
         # 8. Spectral contrastive loss (L_contrastive)
@@ -579,23 +587,19 @@ class MultiTypeEQLoss(nn.Module):
         # high pairwise cosine similarity. The formulation is simple: minimize the
         # mean pairwise cosine similarity, which ensures the encoder uses the full
         # embedding space rather than a thin subspace.
+        # LOGGED ONLY — not in core_losses, wrap in no_grad to skip gradient graph
         loss_contrastive = torch.tensor(0.0, device=pred_gain.device)
         if embedding is not None and embedding.shape[0] > 1:
-            # Skip if embedding contains NaN/inf (from numerical instability)
-            if torch.isfinite(embedding).all():
-                # Normalize embeddings to unit sphere for cosine similarity
-                embed_norm = F.normalize(embedding, dim=1)
-                # Pairwise cosine similarity matrix (B, B)
-                sim_matrix = torch.mm(embed_norm, embed_norm.t())
-                # Exclude self-similarity (diagonal is always 1.0)
-                B = sim_matrix.shape[0]
-                mask = ~torch.eye(B, dtype=torch.bool, device=sim_matrix.device)
-                mean_sim = sim_matrix[mask].mean()
-                # Clamp similarity to prevent log(negative) = NaN and gradient
-                # explosion when sim approaches 1.0 (gradient ~1/(1-sim) → huge)
-                mean_sim_clamped = torch.clamp(mean_sim.float(), max=0.95)
-                loss_contrastive = -torch.log(1.0 - mean_sim_clamped + 1e-3)
-                loss_contrastive = torch.clamp(loss_contrastive, max=5.0)
+            with torch.no_grad():
+                if torch.isfinite(embedding).all():
+                    embed_norm = F.normalize(embedding, dim=1)
+                    sim_matrix = torch.mm(embed_norm, embed_norm.t())
+                    B = sim_matrix.shape[0]
+                    mask = ~torch.eye(B, dtype=torch.bool, device=sim_matrix.device)
+                    mean_sim = sim_matrix[mask].mean()
+                    mean_sim_clamped = torch.clamp(mean_sim.float(), max=0.95)
+                    loss_contrastive = -torch.log(1.0 - mean_sim_clamped + 1e-3)
+                    loss_contrastive = torch.clamp(loss_contrastive, max=5.0)
         components["contrastive_loss"] = loss_contrastive
 
         # D-05 (DATA-02): Detach type_probs from gain gradient path during warmup.
@@ -704,16 +708,12 @@ class MultiTypeEQLoss(nn.Module):
                 ).float() + self.type_label_smoothing / n_classes
 
                 p_t = (probs * smoothed_targets).sum(dim=1)  # (B*N,)
-                # Increase focal gamma to focus more on hard (shelf/HP/LP) errors
-                focal_weight = (1.0 - p_t).pow(3.5)  # (B*N,)
+                # Focal loss: focus on hard examples
+                focal_weight = (1.0 - p_t).pow(self.focal_gamma)  # (B*N,)
 
                 # Class-balanced alpha: alpha_t for each sample
                 alpha_t = self.type_class_weights[targets_flat]  # (B*N,)
                 alpha_t = alpha_t / alpha_t.mean()  # renormalize so mean(alpha)=1
-
-                # Individual shelf boost (multiplies alpha)
-                shelf_mask = (targets_flat == FILTER_LOWSHELF) | (targets_flat == FILTER_HIGHSHELF)
-                alpha_t[shelf_mask] *= 1.5
 
                 # Per-sample loss: alpha_t * (1-p_t)^gamma * CE
                 per_sample_loss = alpha_t * focal_weight * (
@@ -728,18 +728,19 @@ class MultiTypeEQLoss(nn.Module):
             # Apply dynamic weight to type loss
             loss_type = loss_type * self.lambda_type
 
-            # Batch-level type collapse regularization.
-            probs_batch = pred_type_logits.softmax(dim=-1)
-            mean_probs = probs_batch.reshape(-1, C).mean(dim=0)
+            # Batch-level type collapse regularization — LOGGED ONLY
+            with torch.no_grad():
+                probs_batch = pred_type_logits.softmax(dim=-1)
+                mean_probs = probs_batch.reshape(-1, C).mean(dim=0)
 
-            entropy = -(mean_probs * torch.log(mean_probs + 1e-8)).sum()
-            max_entropy = math.log(float(C))
-            loss_type_entropy = 1.0 - entropy / max_entropy
+                entropy = -(mean_probs * torch.log(mean_probs + 1e-8)).sum()
+                max_entropy = math.log(float(C))
+                loss_type_entropy = 1.0 - entropy / max_entropy
 
-            prior = self.type_class_priors.to(mean_probs.dtype)
-            loss_type_prior = torch.sum(
-                prior * (torch.log(prior + 1e-8) - torch.log(mean_probs + 1e-8))
-            )
+                prior = self.type_class_priors.to(mean_probs.dtype)
+                loss_type_prior = torch.sum(
+                    prior * (torch.log(prior + 1e-8) - torch.log(mean_probs + 1e-8))
+                )
         else:
             loss_type = torch.tensor(0.0, device=pred_gain.device)
             loss_type_entropy = torch.tensor(0.0, device=pred_gain.device)
@@ -748,12 +749,72 @@ class MultiTypeEQLoss(nn.Module):
         components["type_entropy_loss"] = loss_type_entropy
         components["type_prior_loss"] = loss_type_prior
 
-        # 3. Frequency response magnitude L1 — uses H_mag_hard (argmax types)
-        # CRITICAL: detach to prevent NaN backward through torch.where argmax branch.
-        # (0 * NaN = NaN in gradient accumulation from non-selected filter branches)
-        pred_H_mag_hard_safe = torch.clamp(pred_H_mag_hard.float().detach(), min=1e-6, max=1e6)
-        target_H_mag_safe = torch.clamp(target_H_mag.float(), min=1e-6, max=1e6)
-        loss_hmag = F.l1_loss(torch.log(pred_H_mag_hard_safe), torch.log(target_H_mag_safe))
+        # 2b. Hierarchical type losses (if hierarchical head is active)
+        loss_hier_broad = torch.tensor(0.0, device=pred_gain.device)
+        loss_hier_pass = torch.tensor(0.0, device=pred_gain.device)
+        loss_hier_shelf = torch.tensor(0.0, device=pred_gain.device)
+        if hier_aux is not None:
+            broad_logits, pass_logits, shelf_logits = hier_aux
+            B_h, N_h, _ = broad_logits.shape
+            target_type_flat = matched_filter_type.reshape(B_h * N_h)
+
+            # Map 5-class targets to 3-class broad targets
+            broad_target = torch.tensor(
+                [FINE_TO_BROAD[i] for i in range(5)],
+                device=target_type_flat.device, dtype=target_type_flat.dtype
+            )
+            broad_target_flat = broad_target[target_type_flat]  # (B*N,)
+
+            # Gain-gated mask (reuse same logic)
+            target_gain_flat = matched_gain.reshape(-1)
+            is_hplp = (target_type_flat == FILTER_HIGHPASS) | (target_type_flat == FILTER_LOWPASS)
+            has_gain = (torch.abs(target_gain_flat) >= 0.5)
+            valid_mask = (has_gain | is_hplp).float()
+
+            # Broad class focal loss (3-class)
+            broad_flat = broad_logits.reshape(B_h * N_h, 3)
+            broad_log_probs = F.log_softmax(broad_flat, dim=1)
+            broad_probs = broad_log_probs.exp()
+            broad_onehot = F.one_hot(broad_target_flat, 3).float()
+            broad_p_t = (broad_probs * broad_onehot).sum(dim=1)
+            broad_focal = (1.0 - broad_p_t).pow(2.0)
+            broad_ce = -(broad_log_probs * broad_onehot).sum(dim=1)
+            loss_hier_broad = (broad_focal * broad_ce * valid_mask).sum() / (valid_mask.sum() + 1e-8)
+            loss_hier_broad = loss_hier_broad * 3.0  # weight for broad classification
+
+            # Pass subclass: binary CE for HP vs LP (only on pass bands)
+            pass_mask = (broad_target_flat == BROAD_PASS)
+            if pass_mask.any():
+                pass_flat = pass_logits.reshape(B_h * N_h, 2)
+                # HP=0, LP=1 for the binary target
+                pass_target = (target_type_flat == FILTER_LOWPASS).long()  # HP→0, LP→1
+                pass_loss_per = F.cross_entropy(pass_flat[pass_mask], pass_target[pass_mask], reduction='none')
+                # Also apply gain gate
+                pass_valid = valid_mask[pass_mask]
+                loss_hier_pass = (pass_loss_per * pass_valid).sum() / (pass_valid.sum() + 1e-8)
+                loss_hier_pass = loss_hier_pass * 1.0
+
+            # Shelf subclass: binary CE for LS vs HS (only on shelf bands)
+            shelf_mask = (broad_target_flat == BROAD_SHELF)
+            if shelf_mask.any():
+                shelf_flat = shelf_logits.reshape(B_h * N_h, 2)
+                # LS=0, HS=1
+                shelf_target = (target_type_flat == FILTER_HIGHSHELF).long()  # LS→0, HS→1
+                shelf_loss_per = F.cross_entropy(shelf_flat[shelf_mask], shelf_target[shelf_mask], reduction='none')
+                shelf_valid = valid_mask[shelf_mask]
+                loss_hier_shelf = (shelf_loss_per * shelf_valid).sum() / (shelf_valid.sum() + 1e-8)
+                loss_hier_shelf = loss_hier_shelf * 2.0  # Higher weight — hardest distinction
+
+        components["hier_broad_loss"] = loss_hier_broad
+        components["hier_pass_loss"] = loss_hier_pass
+        components["hier_shelf_loss"] = loss_hier_shelf
+
+        # 3. Frequency response magnitude L1 — LOGGED ONLY (not in core_losses).
+        # Computed under no_grad to avoid wasting GPU on unused gradient graphs.
+        with torch.no_grad():
+            pred_H_mag_hard_safe = torch.clamp(pred_H_mag_hard.float().detach(), min=1e-6, max=1e6)
+            target_H_mag_safe = torch.clamp(target_H_mag.float(), min=1e-6, max=1e6)
+            loss_hmag = F.l1_loss(torch.log(pred_H_mag_hard_safe), torch.log(target_H_mag_safe))
         components["hmag_loss"] = loss_hmag
 
         # 4. Spectral reconstruction loss (LOSS-05, D-06)
@@ -768,51 +829,49 @@ class MultiTypeEQLoss(nn.Module):
             loss_spectral = torch.tensor(0.0, device=pred_gain.device)
         components["spectral_loss"] = loss_spectral
 
-        # 5. Band activity regularization
-        if active_band_mask is not None:
-            inactive_mask = ~active_band_mask
-            loss_activity = (pred_gain * inactive_mask.float()).abs().mean()
-        else:
-            loss_activity = torch.tensor(0.0, device=pred_gain.device)
+        # 5. Band activity regularization — LOGGED ONLY
+        with torch.no_grad():
+            if active_band_mask is not None:
+                inactive_mask = ~active_band_mask
+                loss_activity = (pred_gain * inactive_mask.float()).abs().mean()
+            else:
+                loss_activity = torch.tensor(0.0, device=pred_gain.device)
         components["activity_loss"] = loss_activity
 
-        # 6. Frequency spread regularization (bounded to prevent pushing frequencies to extremes)
-        if pred_freq.shape[1] > 1:
-            log_freq = torch.log(pred_freq + 1e-8)
-            # Pairwise log-frequency differences
-            diff = log_freq.unsqueeze(-1) - log_freq.unsqueeze(-2)  # (B, N, N)
-            spread = diff.abs().mean()
-            # The maximum achievable mean pairwise spread is bounded by the
-            # log-frequency range (~6.9 octaves for 20-20000 Hz).  Clamp so
-            # the repulsive force saturates instead of growing without bound.
-            max_spread = math.log(20000.0 / 20.0)  # ~6.9
-            spread = torch.clamp(spread, max=max_spread)
-            loss_spread = -spread  # Maximize spread
-        else:
-            loss_spread = torch.tensor(0.0, device=pred_gain.device)
+        # 6. Frequency spread regularization — LOGGED ONLY
+        with torch.no_grad():
+            if pred_freq.shape[1] > 1:
+                log_freq = torch.log(pred_freq + 1e-8)
+                diff = log_freq.unsqueeze(-1) - log_freq.unsqueeze(-2)  # (B, N, N)
+                spread = diff.abs().mean()
+                max_spread = math.log(20000.0 / 20.0)  # ~6.9
+                spread = torch.clamp(spread, max=max_spread)
+                loss_spread = -spread
+            else:
+                loss_spread = torch.tensor(0.0, device=pred_gain.device)
         components["spread_loss"] = loss_spread
 
-        # 9. HP/LP zero-gain supervision
-        # HP and LP filters should have gain ≈ 0 dB. This explicit loss pushes
-        # predicted gain toward zero for bands where the matched target is HP/LP.
-        loss_gain_zero = torch.tensor(0.0, device=pred_gain.device)
-        zero_gain_mask = (
-            (matched_filter_type == FILTER_HIGHPASS)
-            | (matched_filter_type == FILTER_LOWPASS)
-            | (matched_gain.abs() < 0.5)
-        )
-        if zero_gain_mask.any():
-            loss_gain_zero = F.smooth_l1_loss(
-                pred_gain[zero_gain_mask],
-                torch.zeros_like(pred_gain[zero_gain_mask]),
+        # 9. HP/LP zero-gain supervision — LOGGED ONLY
+        with torch.no_grad():
+            loss_gain_zero = torch.tensor(0.0, device=pred_gain.device)
+            zero_gain_mask = (
+                (matched_filter_type == FILTER_HIGHPASS)
+                | (matched_filter_type == FILTER_LOWPASS)
+                | (matched_gain.abs() < 0.5)
             )
+            if zero_gain_mask.any():
+                loss_gain_zero = F.smooth_l1_loss(
+                    pred_gain[zero_gain_mask],
+                    torch.zeros_like(pred_gain[zero_gain_mask]),
+                )
         components["loss_gain_zero"] = loss_gain_zero
 
-        # 10. H_db direct prediction loss (hybrid spectral-parametric)
-        if h_db_pred is not None and h_db_target is not None:
-            loss_hdb = F.l1_loss(h_db_pred, h_db_target)
-        else:
-            loss_hdb = torch.tensor(0.0, device=pred_gain.device)
+        # 10. H_db direct prediction loss — LOGGED ONLY
+        with torch.no_grad():
+            if h_db_pred is not None and h_db_target is not None:
+                loss_hdb = F.l1_loss(h_db_pred, h_db_target)
+            else:
+                loss_hdb = torch.tensor(0.0, device=pred_gain.device)
         components["hdb_loss"] = loss_hdb
 
         # 11. Teacher-forced typed spectral loss
@@ -831,10 +890,12 @@ class MultiTypeEQLoss(nn.Module):
         components["film_diversity_loss"] = loss_film_diversity
 
         # 13. Multi-scale render-domain loss (Fix 3)
+        # CRITICAL: detach type_probs to prevent spectral→type gradient conflict
+        # (same reasoning as H_mag_soft detach in model_tcn.py)
         loss_multi_scale = torch.tensor(0.0, device=pred_gain.device)
         if self._dsp_cascade is not None and type_probs is not None:
             loss_multi_scale = multi_scale_spectral_loss(
-                pred_gain, pred_freq, pred_q, type_probs,
+                pred_gain, pred_freq, pred_q, type_probs.detach(),
                 target_H_mag, self._dsp_cascade,
             )
         components["multi_scale_loss"] = loss_multi_scale
@@ -843,16 +904,24 @@ class MultiTypeEQLoss(nn.Module):
         # Dropped terms (hmag, activity, spread, embed_var, contrastive, hdb,
         # gain_zero, type_entropy, type_prior, film_diversity) are still
         # computed above for logging but excluded from gradient signal.
+        #
+        # Apply lambda scaling to spectral losses (type/gain/freq/q already scaled above).
+        loss_spectral_scaled = loss_spectral * self.lambda_spectral
+        loss_typed_spectral_scaled = loss_typed_spectral * self.lambda_typed_spectral
+        loss_multi_scale_scaled = loss_multi_scale * self.lambda_multi_scale
         core_losses = [
-            loss_spectral,        # 0: soft-type spectral L1
-            loss_typed_spectral,  # 1: teacher-forced spectral
-            loss_type,            # 2: type classification
-            loss_gain,            # 3: gain supervision
-            loss_freq,            # 4: freq supervision
-            loss_q,               # 5: Q supervision
-            loss_multi_scale,     # 6: multi-scale render-domain
+            loss_spectral_scaled,        # 0: soft-type spectral L1
+            loss_typed_spectral_scaled,  # 1: teacher-forced spectral
+            loss_type,                   # 2: type classification
+            loss_gain,                   # 3: gain supervision
+            loss_freq,                   # 4: freq supervision
+            loss_q,                      # 5: Q supervision
+            loss_multi_scale_scaled,     # 6: multi-scale render-domain
         ]
         total_loss = self.uncertainty_loss(core_losses)
+
+        # Add hierarchical type losses (outside uncertainty weighting for stability)
+        total_loss = total_loss + loss_hier_broad + loss_hier_pass + loss_hier_shelf
 
         # Clamp total loss to prevent NaN propagation from any single component
         total_loss = torch.clamp(total_loss, max=1e4)

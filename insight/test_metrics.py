@@ -140,16 +140,18 @@ def test_loss_component_keys():
     pred_freq = torch.abs(torch.randn(B, N)) * 5000 + 100
     pred_q = torch.abs(torch.randn(B, N)) * 2 + 0.1
     pred_type_logits = torch.randn(B, N, 5)
-    pred_H_mag = torch.abs(torch.randn(B, N, 513))
+    pred_H_mag_soft = torch.abs(torch.randn(B, 513))
+    pred_H_mag_hard = torch.abs(torch.randn(B, 513))
     target_gain = torch.randn(B, N)
     target_freq = torch.abs(torch.randn(B, N)) * 5000 + 100
     target_q = torch.abs(torch.randn(B, N)) * 2 + 0.1
     target_ft = torch.randint(0, 5, (B, N))
-    target_H_mag = torch.abs(torch.randn(B, N, 513))
+    target_H_mag = torch.abs(torch.randn(B, 513))
     embedding = torch.randn(B, 128)
 
     total_loss, components = criterion(
-        pred_gain, pred_freq, pred_q, pred_type_logits, pred_H_mag,
+        pred_gain, pred_freq, pred_q, pred_type_logits,
+        pred_H_mag_soft, pred_H_mag_hard,
         target_gain, target_freq, target_q, target_ft, target_H_mag,
         embedding=embedding,
     )
@@ -188,14 +190,14 @@ def test_gradient_monitoring_groups():
     model = StreamingTCNModel(n_mels=128, n_fft=2048, num_bands=5)
     names = [n for n, _ in model.named_parameters()]
 
-    # Check gain_mlp group
-    assert any("gain_mlp" in n for n in names), (
-        f"No parameter with 'gain_mlp' in name. Names: {[n for n in names if 'gain' in n]}"
+    # Check gain head group
+    assert any("gain_head" in n for n in names), (
+        f"No parameter with 'gain_head' in name. Names: {[n for n in names if 'gain' in n]}"
     )
 
-    # Check classification_head group
-    assert any("classification_head" in n for n in names), (
-        f"No parameter with 'classification_head' in name. Names: {[n for n in names if 'class' in n]}"
+    # Check type classifier group
+    assert any("type_head" in n for n in names), (
+        f"No parameter with 'type_head' in name. Names: {[n for n in names if 'type' in n]}"
     )
 
     # Check q_head group
@@ -209,8 +211,8 @@ def test_gradient_monitoring_groups():
     )
 
     print(f"  Model has {len(names)} parameters")
-    print(f"  gain_mlp params: {sum(1 for n in names if 'gain_mlp' in n)}")
-    print(f"  classification_head params: {sum(1 for n in names if 'classification_head' in n)}")
+    print(f"  gain_head params: {sum(1 for n in names if 'gain_head' in n)}")
+    print(f"  type_head params: {sum(1 for n in names if 'type_head' in n)}")
     print(f"  q_head params: {sum(1 for n in names if 'q_head' in n)}")
     print(f"  encoder params: {sum(1 for n in names if n.startswith('encoder'))}")
     print("  PASSED")

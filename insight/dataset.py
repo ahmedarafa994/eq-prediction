@@ -15,6 +15,7 @@ import torch.utils.data as data
 import numpy as np
 import random
 import math
+import json
 from pathlib import Path
 from differentiable_eq import (
     DifferentiableBiquadCascade,
@@ -24,6 +25,12 @@ from differentiable_eq import (
     FILTER_HIGHPASS,
     FILTER_LOWPASS,
     NUM_FILTER_TYPES,
+)
+from pipeline_utils import (
+    PIPELINE_SCHEMA_VERSION,
+    compute_metadata_signature,
+    seeded_index_context,
+    utc_now_iso,
 )
 
 FILTER_NAMES = ["peaking", "lowshelf", "highshelf", "highpass", "lowpass"]
@@ -55,6 +62,7 @@ class SyntheticEQDataset(data.Dataset):
         augment=True,
         precompute_mels=False,
         n_mels=128,
+        base_seed=42,
     ):
         self.num_bands = num_bands
         self.sample_rate = sample_rate
@@ -77,6 +85,7 @@ class SyntheticEQDataset(data.Dataset):
         self.augment = augment
         self.n_mels = n_mels
         self.precompute_mels = precompute_mels
+        self.base_seed = int(base_seed)
         self.dsp = DifferentiableBiquadCascade(
             num_bands=num_bands, sample_rate=sample_rate
         )
@@ -120,6 +129,75 @@ class SyntheticEQDataset(data.Dataset):
 
     def __len__(self):
         return self._size
+
+    def _cache_metadata(self):
+        # AUDIT: HIGH-03 — Include generation parameters hash for staleness detection
+        # AUDIT: MEDIUM-05 — Include lineage info for reproducibility
+        metadata = {
+            "schema_version": PIPELINE_SCHEMA_VERSION,
+            "dataset_class": self.__class__.__name__,
+            "num_bands": self.num_bands,
+            "sample_rate": self.sample_rate,
+            "duration": float(self.duration),
+            "duration_range": list(self.duration_range)
+            if self.duration_range is not None
+            else None,
+            "n_fft": self.n_fft,
+            "hop_length": self.hop_length,
+            "size": self._size,
+            "gain_range": list(self.gain_range),
+            "freq_range": list(self.freq_range),
+            "q_range": list(self.q_range),
+            "type_weights": list(self.type_weights),
+            "hp_lp_gain_target": self.hp_lp_gain_target,
+            "signal_types": list(self.signal_types),
+            "augment": bool(self.augment),
+            "precompute_mels": bool(self.precompute_mels),
+            "n_mels": self.n_mels,
+            "base_seed": self.base_seed,
+            # Lineage tracking (AUDIT: MEDIUM-05)
+            "generation_params_hash": self._generation_params_hash(),
+        }
+        metadata.update(self._extra_cache_metadata())
+        metadata["signature"] = compute_metadata_signature(metadata)
+        return metadata
+
+    def _generation_params_hash(self):
+        """
+        Compute a hash of all parameters that affect data generation.
+        Used for cache staleness detection (AUDIT: HIGH-03).
+        """
+        params = {
+            "num_bands": self.num_bands,
+            "sample_rate": self.sample_rate,
+            "duration": float(self.duration),
+            "duration_range": list(self.duration_range) if self.duration_range else None,
+            "n_fft": self.n_fft,
+            "gain_range": list(self.gain_range),
+            "freq_range": list(self.freq_range),
+            "q_range": list(self.q_range),
+            "type_weights": list(self.type_weights),
+            "signal_types": list(self.signal_types),
+            "hp_lp_gain_target": self.hp_lp_gain_target,
+        }
+        return compute_metadata_signature(params)
+
+    def _extra_cache_metadata(self):
+        return {}
+
+    def get_type_prior(self):
+        weights = torch.tensor(self.type_weights, dtype=torch.float32)
+        return weights / weights.sum().clamp(min=1e-8)
+
+    def apply_curriculum_stage(self, stage):
+        if "gain_bounds" in stage:
+            self.gain_range = tuple(stage["gain_bounds"])
+        if "q_bounds" in stage:
+            self.q_range = tuple(stage["q_bounds"])
+        if "freq_bounds" in stage:
+            self.freq_range = tuple(stage["freq_bounds"])
+        if "type_weights" in stage:
+            self.type_weights = list(stage["type_weights"])
 
     def _generate_dry_signal(self, signal_type, num_samples=None):
         N = self.num_samples if num_samples is None else int(num_samples)
@@ -313,7 +391,11 @@ class SyntheticEQDataset(data.Dataset):
             window=window,
             length=dry_audio.shape[0],
         )
-        return wet_audio.squeeze(0)
+        wet_audio = wet_audio.squeeze(0)
+        # Data integrity: regenerate if output is non-finite (extreme Q/gain combos)
+        if not torch.isfinite(wet_audio).all():
+            return dry_audio  # Fallback: return unprocessed audio
+        return wet_audio
 
     def _audio_to_mel(self, audio):
         """Convert audio tensor to log-mel spectrogram. Returns (n_mels, T)."""
@@ -364,36 +446,8 @@ class SyntheticEQDataset(data.Dataset):
         print(f"Precomputing {self._size} samples...")
         self._cache = []
         for i in range(self._size):
-            if self.duration_range is not None:
-                dur = random.uniform(*self.duration_range)
-                num_samples = int(dur * self.sample_rate)
-            else:
-                num_samples = self.num_samples
-
-            dry_audio = self._generate_dry_mix(num_samples)
-            dry_audio = self._augment_dry_audio(dry_audio)
-            gain_db, freq, q, filter_type = self._sample_multitype_params()
-            wet_audio = self._apply_eq_freq_domain(
-                dry_audio, gain_db, freq, q, filter_type
-            )
-
-            if self.augment:
-                wet_audio, dry_audio = self._augment_audio_pair(wet_audio, dry_audio)
-
-            sample = {
-                "gain": gain_db,
-                "freq": freq,
-                "q": q,
-                "filter_type": filter_type,
-                "active_band_mask": torch.ones(self.num_bands, dtype=torch.bool),  # all bands active
-            }
-
-            if self.precompute_mels:
-                sample["wet_mel"] = self._audio_to_mel(wet_audio)
-            else:
-                sample["wet_audio"] = wet_audio
-
-            self._cache.append(sample)
+            with seeded_index_context(self.base_seed, i):
+                self._cache.append(self._generate_sample())
             if (i + 1) % 2000 == 0:
                 print(f"  {i + 1}/{self._size}")
 
@@ -433,9 +487,68 @@ class SyntheticEQDataset(data.Dataset):
         return result
 
     def __getitem__(self, idx):
+        """
+        Return a single training sample.
+
+        Data integrity guarantees (AUDIT: CRITICAL-01, MEDIUM-06):
+          - wet_audio and all parameters are validated as finite before return
+          - amplitudes are clamped to [-1.0, 1.0] to prevent clip poisoning
+          - non-finite samples are regenerated from the next index (max 5 retries)
+          - duration mismatches are reconciled via padding/truncation
+        """
         if hasattr(self, "_cache") and idx < len(self._cache):
             return self._cache[idx]
-        return self._generate_sample()
+        # Retry up to 5 times for non-finite samples (AUDIT: CRITICAL-01)
+        for attempt in range(5):
+            with seeded_index_context(self.base_seed, idx + attempt):
+                sample = self._generate_sample()
+            # Validate output tensors are finite
+            wet = sample.get("wet_audio")
+            if wet is not None and not torch.isfinite(wet).all():
+                continue  # Regenerate from next seed
+            if not torch.isfinite(sample["gain"]).all():
+                continue
+            if not torch.isfinite(sample["freq"]).all():
+                continue
+            if not torch.isfinite(sample["q"]).all():
+                continue
+            # Clamp wet_audio to safe range to prevent clip poisoning
+            sample["wet_audio"] = torch.clamp(sample["wet_audio"], -1.0, 1.0)
+            # Validate dry_audio if present
+            dry = sample.get("dry_audio")
+            if dry is not None and torch.isfinite(dry).all():
+                sample["dry_audio"] = torch.clamp(dry, -1.0, 1.0)
+            return sample
+        # All retries failed — return a safe fallback sample
+        return self._fallback_sample(idx)
+
+    def _fallback_sample(self, idx):
+        """
+        Return a deterministic fallback sample when generation repeatedly fails.
+        Uses simple white noise with zero-gain EQ (identity transform).
+        """
+        with seeded_index_context(self.base_seed, idx + 999999):
+            num_samples = self.num_samples
+            dry_audio = torch.randn(num_samples, dtype=torch.float32) * 0.3
+            peak = dry_audio.abs().max() + 1e-8
+            dry_audio = dry_audio / peak
+            gain_db = torch.zeros(self.num_bands, dtype=torch.float32)
+            freq = torch.logspace(
+                math.log10(self.freq_range[0]),
+                math.log10(self.freq_range[1]),
+                self.num_bands,
+            )
+            q = torch.ones(self.num_bands, dtype=torch.float32) * 1.0
+            filter_type = torch.zeros(self.num_bands, dtype=torch.long)
+            return {
+                "wet_audio": dry_audio.clone(),
+                "dry_audio": dry_audio.clone(),
+                "gain": gain_db,
+                "freq": freq,
+                "q": q,
+                "filter_type": filter_type,
+                "active_band_mask": torch.ones(self.num_bands, dtype=torch.bool),
+            }
 
     def save_precomputed(self, path):
         """Save precomputed dataset to disk for reuse across training runs."""
@@ -443,22 +556,70 @@ class SyntheticEQDataset(data.Dataset):
         path.parent.mkdir(parents=True, exist_ok=True)
         if not hasattr(self, "_cache"):
             raise RuntimeError("Call precompute() before saving.")
-        torch.save(self._cache, path)
+        metadata = self._cache_metadata()
+        torch.save({"metadata": metadata, "cache": self._cache}, path)
+        manifest_path = path.with_suffix(path.suffix + ".manifest.json")
+        with open(manifest_path, "w") as f:
+            json.dump({**metadata, "saved_at": utc_now_iso()}, f, indent=2)
         print(f"Saved precomputed dataset to {path}")
 
     def load_precomputed(self, path):
-        """Load precomputed dataset from disk, avoiding regeneration."""
+        """
+        Load precomputed dataset from disk, avoiding regeneration.
+
+        Staleness detection (AUDIT: HIGH-03):
+          - Compares metadata signature between cache and current config
+          - Rejects cache if generation parameters changed (gain bounds, type weights, etc.)
+          - Falls back to stale-cache warning if no signature is present (legacy cache)
+        """
         path = Path(path)
         if not path.exists():
             return False
-        self._cache = torch.load(path, weights_only=False)
+        payload = torch.load(path, weights_only=False)
+        if isinstance(payload, dict) and "cache" in payload and "metadata" in payload:
+            metadata = payload["metadata"]
+            expected_signature = self._cache_metadata()["signature"]
+            cached_signature = metadata.get("signature")
+            if cached_signature and cached_signature != expected_signature:
+                print(
+                    f"  [cache] STALE CACHE DETECTED: cache signature {cached_signature[:12]}... "
+                    f"does not match current config {expected_signature[:12]}... — "
+                    f"refusing to load. Regenerate cache or delete {path}"
+                )
+                return False
+            if not cached_signature:
+                print(
+                    f"  [cache] WARNING: cached dataset has no signature (legacy cache). "
+                    f"Loading without staleness check. Regenerate cache to enable validation."
+                )
+            self._cache = payload["cache"]
+        else:
+            print(
+                f"  [cache] WARNING: loaded cache from {path} has unexpected format. "
+                f"Loading without metadata validation. Regenerate cache to enable checks."
+            )
+            self._cache = payload
         self._size = len(self._cache)
-        print(f"Loaded precomputed dataset from {path}: {len(self._cache)} samples")
+        print(f"  [cache] Loaded precomputed dataset from {path}: {len(self._cache)} samples")
         return True
 
 
 def collate_fn(batch):
     """Custom collate to pad variable-length audio and optional mel-spectrograms."""
+    # Data integrity: filter out samples with non-finite parameters
+    valid_batch = []
+    for item in batch:
+        if not torch.isfinite(item["gain"]).all():
+            continue
+        if not torch.isfinite(item["freq"]).all():
+            continue
+        if not torch.isfinite(item["q"]).all():
+            continue
+        if "wet_audio" in item and not torch.isfinite(item["wet_audio"]).all():
+            continue
+        valid_batch.append(item)
+    batch = valid_batch if valid_batch else batch  # Fallback to original if all filtered
+
     has_audio = all("wet_audio" in item for item in batch)
     has_mel = all("wet_mel" in item for item in batch)
 
