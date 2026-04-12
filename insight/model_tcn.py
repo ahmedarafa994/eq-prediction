@@ -35,17 +35,59 @@ Optimization features:
 """
 
 import math
+from pathlib import Path
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
 from torch.utils.checkpoint import checkpoint
-from differentiable_eq import DifferentiableBiquadCascade, MultiTypeEQParameterHead, NUM_FILTER_TYPES
+from differentiable_eq import DifferentiableBiquadCascade, MultiTypeEQParameterHead
+
+try:
+    from transformers import AutoModel
+
+    HAS_TRANSFORMERS = True
+except ImportError:
+    AutoModel = None
+    HAS_TRANSFORMERS = False
+
+try:
+    import timm
+
+    HAS_TIMM = True
+except ImportError:
+    timm = None
+    HAS_TIMM = False
 
 # Fused Triton kernels disabled: runtime compilation fails on this Triton version
 # (tl.math.tanh AttributeError). Use native PyTorch ops instead.
 HAS_FUSED_KERNELS = False
 fused_gated_activation_torch = None
 fused_attention_pool_torch = None
+
+PROJECT_DIR = Path(__file__).resolve().parent
+
+
+def resolve_workspace_resource(path_or_name):
+    if not path_or_name:
+        return path_or_name
+
+    candidate = Path(path_or_name)
+    candidates = []
+    if candidate.is_absolute():
+        candidates.append(candidate)
+    else:
+        candidates.extend(
+            [
+                PROJECT_DIR / candidate,
+                PROJECT_DIR / "pretrained_models" / candidate,
+                candidate,
+            ]
+        )
+
+    for value in candidates:
+        if value.exists():
+            return str(value)
+    return path_or_name
 
 
 # ---------------------------------------------------------------------------
@@ -505,6 +547,491 @@ class FrequencyAwareEncoder(nn.Module):
 
 
 # ---------------------------------------------------------------------------
+# MERT (Music Encoder from Retrieval-based Training) frozen encoder
+# ---------------------------------------------------------------------------
+
+
+class FrozenMERTEncoder(nn.Module):
+    """Frozen MERT backbone with trainable weighted-layer aggregation + projection.
+
+    MERT (ICLR 2024) is a music-specific foundation model pre-trained on 160K hours
+    of music using a CQT-based teacher. Its mid layers capture timbral/spectral
+    features that directly correspond to what EQ modifies.
+
+    Architecture:
+        1. Frozen MERT backbone (95M or 330M)
+        2. Trainable weighted sum over all hidden layers (like ASR layer weighting)
+        3. Attention temporal pooling
+        4. Linear projection to embedding_dim
+
+    This avoids training an encoder from scratch (which collapses) and instead
+    leverages pretrained spectral representations.
+    """
+
+    def __init__(
+        self,
+        checkpoint_name="m-a-p/MERT-v1-95M",
+        input_sample_rate=44100,
+        target_sample_rate=24000,  # MERT expects 24kHz
+        embedding_dim=256,
+    ):
+        super().__init__()
+        if not HAS_TRANSFORMERS:
+            raise ImportError(
+                "The `transformers` package is required for "
+                "`encoder.backend=mert`. Install: pip install transformers"
+            )
+
+        self.input_sample_rate = int(input_sample_rate)
+        self.target_sample_rate = int(target_sample_rate)
+        self.checkpoint_name = checkpoint_name
+
+        # Load MERT model — prefer local cache, fallback to hub download
+        _mert_kwargs = dict(
+            trust_remote_code=True,
+            output_hidden_states=True,
+        )
+        try:
+            self.backbone = AutoModel.from_pretrained(
+                self.checkpoint_name,
+                **_mert_kwargs,
+                attn_implementation="flash_attention_2",
+                torch_dtype=torch.float16,
+                local_files_only=True,
+            )
+            self._uses_flash = True
+        except (Exception, OSError):
+            try:
+                self.backbone = AutoModel.from_pretrained(
+                    self.checkpoint_name,
+                    **_mert_kwargs,
+                    local_files_only=True,
+                )
+            except OSError:
+                self.backbone = AutoModel.from_pretrained(
+                    self.checkpoint_name,
+                    **_mert_kwargs,
+                )
+            self._uses_flash = False
+        self.backbone.eval()
+        for param in self.backbone.parameters():
+            param.requires_grad = False
+
+        hidden_size = int(self.backbone.config.hidden_size)
+        num_layers = self.backbone.config.num_hidden_layers + 1  # +1 for embedding layer
+
+        # Trainable weighted sum over all hidden layers
+        self.layer_weights = nn.Parameter(torch.zeros(num_layers))
+
+        # Temporal pooling and projection
+        self.temporal_pool = AttentionTemporalPool(hidden_size)
+        self.output_proj = nn.Sequential(
+            nn.Linear(hidden_size, embedding_dim),
+            nn.LayerNorm(embedding_dim),
+        )
+
+    @property
+    def receptive_field_frames(self):
+        return 0
+
+    def train(self, mode=True):
+        super().train(mode)
+        self.backbone.eval()  # Always keep backbone frozen
+        return self
+
+    def _resample(self, audio):
+        if self.input_sample_rate == self.target_sample_rate:
+            return audio
+        target_len = max(
+            1,
+            int(round(audio.shape[-1] * self.target_sample_rate / self.input_sample_rate)),
+        )
+        return F.interpolate(
+            audio.unsqueeze(1),
+            size=target_len,
+            mode="linear",
+            align_corners=False,
+        ).squeeze(1)
+
+    def forward(self, wet_audio):
+        if wet_audio is None:
+            raise ValueError("`wet_audio` is required for the MERT encoder.")
+
+        audio = self._resample(wet_audio.float())
+
+        with torch.no_grad():
+            outputs = self.backbone(input_values=audio)
+            # outputs.hidden_states: tuple of (B, T, hidden_size) for each layer
+            hidden_states = torch.stack(outputs.hidden_states, dim=0)  # (L, B, T, H)
+
+        # Weighted sum over layers (trainable)
+        weights = F.softmax(self.layer_weights, dim=0)  # (L,)
+        weighted = torch.einsum("l,lbth->bth", weights, hidden_states.float())  # (B, T, H)
+
+        # Temporal pooling
+        pooled, attn_weights = self.temporal_pool(weighted.transpose(1, 2))  # (B, H), (B, T)
+
+        # Project to embedding dim
+        embedding = self.output_proj(pooled)  # (B, embedding_dim)
+
+        return embedding, attn_weights
+
+
+class FrozenWav2Vec2Encoder(nn.Module):
+    """Wav2Vec2 backbone with trainable weighted-layer aggregation + projection.
+
+    Supports two modes controlled by ``frozen`` flag:
+    - **frozen** (default): backbone in eval mode, no gradients — fast training,
+      features come from pretrained speech representations.
+    - **unfrozen**: backbone gradients enabled via ``unfreeze_backbone()``.
+      Use with a lower encoder LR and warmup to avoid destroying pretrained features.
+
+    Upgraded to use all hidden layers (like MERT encoder) instead of just
+    last_hidden_state. Wav2Vec2-base has 12 transformer layers; a trainable
+    weighted sum lets the model learn which layers are most informative for
+    EQ parameter estimation.
+
+    License: facebook/wav2vec2-base is Apache 2.0 — commercially usable.
+    """
+
+    def __init__(
+        self,
+        checkpoint_name,
+        input_sample_rate=44100,
+        target_sample_rate=16000,
+        embedding_dim=128,
+    ):
+        super().__init__()
+        if not HAS_TRANSFORMERS:
+            raise ImportError(
+                "The `transformers` package is required for "
+                "`encoder.backend=wav2vec2_frozen`."
+            )
+
+        self.input_sample_rate = int(input_sample_rate)
+        self.target_sample_rate = int(target_sample_rate)
+        self.checkpoint_name = resolve_workspace_resource(checkpoint_name)
+        try:
+            self.backbone = AutoModel.from_pretrained(
+                self.checkpoint_name,
+                output_hidden_states=True,
+                local_files_only=True,
+            )
+        except OSError:
+            self.backbone = AutoModel.from_pretrained(
+                self.checkpoint_name,
+                output_hidden_states=True,
+            )
+
+        # Start frozen by default — unfreeze_backbone() switches to fine-tune mode
+        self._backbone_frozen = True
+        self.backbone.eval()
+        for param in self.backbone.parameters():
+            param.requires_grad = False
+
+        hidden_size = int(self.backbone.config.hidden_size)
+        num_layers = self.backbone.config.num_hidden_layers + 1  # +1 for embedding layer
+
+        # Trainable weighted sum over all hidden layers
+        self.layer_weights = nn.Parameter(torch.zeros(num_layers))
+
+        self.temporal_pool = AttentionTemporalPool(hidden_size)
+        self.output_proj = nn.Sequential(
+            nn.Linear(hidden_size, embedding_dim),
+            nn.LayerNorm(embedding_dim),
+        )
+
+    # ------------------------------------------------------------------
+    # Freeze / unfreeze API (matches AST / CLAP encoder interface)
+    # ------------------------------------------------------------------
+    def freeze_backbone(self):
+        """Freeze all backbone parameters (no gradients, eval mode)."""
+        self._backbone_frozen = True
+        self.backbone.eval()
+        for param in self.backbone.parameters():
+            param.requires_grad = False
+        print("  [wav2vec2] Backbone FROZEN")
+
+    def unfreeze_backbone(self):
+        """Unfreeze backbone for fine-tuning with encoder-specific LR."""
+        self._backbone_frozen = False
+        self.backbone.train()
+        for param in self.backbone.parameters():
+            param.requires_grad = True
+        # Enable gradient checkpointing on the transformer to save VRAM
+        # Must use use_reentrant=False — the default (True) kills gradients
+        if hasattr(self.backbone, "gradient_checkpointing_enable"):
+            self.backbone.gradient_checkpointing_enable(
+                gradient_checkpointing_kwargs={"use_reentrant": False}
+            )
+        n_params = sum(p.numel() for p in self.backbone.parameters())
+        print(f"  [wav2vec2] Backbone UNFROZEN — {n_params:,} params now trainable")
+
+    @property
+    def receptive_field_frames(self):
+        return 0
+
+    def train(self, mode=True):
+        super().train(mode)
+        if self._backbone_frozen:
+            self.backbone.eval()
+        return self
+
+    def _resample(self, audio):
+        if self.input_sample_rate == self.target_sample_rate:
+            return audio
+
+        target_len = max(
+            1,
+            int(round(audio.shape[-1] * self.target_sample_rate / self.input_sample_rate)),
+        )
+        return F.interpolate(
+            audio.unsqueeze(1),
+            size=target_len,
+            mode="linear",
+            align_corners=False,
+        ).squeeze(1)
+
+    def forward(self, wet_audio):
+        if wet_audio is None:
+            raise ValueError("`wet_audio` is required for the Wav2Vec2 encoder.")
+
+        audio = self._resample(wet_audio.float())
+
+        if self._backbone_frozen:
+            with torch.no_grad():
+                outputs = self.backbone(input_values=audio)
+                hidden_states = torch.stack(outputs.hidden_states, dim=0)  # (L, B, T, H)
+        else:
+            outputs = self.backbone(input_values=audio)
+            hidden_states = torch.stack(outputs.hidden_states, dim=0)
+
+        # Weighted sum over layers (trainable)
+        weights = F.softmax(self.layer_weights, dim=0)
+        weighted = torch.einsum("l,lbth->bth", weights, hidden_states.float())
+
+        pooled, attn_weights = self.temporal_pool(weighted.transpose(1, 2))
+        embedding = self.output_proj(pooled)
+        return embedding, attn_weights
+
+
+# ---------------------------------------------------------------------------
+# AST (Audio Spectrogram Transformer) encoder — pretrained ViT backbone
+# ---------------------------------------------------------------------------
+
+
+class ASTEncoder(nn.Module):
+    """
+    Audio Spectrogram Transformer encoder using a pretrained ViT backbone.
+
+    Treats mel spectrograms as single-channel images and leverages pretrained
+    ImageNet features for discriminative audio representations from day 1,
+    avoiding the encoder collapse problem entirely.
+
+    Supports backbone freezing for initial training phases (freeze_backbone),
+    with unfreeze_backbone() for fine-tuning with lower LR.
+    """
+
+    def __init__(
+        self,
+        n_mels=128,
+        embedding_dim=128,
+        model_name="vit_small_patch16_224",
+        pretrained=True,
+        freeze_backbone=False,
+        checkpoint_path="",
+    ):
+        super().__init__()
+        if not HAS_TIMM:
+            raise ImportError(
+                "The `timm` package is required for encoder.backend='ast'. "
+                "Install with: pip install timm"
+            )
+
+        self.n_mels = n_mels
+        self.model_name = model_name
+
+        resolved_checkpoint = resolve_workspace_resource(checkpoint_path)
+
+        # Create backbone with 1 input channel, no classification head
+        # If a local checkpoint is provided, we load weights manually to handle
+        # 3→1 channel conversion and key renaming (norm→fc_norm, head removal).
+        self.backbone = timm.create_model(
+            model_name,
+            pretrained=(pretrained and not resolved_checkpoint),
+            in_chans=1,
+            num_classes=0,
+            global_pool="avg",
+        )
+
+        if resolved_checkpoint:
+            self._load_checkpoint_with_adaptation(resolved_checkpoint)
+
+        backbone_dim = self.backbone.num_features
+
+        # Get expected input size from patch embedding
+        if hasattr(self.backbone, "patch_embed") and hasattr(
+            self.backbone.patch_embed, "img_size"
+        ):
+            self._target_size = self.backbone.patch_embed.img_size
+        else:
+            self._target_size = (224, 224)
+
+        # Output projection to match embedding_dim
+        self.output_proj = nn.Sequential(
+            nn.Linear(backbone_dim, embedding_dim),
+            nn.LayerNorm(embedding_dim),
+        )
+
+        if freeze_backbone:
+            self.freeze_backbone()
+
+    def _load_checkpoint_with_adaptation(self, checkpoint_path):
+        """Load a pretrained checkpoint, adapting 3→1 channel and key mismatches."""
+        state_dict = torch.load(checkpoint_path, map_location="cpu", weights_only=True)
+
+        # Convert 3-channel patch_embed to 1-channel by summing
+        key = "patch_embed.proj.weight"
+        if key in state_dict and state_dict[key].shape[1] == 3:
+            state_dict[key] = state_dict[key].sum(dim=1, keepdim=True)
+
+        # Rename norm→fc_norm for num_classes=0 / global_pool="avg"
+        for suffix in ("weight", "bias"):
+            src = f"norm.{suffix}"
+            dst = f"fc_norm.{suffix}"
+            if src in state_dict and dst not in state_dict:
+                state_dict[dst] = state_dict.pop(src)
+
+        # Remove classification head keys
+        for k in list(state_dict.keys()):
+            if k.startswith("head."):
+                del state_dict[k]
+
+        missing, unexpected = self.backbone.load_state_dict(state_dict, strict=False)
+        if missing:
+            print(f"  [ast] Loaded checkpoint with {len(missing)} missing keys (expected for adapted model)")
+        if unexpected:
+            print(f"  [ast] {len(unexpected)} unexpected keys ignored")
+
+    def freeze_backbone(self):
+        """Freeze all backbone parameters (for initial training phase)."""
+        for param in self.backbone.parameters():
+            param.requires_grad = False
+
+    def unfreeze_backbone(self):
+        """Unfreeze backbone for fine-tuning."""
+        for param in self.backbone.parameters():
+            param.requires_grad = True
+
+    @property
+    def receptive_field_frames(self):
+        return 0
+
+    def forward(self, mel_frames):
+        """
+        Args:
+            mel_frames: (B, n_mels, T) mel spectrogram
+
+        Returns:
+            embedding: (B, embedding_dim)
+            mel_profile: (B, n_mels) mean mel over time
+            skip_sum: None (not applicable for transformer)
+            attn_weights: None
+        """
+        B, n_mels, T = mel_frames.shape
+
+        # Spectral bypass: mean mel profile for parameter head
+        mel_profile = mel_frames.mean(dim=-1)
+
+        # Reshape to (B, 1, n_mels, T) — single-channel "image"
+        x = mel_frames.unsqueeze(1)
+
+        # Resize to backbone's expected input size
+        if x.shape[2:] != self._target_size:
+            x = F.interpolate(
+                x, size=self._target_size, mode="bilinear", align_corners=False
+            )
+
+        # Forward through ViT backbone → (B, backbone_dim)
+        features = self.backbone(x)
+
+        # Project to target embedding dimension
+        embedding = self.output_proj(features)
+
+        return embedding, mel_profile, None, None
+
+
+# ---------------------------------------------------------------------------
+# CLAP (Contrastive Language-Audio Pretraining) encoder
+# ---------------------------------------------------------------------------
+
+class CLAPEncoder(nn.Module):
+    """
+    CLAP Audio Encoder.
+    Extracts 512-dim contrastive embeddings from raw audio waveforms,
+    providing a zero-shot aligned representation space for text-guided EQ.
+    """
+    def __init__(
+        self,
+        embedding_dim=128,
+        pretrained=True,
+        freeze_backbone=True,
+        model_name=None,
+    ):
+        super().__init__()
+        import transformers
+
+        local_path = resolve_workspace_resource("pretrained_models/laion/clap-htsat-unfused")
+        self.model_name = resolve_workspace_resource(model_name) if model_name else None
+        if not self.model_name:
+            self.model_name = local_path or "laion/clap-htsat-unfused"
+
+        self.processor = transformers.ClapProcessor.from_pretrained(self.model_name)
+        self.backbone = transformers.ClapAudioModelWithProjection.from_pretrained(self.model_name)
+
+        if freeze_backbone:
+            self.freeze_backbone()
+        else:
+            self.unfreeze_backbone()
+
+        clap_dim = self.backbone.config.projection_dim
+        self.output_proj = nn.Sequential(
+            nn.Linear(clap_dim, embedding_dim),
+            nn.LayerNorm(embedding_dim)
+        )
+
+    def freeze_backbone(self):
+        for param in self.backbone.parameters():
+            param.requires_grad = False
+
+    def unfreeze_backbone(self):
+        for param in self.backbone.parameters():
+            param.requires_grad = True
+
+    def forward(self, wet_audio):
+        device = wet_audio.device
+        # Ensure correct formatting for huggingface processor (expects lists of 1D arrays)
+        wet_audio_np = wet_audio.detach().cpu().numpy()
+        audio_list = [wet_audio_np[i] for i in range(wet_audio_np.shape[0])]
+
+        inputs = self.processor(audio=audio_list, return_tensors="pt", sampling_rate=48000)
+
+        input_features = inputs["input_features"].to(device)
+        is_longer = inputs.get("is_longer", None)
+        if is_longer is not None:
+            is_longer = is_longer.to(device)
+            outputs = self.backbone(input_features, is_longer=is_longer)
+        else:
+            outputs = self.backbone(input_features)
+
+        audio_embeds = outputs.audio_embeds  # (B, clap_dim)
+        embedding = self.output_proj(audio_embeds)
+
+        # Return matched interface: embedding, mel_profile, skip_sum, attn_weights
+        return embedding, None, None, None
+
+
+# ---------------------------------------------------------------------------
 # Streaming-compatible wrapper model
 # ---------------------------------------------------------------------------
 
@@ -547,6 +1074,13 @@ class StreamingTCNModel(nn.Module):
         dropout=0.1,
         mel_noise_std=0.0,
         n_shelf_bands=16,
+        encoder_backend="hybrid_tcn",
+        wav2vec2_checkpoint="facebook/wav2vec2-base",
+        ast_model_name="vit_small_patch16_224",
+        ast_checkpoint_path="",
+        clap_model_path=None,
+        mert_checkpoint="m-a-p/MERT-v1-95M",
+        two_stage=False,
     ):
         super().__init__()
         self.n_mels = n_mels
@@ -555,6 +1089,8 @@ class StreamingTCNModel(nn.Module):
         self.sample_rate = sample_rate
         self.n_fft = n_fft
         self.n_shelf_bands = n_shelf_bands
+        self.encoder_backend = encoder_backend
+        self.two_stage = two_stage
 
         # Number of frequency groups for grouped convolutions
         # Use 8 groups by default; this keeps ~16 mel bins per group
@@ -565,33 +1101,83 @@ class StreamingTCNModel(nn.Module):
         while channels % num_freq_groups != 0 and num_freq_groups > 1:
             num_freq_groups -= 1
 
-        # Encoder
-        self.encoder = FrequencyAwareEncoder(
-            n_mels=n_mels,
-            embedding_dim=embedding_dim,
-            channels=channels,
-            num_blocks=num_blocks,
-            num_stacks=num_stacks,
-            kernel_size=kernel_size,
-            num_freq_groups=num_freq_groups,
-            dropout_p=dropout,
-            mel_noise_std=mel_noise_std,
-        )
+        if encoder_backend == "hybrid_tcn":
+            self.encoder = FrequencyAwareEncoder(
+                n_mels=n_mels,
+                embedding_dim=embedding_dim,
+                channels=channels,
+                num_blocks=num_blocks,
+                num_stacks=num_stacks,
+                kernel_size=kernel_size,
+                num_freq_groups=num_freq_groups,
+                dropout_p=dropout,
+                mel_noise_std=mel_noise_std,
+            )
+        elif encoder_backend == "wav2vec2_frozen":
+            self.encoder = FrozenWav2Vec2Encoder(
+                checkpoint_name=wav2vec2_checkpoint,
+                input_sample_rate=sample_rate,
+                embedding_dim=embedding_dim,
+            )
+        elif encoder_backend == "ast":
+            checkpoint_path = ast_checkpoint_path or resolve_workspace_resource(
+                "pretrained_ast_1channel.bin"
+            )
+            self.encoder = ASTEncoder(
+                n_mels=n_mels,
+                embedding_dim=embedding_dim,
+                model_name=ast_model_name,
+                pretrained=True if not checkpoint_path else False,
+                checkpoint_path=checkpoint_path
+            )
+        elif encoder_backend == "clap":
+            self.encoder = CLAPEncoder(
+                embedding_dim=embedding_dim,
+                pretrained=True,
+                freeze_backbone=True,
+                model_name=clap_model_path,
+            )
+        elif encoder_backend == "mert":
+            self.encoder = FrozenMERTEncoder(
+                checkpoint_name=mert_checkpoint,
+                input_sample_rate=sample_rate,
+                embedding_dim=embedding_dim,
+            )
+        else:
+            raise ValueError(
+                f"Unsupported encoder backend `{encoder_backend}`. "
+                "Expected `hybrid_tcn`, `wav2vec2_frozen`, `ast`, `clap`, or `mert`."
+            )
+
+        # DSP layer — created BEFORE param_head so it can be passed in (Fix 5)
+        self.dsp_cascade = DifferentiableBiquadCascade(num_bands, sample_rate)
 
         # Parameter head -- receives both embedding AND mel_profile
-        self.param_head = MultiTypeEQParameterHead(
-            embedding_dim,
-            num_bands,
-            num_filter_types=num_filter_types,
-            n_mels=n_mels,
-            type_conditioned_frequency=type_conditioned_frequency,
-            n_shelf_bands=n_shelf_bands,
-            n_fft=n_fft,
-            sample_rate=sample_rate,
-        )
-
-        # DSP layer
-        self.dsp_cascade = DifferentiableBiquadCascade(num_bands, sample_rate)
+        if two_stage:
+            from differentiable_eq import TypeGroupedParameterHead
+            self.param_head = TypeGroupedParameterHead(
+                embedding_dim,
+                num_bands,
+                num_filter_types=num_filter_types,
+                n_mels=n_mels,
+                type_conditioned_frequency=type_conditioned_frequency,
+                n_shelf_bands=n_shelf_bands,
+                n_fft=n_fft,
+                sample_rate=sample_rate,
+                dsp_cascade=self.dsp_cascade,
+            )
+        else:
+            self.param_head = MultiTypeEQParameterHead(
+                embedding_dim,
+                num_bands,
+                num_filter_types=num_filter_types,
+                n_mels=n_mels,
+                type_conditioned_frequency=type_conditioned_frequency,
+                n_shelf_bands=n_shelf_bands,
+                n_fft=n_fft,
+                sample_rate=sample_rate,
+                dsp_cascade=self.dsp_cascade,
+            )
 
         # Streaming state
         self._streaming_buffer = None
@@ -600,7 +1186,7 @@ class StreamingTCNModel(nn.Module):
 
     @property
     def receptive_field_frames(self):
-        return self.encoder.receptive_field_frames
+        return getattr(self.encoder, "receptive_field_frames", 0)
 
     def reset_state(self):
         """Reset streaming state for a new inference session."""
@@ -642,7 +1228,7 @@ class StreamingTCNModel(nn.Module):
         result = self.load_state_dict(compatible_state, strict=False)
         return result, skipped
 
-    def forward(self, mel_frames, hard_types=None, force_soft_response=False):
+    def forward(self, mel_frames=None, wet_audio=None, hard_types=None, force_soft_response=False):
         """
         Batch-mode forward pass for training.
 
@@ -663,8 +1249,27 @@ class StreamingTCNModel(nn.Module):
         if hard_types is None:
             hard_types = not self.training
 
-        # 1. Encode -- now returns mel_profile and attn_weights too
-        embedding, mel_profile, skip_sum, attn_weights = self.encoder(mel_frames)
+        if self.encoder_backend in ["hybrid_tcn", "ast"]:
+            if mel_frames is None:
+                raise ValueError(f"`mel_frames` is required for `{self.encoder_backend}`.")
+            embedding, mel_profile, skip_sum, attn_weights = self.encoder(mel_frames)
+        elif self.encoder_backend == "clap":
+            if wet_audio is None:
+                raise ValueError("`wet_audio` is required for `clap` encoder.")
+            if mel_frames is None:
+                raise ValueError("`mel_frames` is required to derive `mel_profile` for the parameter head.")
+            embedding, mel_profile, skip_sum, attn_weights = self.encoder(wet_audio)
+            mel_profile = mel_frames.mean(dim=-1)
+        else:
+            if wet_audio is None:
+                raise ValueError("`wet_audio` is required for `wav2vec2_frozen`.")
+            if mel_frames is None:
+                raise ValueError(
+                    "`mel_frames` is required to derive `mel_profile` for the parameter head."
+                )
+            embedding, attn_weights = self.encoder(wet_audio)
+            mel_profile = mel_frames.mean(dim=-1)
+            skip_sum = None
 
         # 2. Predict parameters -- pass mel_profile to param head
         gain_db, freq, q, type_logits, type_probs, filter_type, param_aux = self.param_head(
@@ -679,19 +1284,13 @@ class StreamingTCNModel(nn.Module):
 
         # Soft H_mag path: differentiable w.r.t. type_logits (used for spectral loss during training)
         if self.training or force_soft_response:
-            type_probs_soft = F.softmax(type_logits, dim=-1)  # (B, N, 5)
-            H_per_type = []
-            for t in range(NUM_FILTER_TYPES):
-                ft = torch.full_like(filter_type, t)
-                b0, b1, b2, a1, a2 = self.dsp_cascade.compute_biquad_coeffs_multitype(
-                    gain_db, freq, q, ft
-                )
-                H_t = self.dsp_cascade.freq_response(b0, b1, b2, a1, a2, self.n_fft)  # (B, N, F)
-                H_per_type.append(H_t)
-            H_stack = torch.stack(H_per_type, dim=2)  # (B, N, 5, F)
-            weights = type_probs_soft.unsqueeze(-1)     # (B, N, 5, 1)
-            H_soft_bands = (H_stack * weights).sum(dim=2)  # (B, N, F)
-            H_mag_soft = torch.clamp(H_soft_bands.prod(dim=1), min=1e-6, max=1e4)  # (B, F)
+            H_mag_soft = self.dsp_cascade.forward_soft(
+                gain_db,
+                freq,
+                q,
+                type_probs,
+                self.n_fft,
+            )
         else:
             H_mag_soft = H_mag
 
@@ -703,6 +1302,7 @@ class StreamingTCNModel(nn.Module):
             "H_mag": H_mag,
             "H_mag_soft": H_mag_soft,
             "embedding": embedding,
+            "band_embedding": param_aux.get("band_embedding"),
             "mel_profile": mel_profile,
             "mel_profile_centered": param_aux.get("mel_profile_centered"),
             "gain_aux_summary": param_aux.get("gain_aux_summary"),
@@ -741,6 +1341,11 @@ class StreamingTCNModel(nn.Module):
         Returns:
             Same dict as forward().
         """
+        if self.encoder_backend != "hybrid_tcn":
+            raise NotImplementedError(
+                "Streaming inference is only implemented for `hybrid_tcn`."
+            )
+
         # Guard: BatchNorm uses running stats in eval mode only.
         # Streaming inference requires eval mode for correct normalization.
         if self.training:
@@ -807,6 +1412,7 @@ class StreamingTCNModel(nn.Module):
             "filter_type": filter_type,
             "H_mag": H_mag,
             "embedding": embedding,
+            "band_embedding": param_aux.get("band_embedding"),
             "mel_profile": mel_profile,
             "mel_profile_centered": param_aux.get("mel_profile_centered"),
             "gain_aux_summary": param_aux.get("gain_aux_summary"),
