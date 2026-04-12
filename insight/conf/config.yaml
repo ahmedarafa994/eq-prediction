@@ -91,11 +91,11 @@ loss:
   lambda_type_prior: 0.05
   lambda_type_entropy: 0.02
   class_weight_multipliers:
-  - 1.0
-  - 1.75
-  - 1.25
-  - 1.0
-  - 1.0
+  - 0.6
+  - 3.5
+  - 2.5
+  - 3.0
+  - 3.0
   sign_penalty_weight: 0.5
   lambda_embed_var: 0.1
   lambda_contrastive: 0.05
