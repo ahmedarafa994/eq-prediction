@@ -2,7 +2,17 @@
 
 ## What This Is
 
-A differentiable DSP system for blind parametric EQ parameter estimation. Given an audio signal processed through a multi-band parametric EQ (up to 5 bands, 5 filter types), the model estimates the EQ parameters (gain, frequency, Q, filter type) without access to the original dry signal. v1.0 shipped with all five accuracy improvement phases implemented: fixed measurement, rebuilt gain head, restructured loss, refined all parameters, and added inference-time optimization with confidence estimation.
+A differentiable DSP system for blind parametric EQ parameter estimation. Given an audio signal processed through a multi-band parametric EQ (up to 5 bands, 5 filter types), the model estimates the EQ parameters (gain, frequency, Q, filter type) without access to the original dry signal. v1.0 shipped architectural improvements (gain head, loss restructuring, inference refinement). v1.1 focuses on breaking the accuracy plateau through wav2vec2 backbone fine-tuning and training strategy optimization.
+
+## Current Milestone: v1.1 Backbone Fine-tuning & Accuracy Push
+
+**Goal:** Break through the 2.68 dB gain MAE plateau by unfreezing the wav2vec2 backbone for end-to-end fine-tuning, closing the gap toward <1 dB gain MAE.
+
+**Target features:**
+- Wav2vec2 backbone unfreezing with gradient checkpointing
+- 3-group optimizer with differentiated LRs (backbone/encoder/head)
+- Freeze-then-unfreeze curriculum (warmup → full fine-tuning)
+- Training strategy iteration (data augmentation, loss tuning, LR schedules)
 
 ## Core Value
 
@@ -47,10 +57,14 @@ The model must accurately estimate EQ parameters from wet audio alone. If gain M
 
 ### Active
 
-- [ ] GAIN-04: Gain MAE < 1 dB (implementation complete, needs training verification)
-- [ ] QP-02: Q MAE < 0.2 decades (implementation complete, needs training verification)
-- [ ] TYPE-01: Filter type accuracy > 95% (implementation complete, needs training verification)
-- [ ] FREQ-01: Frequency MAE < 0.25 octaves (implementation complete, needs training verification)
+- [ ] GAIN-04: Gain MAE < 1 dB — v1.0 plateau at 2.68 dB, backbone fine-tuning needed
+- [ ] QP-02: Q MAE < 0.2 decades — v1.0 plateau at 0.52 dec
+- [ ] TYPE-01: Filter type accuracy > 95% — v1.0 plateau at 46.9%
+- [ ] FREQ-01: Frequency MAE < 0.25 octaves — v1.0 plateau at 1.79 oct
+- [ ] BACK-01: Wav2vec2 backbone unfreezing with gradient checkpointing
+- [ ] BACK-02: 3-group optimizer (backbone/encoder/head) with differentiated LRs
+- [ ] BACK-03: Freeze-then-unfreeze curriculum (warmup → fine-tuning)
+- [ ] TRAIN-01: Training strategy iteration to close accuracy gap
 
 ### Out of Scope
 
@@ -95,5 +109,22 @@ The model must accurately estimate EQ parameters from wet audio alone. If gain M
 - **Architecture:** Must preserve streaming inference capability (causal convolutions)
 - **Evaluation:** Must have proper Hungarian-matched validation metrics to track real progress
 
+## Evolution
+
+This document evolves at phase transitions and milestone boundaries.
+
+**After each phase transition** (via `/gsd-transition`):
+1. Requirements invalidated? → Move to Out of Scope with reason
+2. Requirements validated? → Move to Validated with phase reference
+3. New requirements emerged? → Add to Active
+4. Decisions to log? → Add to Key Decisions
+5. "What This Is" still accurate? → Update if drifted
+
+**After each milestone** (via `/gsd-complete-milestone`):
+1. Full review of all sections
+2. Core Value check — still the right priority?
+3. Audit Out of Scope — reasons still valid?
+4. Update Context with current state
+
 ---
-*Last updated: 2026-04-06 after v1.0 milestone*
+*Last updated: 2026-04-12 after v1.1 milestone start*

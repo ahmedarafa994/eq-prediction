@@ -1,0 +1,175 @@
+experiment_name: idsp-eq-wav2vec2-unfreeze
+seed: 42
+data:
+  num_bands: 5
+  sample_rate: 44100
+  audio_duration: 2.0
+  dataset_type: synthetic
+  litdata_dir: /teamspace/lightning_storage/SNAP_DATA_SET/musdb_eq_pedalboard_train_mel
+  musdb_root: /teamspace/lightning_storage/SNAP_DATA_SET/musdb18_hq
+  musdb_subsets:
+  - train
+  - test
+  dataset_size: 200000
+  val_dataset_size: 1000
+  n_fft: 2048
+  hop_length: 256
+  n_mels: 128
+  gain_bounds:
+  - -12.0
+  - 12.0
+  freq_bounds:
+  - 20.0
+  - 20000.0
+  q_bounds:
+  - 0.05
+  - 15.0
+  filter_types:
+  - peaking
+  - lowshelf
+  - highshelf
+  - highpass
+  - lowpass
+  type_weights:
+  - 0.2
+  - 0.2
+  - 0.2
+  - 0.2
+  - 0.2
+  adversarial_fraction: 0.25
+  hp_lp_gain_target: zero
+  duration_range:
+  - 0.5
+  - 2.0
+  train_split: 0.8
+  val_split: 0.1
+  test_split: 0.1
+  batch_size: 512
+  num_workers: 8
+  precompute_mels: false
+  freeze_val_set: false
+model:
+  use_full_spectrum: true
+  two_stage: true
+  type_pretrain_epochs: 0
+  encoder:
+    backend: wav2vec2_frozen
+    wav2vec2_checkpoint: /teamspace/studios/this_studio/insight/pretrained/wav2vec2-base
+    ast_model_name: vit_small_patch16_224
+    ast_checkpoint_path: /teamspace/studios/this_studio/insight/pretrained_models/vit_small_patch16_224/pytorch_model.bin
+    clap_model_path: /teamspace/studios/this_studio/insight/pretrained_models/laion/clap-htsat-unfused
+    freeze_epochs: 42
+    backbone_lr: 1.0e-05
+    type: tcn
+    n_mels: 128
+    embedding_dim: 256
+    channels: 256
+    num_blocks: 8
+    num_stacks: 3
+    kernel_size: 5
+    dropout: 0.2
+    mel_noise_std: 0.0
+  num_bands: 5
+  type_conditioned_frequency: true
+  n_shelf_bands: 16
+  learning_rate: 5.0e-05
+  weight_decay: 0.05
+  head_lr_multiplier: 2.0
+  spectral_pretrain_path: null
+loss:
+  lambda_param: 0.5
+  lambda_hmag: 1.5
+  lambda_type: 2.0
+  lambda_gain: 5.0
+  lambda_freq: 0.5
+  lambda_q: 0.25
+  lambda_gain_zero: 0.5
+  lambda_spectral: 5.0
+  lambda_typed_spectral: 3.0
+  label_smoothing: 0.01
+  focal_gamma: 2.5
+  type_loss_mode: focal
+  lambda_type_match: 1.0
+  lambda_type_prior: 0.05
+  lambda_type_entropy: 0.02
+  class_weight_multipliers:
+  - 2.5
+  - 1.5
+  - 2.5
+  - 1.0
+  - 1.0
+  sign_penalty_weight: 0.5
+  lambda_embed_var: 0.1
+  lambda_contrastive: 0.1
+  lambda_hdb: 2.5
+  lambda_film_diversity: 0.0
+  lambda_multi_scale: 3.0
+  lambda_perceptual: 2.0
+  lambda_shape: 0.2
+  audio_fft_sizes:
+  - 1024
+  - 2048
+  - 512
+  audio_hop_sizes:
+  - 120
+  - 240
+  - 50
+  audio_win_lengths:
+  - 600
+  - 1200
+  - 240
+  audio_n_mels: 64
+  audio_n_mfcc: 20
+trainer:
+  use_torch_compile: false
+  use_gradient_checkpointing: true
+  precompute_cache_path: ''
+  max_epochs: 60
+  accelerator: auto
+  devices: 1
+  precision: bf16-mixed
+  log_every_n_steps: 10
+  fast_dev_run: false
+  gradient_accumulation_steps: 6
+  early_stopping_patience: 20
+  monitor_val_metric: primary_val_score
+  validate_render_audio: false
+  mode: min
+curriculum:
+  stages:
+  - name: stage_0_coarse_structure
+    epochs: 5
+    filter_types: all
+    lambda_type: 1.0
+    lambda_gain: 0.1
+    lambda_freq: 1.0
+    lambda_q: 0.1
+    matcher_lambda_freq: 5.0
+    matcher_lambda_gain: 0.1
+    matcher_lambda_q: 0.1
+    matcher_lambda_type_match: 0.1
+  - name: stage_1_frozen_warmup
+    epochs: 37
+    filter_types: all
+    lambda_type: 1.0
+    lambda_gain: 1.0
+    lambda_freq: 1.0
+    lambda_q: 1.0
+    matcher_lambda_freq: 1.0
+    matcher_lambda_gain: 2.0
+    matcher_lambda_q: 0.5
+    matcher_lambda_type_match: 0.5
+  - name: stage_2_full_finetune
+    epochs: 18
+    filter_types: all
+    lambda_type: 1.0
+    lambda_gain: 1.0
+    lambda_freq: 1.0
+    lambda_q: 1.0
+    matcher_lambda_freq: 1.0
+    matcher_lambda_gain: 2.0
+    matcher_lambda_q: 0.5
+    matcher_lambda_type_match: 0.5
+gumbel:
+  start_tau: 1.5
+  min_tau: 0.1

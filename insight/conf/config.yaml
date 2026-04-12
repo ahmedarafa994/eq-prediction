@@ -1,48 +1,70 @@
-# Configuration for the audio-first IDSP multi-type EQ estimator.
-
-experiment_name: "idsp-eq-audio-first"
+experiment_name: idsp-eq-audio-first
 seed: 42
-
 data:
   num_bands: 5
   sample_rate: 44100
-  audio_duration: 3.0
+  audio_duration: 5.0
+  dataset_type: musdb
+  musdb_root: /teamspace/lightning_storage/SNAP_DATA_SET/musdb18_hq
+  musdb_subsets:
+  - train
+  - test
   dataset_size: 200000
-  val_dataset_size: 5000
+  val_dataset_size: 1000
   n_fft: 2048
   hop_length: 256
   n_mels: 128
-  gain_bounds: [-12.0, 12.0]
-  freq_bounds: [20.0, 20000.0]
-  q_bounds: [0.05, 15.0]
-  filter_types: ["peaking", "lowshelf", "highshelf", "highpass", "lowpass"]
-  type_weights: [0.20, 0.20, 0.20, 0.20, 0.20]
+  gain_bounds:
+  - -12.0
+  - 12.0
+  freq_bounds:
+  - 20.0
+  - 20000.0
+  q_bounds:
+  - 0.05
+  - 15.0
+  filter_types:
+  - peaking
+  - lowshelf
+  - highshelf
+  - highpass
+  - lowpass
+  type_weights:
+  - 0.2
+  - 0.2
+  - 0.2
+  - 0.2
+  - 0.2
   adversarial_fraction: 0.25
-  hp_lp_gain_target: "zero"
-  duration_range: [1.0, 5.0]
+  hp_lp_gain_target: zero
+  duration_range:
+  - 1.0
+  - 5.0
   train_split: 0.8
   val_split: 0.1
   test_split: 0.1
-  batch_size: 2048
-  num_workers: 4
+  batch_size: 256
+  num_workers: 0
   precompute_mels: false
-  freeze_val_set: true
-
+  freeze_val_set: false
 model:
+  use_full_spectrum: true
   two_stage: true
   type_pretrain_epochs: 5
   encoder:
-    backend: "ast"
-    ast_model_name: "vit_small_patch16_224"
+    backend: ast
+    ast_model_name: vit_small_patch16_224
+    ast_checkpoint_path: pretrained_ast_1channel.bin
+    clap_model_path: pretrained_models/laion/clap-htsat-unfused
     freeze_epochs: 10
-    type: "tcn"
-    wav2vec2_checkpoint: "facebook/wav2vec2-base"
+    type: tcn
+    wav2vec2_checkpoint: facebook/wav2vec2-base
     n_mels: 128
     embedding_dim: 256
-    channels: 128
-    num_blocks: 4
-    num_stacks: 2
-    kernel_size: 3
+    channels: 256
+    num_blocks: 8
+    num_stacks: 3
+    kernel_size: 5
     dropout: 0.2
     mel_noise_std: 0.05
   num_bands: 5
@@ -51,9 +73,9 @@ model:
   learning_rate: 0.0001
   weight_decay: 0.05
   head_lr_multiplier: 1.5
-  spectral_pretrain_path: "checkpoints/spectral_pretrain_best.pt"
-
+  spectral_pretrain_path: null
 loss:
+  lambda_param: 1.0
   lambda_hmag: 0.25
   lambda_type: 4.0
   lambda_gain: 2.0
@@ -64,61 +86,119 @@ loss:
   lambda_typed_spectral: 1.0
   label_smoothing: 0.01
   focal_gamma: 2.0
-  type_loss_mode: "focal"
+  type_loss_mode: focal
   lambda_type_match: 1.0
   lambda_type_prior: 0.05
   lambda_type_entropy: 0.02
-  class_weight_multipliers: [1.0, 1.75, 1.25, 1.0, 1.0]
+  class_weight_multipliers:
+  - 1.0
+  - 1.75
+  - 1.25
+  - 1.0
+  - 1.0
   sign_penalty_weight: 0.5
   lambda_embed_var: 0.1
   lambda_contrastive: 0.05
   lambda_hdb: 0.5
   lambda_film_diversity: 0.1
-  audio_fft_sizes: [1024, 2048, 512]
-  audio_hop_sizes: [120, 240, 50]
-  audio_win_lengths: [600, 1200, 240]
+  lambda_multi_scale: 1.0
+  audio_fft_sizes:
+  - 1024
+  - 2048
+  - 512
+  audio_hop_sizes:
+  - 120
+  - 240
+  - 50
+  audio_win_lengths:
+  - 600
+  - 1200
+  - 240
   audio_n_mels: 64
   audio_n_mfcc: 20
-
 trainer:
+  use_torch_compile: false
+  use_gradient_checkpointing: false
+  precompute_cache_path: data/dataset_phase3_200k.pt
   max_epochs: 60
-  accelerator: "auto"
+  accelerator: auto
   devices: 1
-  precision: "bf16-mixed"
+  precision: bf16-mixed
   log_every_n_steps: 10
   fast_dev_run: false
-  gradient_accumulation_steps: 2
+  gradient_accumulation_steps: 1
   early_stopping_patience: 30
-  monitor_val_metric: "primary_val_score"
-  mode: "min"
-
+  monitor_val_metric: primary_val_score
+  validate_render_audio: false
+  mode: min
 curriculum:
   stages:
-    - name: "multitype_lowshelf_focus"
-      epochs: 10
-      filter_types: ["peaking", "lowshelf", "highshelf", "highpass", "lowpass"]
-      gain_bounds: [-6.0, 6.0]
-      q_bounds: [0.3, 5.0]
-      type_weights: [0.20, 0.35, 0.15, 0.15, 0.15]
-      adversarial_fraction: 0.40
-      lambda_type: 1.0
-    - name: "multitype_midrange"
-      epochs: 15
-      filter_types: ["peaking", "lowshelf", "highshelf", "highpass", "lowpass"]
-      gain_bounds: [-9.0, 9.0]
-      q_bounds: [0.2, 8.0]
-      type_weights: [0.25, 0.30, 0.20, 0.125, 0.125]
-      adversarial_fraction: 0.30
-      lambda_type: 1.0
-    - name: "multitype_full_range"
-      epochs: 35
-      filter_types: ["peaking", "lowshelf", "highshelf", "highpass", "lowpass"]
-      gain_bounds: [-12.0, 12.0]
-      q_bounds: [0.05, 15.0]
-      type_weights: [0.20, 0.20, 0.20, 0.20, 0.20]
-      adversarial_fraction: 0.20
-      lambda_type: 1.0
-
+  - name: multitype_lowshelf_focus
+    epochs: 10
+    filter_types:
+    - peaking
+    - lowshelf
+    - highshelf
+    - highpass
+    - lowpass
+    gain_bounds:
+    - -6.0
+    - 6.0
+    q_bounds:
+    - 0.3
+    - 5.0
+    type_weights:
+    - 0.2
+    - 0.35
+    - 0.15
+    - 0.15
+    - 0.15
+    adversarial_fraction: 0.4
+    lambda_type: 1.0
+  - name: multitype_midrange
+    epochs: 15
+    filter_types:
+    - peaking
+    - lowshelf
+    - highshelf
+    - highpass
+    - lowpass
+    gain_bounds:
+    - -9.0
+    - 9.0
+    q_bounds:
+    - 0.2
+    - 8.0
+    type_weights:
+    - 0.25
+    - 0.3
+    - 0.2
+    - 0.125
+    - 0.125
+    adversarial_fraction: 0.3
+    lambda_type: 1.0
+  - name: multitype_full_range
+    epochs: 35
+    filter_types:
+    - peaking
+    - lowshelf
+    - highshelf
+    - highpass
+    - lowpass
+    gain_bounds:
+    - -12.0
+    - 12.0
+    q_bounds:
+    - 0.05
+    - 15.0
+    type_weights:
+    - 0.2
+    - 0.2
+    - 0.2
+    - 0.2
+    - 0.2
+    adversarial_fraction: 0.2
+    lambda_type: 1.0
 gumbel:
   start_tau: 2.0
   min_tau: 0.1
