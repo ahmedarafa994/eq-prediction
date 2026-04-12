@@ -95,7 +95,8 @@ def apply_stage_to_training_state(train_dataset, criterion, stage):
         apply_fn(stage)
 
     # Apply dynamic component loss weights from curriculum stage
-    for weight_name in ["lambda_gain", "lambda_freq", "lambda_q", "lambda_type", "lambda_spectral", "lambda_type_match"]:
+    for weight_name in ["lambda_gain", "lambda_freq", "lambda_q", "lambda_type", "lambda_spectral", "lambda_type_match",
+                        "matcher_lambda_gain", "matcher_lambda_freq", "matcher_lambda_q", "matcher_lambda_type_match"]:
         if weight_name in stage:
             setattr(criterion, weight_name, float(stage[weight_name]))
 
