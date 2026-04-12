@@ -18,6 +18,8 @@ Optimization features (QLoRA/Unsloth/DeepSpeed-inspired):
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
+torch.set_float32_matmul_precision("high")  # TF32 for 3x matmul throughput on Ampere+
+torch.backends.cudnn.benchmark = True  # Auto-tune convolution algorithms for fixed input sizes
 from torch.utils.data import DataLoader, random_split
 from model_tcn import StreamingTCNModel
 from dsp_frontend import STFTFrontend
@@ -110,6 +112,16 @@ def apply_stage_to_training_state(train_dataset, criterion, stage):
     return current_prior
 
 
+def get_dataset_type_prior(dataset):
+    current = dataset
+    while current is not None:
+        prior_getter = getattr(current, "get_type_prior", None)
+        if callable(prior_getter):
+            return prior_getter()
+        current = getattr(current, "dataset", None)
+    return None
+
+
 def load_config(path="conf/config.yaml"):
     with open(path, "r") as f:
         cfg = yaml.safe_load(f)
@@ -128,6 +140,7 @@ def validate_config(cfg):
     lambda_spectral = float(loss_cfg.get("lambda_spectral", 5.0))
     lambda_typed_spectral = float(loss_cfg.get("lambda_typed_spectral", 0.0))
     lambda_hmag = float(loss_cfg.get("lambda_hmag", 0.0))
+    lambda_multi_scale = float(loss_cfg.get("lambda_multi_scale", 1.0))
     type_loss_mode = str(loss_cfg.get("type_loss_mode", "focal")).lower()
     hp_lp_gain_target = data_cfg.get("hp_lp_gain_target", "zero")
     encoder_backend = encoder_cfg.get("backend", "hybrid_tcn")
@@ -143,12 +156,13 @@ def validate_config(cfg):
         and lambda_spectral <= 0.0
         and lambda_typed_spectral <= 0.0
         and lambda_hmag <= 0.0
+        and lambda_multi_scale <= 0.0
     ):
         raise ValueError(
             "SimplifiedEQLoss requires at least one active supervision term: "
             "`loss.lambda_gain`, `loss.lambda_freq`, `loss.lambda_q`, "
             "`loss.lambda_spectral`, `loss.lambda_typed_spectral`, or "
-            "`loss.lambda_hmag`."
+            "`loss.lambda_hmag`, or `loss.lambda_multi_scale`."
         )
     if type_loss_mode not in {"focal", "balanced_softmax"}:
         raise ValueError(
@@ -164,6 +178,12 @@ def validate_config(cfg):
             raise ValueError(
                 "`model.encoder.wav2vec2_checkpoint` must be set for "
                 "`encoder.backend=wav2vec2_frozen`."
+            )
+    if encoder_backend == "mert":
+        if data_cfg.get("precompute_mels", False):
+            raise ValueError(
+                "`mert` requires raw `wet_audio`; "
+                "`data.precompute_mels` must be false."
             )
 
 
@@ -206,6 +226,7 @@ class Trainer:
         )
         self.use_deepspeed = trainer_cfg.get("use_deepspeed", False) and HAS_DEEPSPEED
         self.precompute_cache_path = trainer_cfg.get("precompute_cache_path", None)
+        self.validate_render_audio = trainer_cfg.get("validate_render_audio", False)
 
         if self.use_8bit_optimizer:
             print("  [opt] Using 8-bit AdamW optimizer (bitsandbytes)")
@@ -226,9 +247,6 @@ class Trainer:
             num_bands=self.num_bands,
             sample_rate=self.sample_rate,
             duration=data_cfg.get("audio_duration", 1.5),
-            duration_range=tuple(data_cfg["duration_range"])
-            if data_cfg.get("duration_range") is not None
-            else None,
             n_fft=self.n_fft,
             size=dataset_size,
             gain_range=tuple(data_cfg["gain_bounds"]),
@@ -238,10 +256,26 @@ class Trainer:
             hp_lp_gain_target=data_cfg.get("hp_lp_gain_target", "zero"),
             precompute_mels=data_cfg.get("precompute_mels", True),
             n_mels=data_cfg.get("n_mels", 128),
-            adversarial_fraction=data_cfg.get("adversarial_fraction", 0.0),
         )
+        synthetic_ds_kwargs = {
+            **ds_kwargs,
+            "duration_range": tuple(data_cfg["duration_range"])
+            if data_cfg.get("duration_range") is not None
+            else None,
+            }
 
-        if dataset_type == "musdb":
+        if dataset_type == "litdata":
+            litdata_dir = data_cfg.get("litdata_dir")
+            print(f"  [data] Using litdata streaming dataset from {litdata_dir}")
+            self.train_dataset = LitdataEQDataset(
+                data_dir=litdata_dir,
+                num_bands=self.num_bands,
+                duration=data_cfg.get("audio_duration", 5.0),
+                sample_rate=self.sample_rate,
+                n_mels=data_cfg.get("n_mels", 128),
+            )
+            # litdata streams from disk — no precompute step needed
+        elif dataset_type == "musdb":
             musdb_root = data_cfg.get("musdb_root", "")
             musdb_subsets = data_cfg.get("musdb_subsets", ["train", "test"])
             print(f"  [data] Using MUSDB18 dataset from {musdb_root}")
@@ -252,24 +286,46 @@ class Trainer:
             )
         else:
             print(f"  [data] Using synthetic dataset")
-            self.train_dataset = SyntheticEQDataset(**ds_kwargs)
+            self.train_dataset = SyntheticEQDataset(**synthetic_ds_kwargs)
 
-        # Try loading precomputed cache from disk
-        if self.precompute_cache_path and self.train_dataset.load_precomputed(
-            self.precompute_cache_path
-        ):
-            print(f"  [data] Loaded cached dataset from {self.precompute_cache_path}")
-        elif data_cfg.get("precompute_mels", True):
-            # Precompute all samples with mel-spectrograms upfront
-            self.train_dataset.precompute()
-            # Save cache if path specified
-            if self.precompute_cache_path:
-                self.train_dataset.save_precomputed(self.precompute_cache_path)
-        else:
-            print(f"  [data] On-the-fly generation (no precompute)")
+        # Try loading precomputed cache from disk (skip for litdata)
+        if dataset_type != "litdata":
+            if self.precompute_cache_path and self.train_dataset.load_precomputed(
+                self.precompute_cache_path
+            ):
+                print(f"  [data] Loaded cached dataset from {self.precompute_cache_path}")
+            elif data_cfg.get("precompute_mels", True):
+                # Precompute all samples with mel-spectrograms upfront
+                self.train_dataset.precompute()
+                # Save cache if path specified
+                if self.precompute_cache_path:
+                    self.train_dataset.save_precomputed(self.precompute_cache_path)
+            else:
+                print(f"  [data] On-the-fly generation (no precompute)")
 
         # Fixed validation dataset — generated once with full type distribution.
-        if dataset_type == "musdb":
+        if dataset_type == "litdata":
+            litdata_val_dir = data_cfg.get("litdata_val_dir", None)
+            if litdata_val_dir:
+                self.val_dataset = LitdataEQDataset(
+                    data_dir=litdata_val_dir,
+                    num_bands=self.num_bands,
+                    duration=data_cfg.get("audio_duration", 5.0),
+                    sample_rate=self.sample_rate,
+                    n_mels=data_cfg.get("n_mels", 128),
+                )
+            else:
+                # Split training set: use last val_dataset_size samples for validation
+                total = len(self.train_dataset)
+                val_size = min(val_dataset_size, total // 10)
+                train_size = total - val_size
+                print(f"  [data] Splitting litdata: {train_size:,} train / {val_size:,} val")
+                self.train_dataset, self.val_dataset = random_split(
+                    self.train_dataset,
+                    [train_size, val_size],
+                    generator=torch.Generator().manual_seed(42),
+                )
+        elif dataset_type == "musdb":
             self.val_dataset = MUSDB18EQDataset(
                 musdb_root=musdb_root,
                 subsets=musdb_subsets,
@@ -277,23 +333,28 @@ class Trainer:
             )
         else:
             self.val_dataset = SyntheticEQDataset(
-                **{**ds_kwargs, "size": val_dataset_size},
+                **{**synthetic_ds_kwargs, "size": val_dataset_size},
             )
-        if data_cfg.get("precompute_mels", True) or data_cfg.get(
-            "freeze_val_set", True
-        ):
-            self.val_dataset.precompute()
+        if dataset_type != "litdata":
+            if data_cfg.get("precompute_mels", True) or data_cfg.get(
+                "freeze_val_set", True
+            ):
+                self.val_dataset.precompute()
 
-        # Train split: fold val portion into training since we have a separate val set.
-        n_train = int(
-            len(self.train_dataset) * (data_cfg["train_split"] + data_cfg["val_split"])
-        )
-        n_test = len(self.train_dataset) - n_train
-        self.train_set, self.test_set = random_split(
-            self.train_dataset,
-            [n_train, n_test],
-            generator=torch.Generator().manual_seed(42),
-        )
+            # Train split: fold val portion into training since we have a separate val set.
+            n_train = int(
+                len(self.train_dataset) * (data_cfg["train_split"] + data_cfg["val_split"])
+            )
+            n_test = len(self.train_dataset) - n_train
+            self.train_set, self.test_set = random_split(
+                self.train_dataset,
+                [n_train, n_test],
+                generator=torch.Generator().manual_seed(42),
+            )
+        else:
+            # litdata: train_dataset/val_dataset are already split above
+            self.train_set = self.train_dataset
+            self.test_set = self.val_dataset
 
         # Pin memory for async GPU transfer
         pin_memory = self.device.type == "cuda"
@@ -307,7 +368,7 @@ class Trainer:
             collate_fn=collate_fn,
             pin_memory=pin_memory,
             drop_last=True,
-            prefetch_factor=4 if num_workers > 0 else None,
+            prefetch_factor=8 if num_workers > 0 else None,
             persistent_workers=True if num_workers > 0 else False,
         )
         self.val_loader = DataLoader(
@@ -317,7 +378,7 @@ class Trainer:
             num_workers=num_workers,
             collate_fn=collate_fn,
             pin_memory=pin_memory,
-            prefetch_factor=4 if num_workers > 0 else None,
+            prefetch_factor=8 if num_workers > 0 else None,
             persistent_workers=True if num_workers > 0 else False,
         )
 
@@ -330,6 +391,7 @@ class Trainer:
             channels=enc_cfg.get("channels", 128),
             num_blocks=enc_cfg.get("num_blocks", 4),
             num_stacks=enc_cfg.get("num_stacks", 2),
+            kernel_size=enc_cfg.get("kernel_size", 3),
             sample_rate=self.sample_rate,
             n_fft=self.n_fft,
             type_conditioned_frequency=model_cfg.get(
@@ -344,6 +406,9 @@ class Trainer:
                 "facebook/wav2vec2-base",
             ),
             ast_model_name=enc_cfg.get("ast_model_name", "vit_small_patch16_224"),
+            ast_checkpoint_path=enc_cfg.get("ast_checkpoint_path", ""),
+            clap_model_path=enc_cfg.get("clap_model_path"),
+            mert_checkpoint=enc_cfg.get("mert_checkpoint", "m-a-p/MERT-v1-95M"),
             two_stage=model_cfg.get("two_stage", False),
         ).to(self.device)
 
@@ -383,8 +448,10 @@ class Trainer:
 
         # Loss — spectral-dominant with parameter supervision
         self.criterion = SimplifiedEQLoss(
+            lambda_param=loss_cfg.get("lambda_param", 1.0),
             lambda_spectral=loss_cfg.get("lambda_spectral", 5.0),
             lambda_type=loss_cfg.get("lambda_type", 2.0),
+            lambda_hmag=loss_cfg.get("lambda_hmag", 0.3),
             lambda_coarse_type=loss_cfg.get("lambda_coarse_type", 0.0),
             lambda_triplet=loss_cfg.get("lambda_triplet", 0.0),
             triplet_margin=loss_cfg.get("triplet_margin", 0.2),
@@ -408,14 +475,20 @@ class Trainer:
             lambda_hdb=self.cfg.get("loss", {}).get("lambda_hdb", 2.0),
             lambda_typed_spectral=self.cfg.get("loss", {}).get("lambda_typed_spectral", 2.0),
             lambda_film_diversity=self.cfg.get("loss", {}).get("lambda_film_diversity", 0.0),
+            lambda_multi_scale=self.cfg.get("loss", {}).get("lambda_multi_scale", 1.0),
+            lambda_perceptual=self.cfg.get("loss", {}).get("lambda_perceptual", 2.0),
+            lambda_shape=self.cfg.get("loss", {}).get("lambda_shape", 1.0),
+            lambda_activity=self.cfg.get("loss", {}).get("lambda_activity", 0.1),
+            lambda_spread=self.cfg.get("loss", {}).get("lambda_spread", 0.05),
             perceptual_mel_bins=loss_cfg.get("perceptual_mel_bins", 64),
             perceptual_mfcc_bins=loss_cfg.get("perceptual_mfcc_bins", 20),
             sample_rate=self.sample_rate,
             n_fft=self.n_fft,
             dsp_cascade=self.model.dsp_cascade,
         )
-        if hasattr(self.train_dataset, "get_type_prior"):
-            self.criterion.update_type_priors(self.train_dataset.get_type_prior())
+        dataset_type_prior = get_dataset_type_prior(self.train_set)
+        if dataset_type_prior is not None:
+            self.criterion.update_type_priors(dataset_type_prior)
         self.metric_lambda_type_match = loss_cfg.get("lambda_type_match", 1.0)
 
         # Hungarian matcher for fair validation metrics (matches target ordering to predictions)
@@ -431,8 +504,14 @@ class Trainer:
         base_lr = model_cfg["learning_rate"]
         wd = model_cfg["weight_decay"]
         head_lr_mult = model_cfg.get("head_lr_multiplier", 3.0)
+        # Optional separate backbone LR (for unfrozen wav2vec2 fine-tuning)
+        backbone_lr = model_cfg.get("encoder", {}).get("backbone_lr", None)
 
-        # Classify parameters: encoder backbone gets base_lr, param head gets higher
+        # Classify parameters into 3 groups:
+        #   1. backbone (wav2vec2 transformer) — lowest LR when unfrozen
+        #   2. encoder other (layer_weights, temporal_pool, output_proj) — base LR
+        #   3. param_head — highest LR
+        backbone_params = []
         encoder_params = []
         head_params = []
         for name, param in self.model.named_parameters():
@@ -440,15 +519,28 @@ class Trainer:
                 continue
             if "param_head" in name:
                 head_params.append(param)
+            elif backbone_lr is not None and "encoder.backbone" in name:
+                backbone_params.append(param)
             else:
                 encoder_params.append(param)
 
-        # Loss learnable params (uncertainty weighting log_sigmas)
-        loss_params = list(self.criterion.parameters())
+        loss_params = [param for param in self.criterion.parameters() if param.requires_grad]
 
-        print(f"  [opt] LR groups: encoder={base_lr:.1e}, head={base_lr*head_lr_mult:.1e} ({head_lr_mult:.1f}x), loss_uw={base_lr:.1e}")
+        if backbone_params:
+            print(f"  [opt] LR groups: backbone={backbone_lr:.1e}, encoder={base_lr:.1e}, head={base_lr*head_lr_mult:.1e} ({head_lr_mult:.1f}x)")
+            print(f"  [opt] Backbone trainable params: {sum(p.numel() for p in backbone_params):,}")
+        else:
+            print(f"  [opt] LR groups: encoder={base_lr:.1e}, head={base_lr*head_lr_mult:.1e} ({head_lr_mult:.1f}x)")
 
-        param_groups = [
+        param_groups = []
+        if backbone_params:
+            param_groups.append({
+                "params": backbone_params,
+                "lr": backbone_lr,
+                "weight_decay": wd,
+                "initial_lr": backbone_lr,
+            })
+        param_groups.extend([
             {
                 "params": encoder_params,
                 "lr": base_lr,
@@ -461,13 +553,15 @@ class Trainer:
                 "weight_decay": wd,
                 "initial_lr": base_lr * head_lr_mult,
             },
-            {
+        ])
+        if loss_params:
+            print(f"  [opt] Criterion trainables: {sum(p.numel() for p in loss_params):,}")
+            param_groups.append({
                 "params": loss_params,
                 "lr": base_lr,
-                "weight_decay": 0.0,  # no weight decay on log_sigma
+                "weight_decay": 0.0,
                 "initial_lr": base_lr,
-            },
-        ]
+            })
 
         if self.use_8bit_optimizer:
             self.optimizer = bnb.optim.AdamW8bit(param_groups)
@@ -577,10 +671,10 @@ class Trainer:
         # Fix 8: Ensure the loss object knows the current epoch for warmup gating
         self.criterion.current_epoch = epoch
 
-        # Fix 7: H_db loss warmup ramp — 0.5 → 2.0 over first 10 epochs
+        # Fix 7: H_db loss warmup ramp — 0.5 → config max over first 10 epochs
         hdb_ramp_epochs = 10
         hdb_min = 0.5
-        hdb_max = 2.0
+        hdb_max = float(self.cfg.get("loss", {}).get("lambda_hdb", 2.0))
         if epoch <= hdb_ramp_epochs:
             self.criterion.lambda_hdb = hdb_min + (hdb_max - hdb_min) * (epoch - 1) / hdb_ramp_epochs
         else:
@@ -609,13 +703,16 @@ class Trainer:
             # Store norm for loss computation
             self.criterion._film_gamma_norm = film_gamma_norm
 
-        # AST Encoder freeze schedule
+        # AST / Wav2Vec2 Encoder freeze schedule
         freeze_epochs = self.cfg.get("model", {}).get("encoder", {}).get("freeze_epochs", 0)
         if hasattr(model_ref, "encoder") and hasattr(model_ref.encoder, "freeze_backbone"):
             if epoch <= freeze_epochs:
                 model_ref.encoder.freeze_backbone()
             else:
                 model_ref.encoder.unfreeze_backbone()
+                # When backbone is newly unfrozen, its params are not yet in the optimizer.
+                # Rebuild optimizer param groups to include them.
+                self._rebuild_optimizer_if_needed()
 
         # Type classifier pretrain phase
         # If true, first 5 epochs only use type loss and 0 for others to prevent param regression interference
@@ -695,6 +792,7 @@ class Trainer:
 
     def train_one_epoch(self, epoch):
         self.model.train()
+        self.criterion.train()
         epoch_loss = 0.0
         n_batches = 0
         n_nan_batches = 0
@@ -706,8 +804,12 @@ class Trainer:
         model_ref = self.model.module if hasattr(self.model, "module") else self.model
 
         for batch_idx, batch in enumerate(self.train_loader):
-            wet_audio = self._prepare_wet_audio(batch)
-            dry_audio = self._prepare_dry_audio(batch)
+            wet_audio = batch.get("wet_audio", None)
+            if wet_audio is not None:
+                wet_audio = wet_audio.to(self.device, non_blocking=True)
+            dry_audio = batch.get("dry_audio", None)
+            if dry_audio is not None:
+                dry_audio = dry_audio.to(self.device, non_blocking=True)
             mel_frames = self._prepare_input(batch, wet_audio=wet_audio)
             target_gain = batch["gain"].to(self.device, non_blocking=True)
             target_freq = batch["freq"].to(self.device, non_blocking=True)
@@ -716,7 +818,7 @@ class Trainer:
 
             # Forward (wrapped in autocast for bf16-mixed precision)
             with self.autocast_ctx:
-                output = self.model(mel_frames)
+                output = self.model(mel_frames, wet_audio=wet_audio)
                 pred_gain, pred_freq, pred_q = output["params"]
 
                 # Ground truth frequency response
@@ -747,7 +849,12 @@ class Trainer:
                 #         pred_gain.float(), pred_freq.float(), pred_q.float(),
                 #         filter_type=target_ft,
                 #     )
-                H_mag_typed = None
+                H_mag_typed = model_ref.dsp_cascade(
+                    pred_gain,
+                    pred_freq,
+                    pred_q,
+                    filter_type=target_ft,
+                )
 
                 total_loss, components = self.criterion(
                     pred_gain,
@@ -830,6 +937,8 @@ class Trainer:
                                 elif "param_head" in name:
                                     # Catch-all for trunk, cnn_merge, query_proj, etc.
                                     grad_parts.append(("param_head_other", param.grad.norm().item()))
+                                elif "encoder.backbone" in name:
+                                    grad_parts.append(("backbone", param.grad.norm().item()))
                                 elif "encoder" in name:
                                     grad_parts.append(("encoder", param.grad.norm().item()))
                         if grad_parts:
@@ -897,6 +1006,7 @@ class Trainer:
     @torch.no_grad()
     def validate(self, epoch):
         self.model.eval()
+        self.criterion.eval()
         val_loss_soft = 0.0
         val_loss_hard = 0.0
         val_spectral_loss_soft = 0.0
@@ -926,8 +1036,12 @@ class Trainer:
         compute_soft = (epoch % self.val_compute_soft_every_n == 0)
 
         for batch in self.val_loader:
-            wet_audio = self._prepare_wet_audio(batch)
-            dry_audio = self._prepare_dry_audio(batch)
+            wet_audio = batch.get("wet_audio", None)
+            if wet_audio is not None:
+                wet_audio = wet_audio.to(self.device, non_blocking=True)
+            dry_audio = batch.get("dry_audio", None)
+            if dry_audio is not None:
+                dry_audio = dry_audio.to(self.device, non_blocking=True)
             mel_frames = self._prepare_input(batch, wet_audio=wet_audio)
             target_gain = batch["gain"].to(self.device, non_blocking=True)
             target_freq = batch["freq"].to(self.device, non_blocking=True)
@@ -950,36 +1064,42 @@ class Trainer:
                 else:
                     output_soft = output_hard
                 pred_gain, pred_freq, pred_q = output_hard["params"]
-                pred_audio_hard = model_ref.dsp_cascade.process_audio(
-                    dry_audio,
-                    output_hard["params"][0],
-                    output_hard["params"][1],
-                    output_hard["params"][2],
-                    filter_type=output_hard["filter_type"],
-                    n_fft=self.n_fft,
-                    hop_length=self.hop_length,
-                )
-                pred_audio_soft = model_ref.dsp_cascade.process_audio(
-                    dry_audio,
-                    output_soft["params"][0],
-                    output_soft["params"][1],
-                    output_soft["params"][2],
-                    type_probs=output_soft["type_probs"],
-                    n_fft=self.n_fft,
-                    hop_length=self.hop_length,
-                )
+                pred_audio_hard = None
+                pred_audio_soft = None
+                if self.validate_render_audio:
+                    pred_audio_hard = model_ref.dsp_cascade.process_audio(
+                        dry_audio,
+                        output_hard["params"][0],
+                        output_hard["params"][1],
+                        output_hard["params"][2],
+                        filter_type=output_hard["filter_type"],
+                        n_fft=self.n_fft,
+                        hop_length=self.hop_length,
+                    )
+                    pred_audio_soft = model_ref.dsp_cascade.process_audio(
+                        dry_audio,
+                        output_soft["params"][0],
+                        output_soft["params"][1],
+                        output_soft["params"][2],
+                        type_probs=output_soft["type_probs"],
+                        n_fft=self.n_fft,
+                        hop_length=self.hop_length,
+                    )
 
                 # NaN diagnostic
-                for name, tensor in [
+                diagnostic_tensors = [
                     ("pred_gain", pred_gain),
                     ("pred_freq", pred_freq),
                     ("pred_q", pred_q),
                     ("embedding", output_hard["embedding"]),
-                    ("pred_audio_hard", pred_audio_hard),
-                    ("pred_audio_soft", pred_audio_soft),
                     ("H_mag", output_hard["H_mag"]),
                     ("H_mag_soft", output_soft["H_mag_soft"]),
-                ]:
+                ]
+                if pred_audio_hard is not None:
+                    diagnostic_tensors.append(("pred_audio_hard", pred_audio_hard))
+                if pred_audio_soft is not None:
+                    diagnostic_tensors.append(("pred_audio_soft", pred_audio_soft))
+                for name, tensor in diagnostic_tensors:
                     if not torch.isfinite(tensor).all():
                         print(f"  [nan] {name} has NaN/inf at val batch {n_batches}")
 
@@ -996,6 +1116,18 @@ class Trainer:
                     b0, b1, b2, a1, a2, n_fft=self.n_fft
                 )
                 h_db_target = 20.0 * torch.log10(H_mag_per_band.clamp(min=1e-6))
+                H_mag_typed_soft = model_ref.dsp_cascade(
+                    output_soft["params"][0],
+                    output_soft["params"][1],
+                    output_soft["params"][2],
+                    filter_type=target_ft,
+                )
+                H_mag_typed_hard = model_ref.dsp_cascade(
+                    output_hard["params"][0],
+                    output_hard["params"][1],
+                    output_hard["params"][2],
+                    filter_type=target_ft,
+                )
 
                 total_loss_soft, components = self.criterion(
                     output_soft["params"][0],
@@ -1012,6 +1144,7 @@ class Trainer:
                     embedding=output_soft["embedding"],
                     h_db_pred=output_soft.get("h_db_pred"),
                     h_db_target=h_db_target,
+                    H_mag_typed=H_mag_typed_soft,
                     type_probs=output_soft["type_probs"],
                 )
                 total_loss_hard, hard_components = self.criterion(
@@ -1029,6 +1162,7 @@ class Trainer:
                     embedding=output_hard["embedding"],
                     h_db_pred=output_hard.get("h_db_pred"),
                     h_db_target=h_db_target,
+                    H_mag_typed=H_mag_typed_hard,
                     type_probs=output_hard["type_probs"],
                 )
 
@@ -1278,7 +1412,13 @@ class Trainer:
         if result.missing_keys:
             print(f"  [resume] {len(result.missing_keys)} keys initialized randomly (not in checkpoint): {[k.split('.')[-1] for k in result.missing_keys]}")
         try:
-            self.optimizer.load_state_dict(state["optimizer_state_dict"])
+            opt_sd = state["optimizer_state_dict"]
+            self.optimizer.load_state_dict(opt_sd)
+            # Ensure optimizer state tensors are on the same device as model params
+            for s in self.optimizer.state.values():
+                for k, v in s.items():
+                    if isinstance(v, torch.Tensor):
+                        s[k] = v.to(self.device)
         except Exception as e:
             print(f"  [resume] Could not restore optimizer state ({e}); starting fresh optimizer")
         self.global_step = state.get("global_step", 0)
@@ -1301,20 +1441,82 @@ class Trainer:
         # Reset both lr and initial_lr to config values so WarmRestarts starts from peak.
         base_lr = self.cfg["model"]["learning_rate"]
         head_lr_mult = self.cfg["model"].get("head_lr_multiplier", 1.5)
-        for pg in self.optimizer.param_groups:
-            pg["initial_lr"] = base_lr
-            pg["lr"] = base_lr
-        # Second group (param head) gets higher LR
-        if len(self.optimizer.param_groups) > 1:
-            self.optimizer.param_groups[1]["initial_lr"] = base_lr * head_lr_mult
-            self.optimizer.param_groups[1]["lr"] = base_lr * head_lr_mult
-        print(f"  [resume] Starting fresh LR schedule (warm restart, lr={base_lr:.1e}, head_lr={base_lr*head_lr_mult:.1e})")
+        backbone_lr = self.cfg["model"].get("encoder", {}).get("backbone_lr", None)
+
+        # Set LR per param group based on group structure
+        # With backbone_lr: groups are [backbone, encoder, head, (loss)]
+        # Without backbone_lr: groups are [encoder, head, (loss)]
+        if backbone_lr is not None and len(self.optimizer.param_groups) >= 3:
+            # 3+ groups: backbone, encoder, head, (loss)
+            self.optimizer.param_groups[0]["initial_lr"] = backbone_lr
+            self.optimizer.param_groups[0]["lr"] = backbone_lr
+            self.optimizer.param_groups[1]["initial_lr"] = base_lr
+            self.optimizer.param_groups[1]["lr"] = base_lr
+            self.optimizer.param_groups[2]["initial_lr"] = base_lr * head_lr_mult
+            self.optimizer.param_groups[2]["lr"] = base_lr * head_lr_mult
+            # Loss group (if present)
+            for pg in self.optimizer.param_groups[3:]:
+                pg["initial_lr"] = base_lr
+                pg["lr"] = base_lr
+            print(f"  [resume] Starting fresh LR schedule (backbone_lr={backbone_lr:.1e}, encoder_lr={base_lr:.1e}, head_lr={base_lr*head_lr_mult:.1e})")
+        else:
+            for pg in self.optimizer.param_groups:
+                pg["initial_lr"] = base_lr
+                pg["lr"] = base_lr
+            # Second group (param head) gets higher LR
+            if len(self.optimizer.param_groups) > 1:
+                self.optimizer.param_groups[1]["initial_lr"] = base_lr * head_lr_mult
+                self.optimizer.param_groups[1]["lr"] = base_lr * head_lr_mult
+            print(f"  [resume] Starting fresh LR schedule (warm restart, lr={base_lr:.1e}, head_lr={base_lr*head_lr_mult:.1e})")
 
         print(
             f"  [resume] Loaded checkpoint from {path} "
             f"(epoch {state.get('epoch')}, monitor_value={self.best_monitor_value:.4f})"
         )
         print(f"  [resume] Resuming from epoch {self.start_epoch}")
+
+    _optimizer_includes_backbone = False  # Track whether backbone params are in optimizer
+
+    def _rebuild_optimizer_if_needed(self):
+        """Rebuild optimizer param groups when backbone is newly unfrozen.
+
+        When freeze_epochs > 0, the backbone starts frozen (requires_grad=False)
+        so its parameters are absent from the optimizer built at __init__.
+        This method detects that case and rebuilds param groups to include
+        the backbone at its own LR, preserving head/encoder momentum states.
+        """
+        if self._optimizer_includes_backbone:
+            return  # Already rebuilt
+
+        model_cfg = self.cfg["model"]
+        backbone_lr = model_cfg.get("encoder", {}).get("backbone_lr", None)
+        if backbone_lr is None:
+            # No backbone_lr configured — backbone params get base_lr via the
+            # normal encoder group (they'll be picked up on next optimizer reset)
+            backbone_lr = model_cfg["learning_rate"]
+
+        model_ref = self.model._orig_mod if hasattr(self.model, "_orig_mod") else self.model
+
+        # Collect newly-unfrozen backbone params
+        backbone_params = [
+            p for n, p in model_ref.named_parameters()
+            if "encoder.backbone" in n and p.requires_grad
+        ]
+        if not backbone_params:
+            return
+
+        # Add as a new param group (index 0 position matters for LR schedule,
+        # but AdamW just needs them in a group — order doesn't affect backward)
+        self.optimizer.add_param_group({
+            "params": backbone_params,
+            "lr": backbone_lr,
+            "weight_decay": model_cfg.get("weight_decay", 0.01),
+            "initial_lr": backbone_lr,
+        })
+
+        self._optimizer_includes_backbone = True
+        n_params = sum(p.numel() for p in backbone_params)
+        print(f"  [opt] Added {n_params:,} backbone params to optimizer (lr={backbone_lr:.1e})")
 
     def _recover_from_nan(self, epoch):
         """Reload last good checkpoint to recover from NaN state."""
