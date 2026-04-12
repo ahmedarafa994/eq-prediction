@@ -45,12 +45,13 @@ data:
   val_split: 0.1
   test_split: 0.1
   batch_size: 512
-  num_workers: 8
+  num_workers: 20
   precompute_mels: false
   freeze_val_set: false
 model:
   use_full_spectrum: true
-  two_stage: true
+  two_stage: false
+  hierarchical_type_head: true
   type_pretrain_epochs: 0
   encoder:
     backend: wav2vec2_frozen
@@ -59,7 +60,7 @@ model:
     ast_checkpoint_path: /teamspace/studios/this_studio/insight/pretrained_models/vit_small_patch16_224/pytorch_model.bin
     clap_model_path: /teamspace/studios/this_studio/insight/pretrained_models/laion/clap-htsat-unfused
     freeze_epochs: 42
-    backbone_lr: 1.0e-05
+    backbone_lr: 4.0e-06
     type: tcn
     n_mels: 128
     embedding_dim: 256
@@ -72,9 +73,9 @@ model:
   num_bands: 5
   type_conditioned_frequency: true
   n_shelf_bands: 16
-  learning_rate: 5.0e-05
+  learning_rate: 2.0e-05
   weight_decay: 0.05
-  head_lr_multiplier: 2.0
+  head_lr_multiplier: 5.0
   spectral_pretrain_path: null
 loss:
   lambda_param: 0.5
@@ -93,17 +94,17 @@ loss:
   lambda_type_prior: 0.05
   lambda_type_entropy: 0.02
   class_weight_multipliers:
+  - 1.25
   - 1.0
-  - 3.0
-  - 3.0
-  - 2.0
-  - 2.0
+  - 1.0
+  - 1.0
+  - 1.0
   sign_penalty_weight: 0.5
   lambda_embed_var: 0.1
   lambda_contrastive: 0.1
   lambda_hdb: 2.5
   lambda_film_diversity: 0.0
-  lambda_multi_scale: 3.0
+  lambda_multi_scale: 0.3
   lambda_perceptual: 2.0
   lambda_shape: 0.2
   audio_fft_sizes:
@@ -130,7 +131,7 @@ trainer:
   precision: bf16-mixed
   log_every_n_steps: 10
   fast_dev_run: false
-  gradient_accumulation_steps: 6
+  gradient_accumulation_steps: 2
   early_stopping_patience: 20
   monitor_val_metric: primary_val_score
   validate_render_audio: false
@@ -140,8 +141,8 @@ curriculum:
   - name: stage_0_coarse_structure
     epochs: 5
     filter_types: all
-    lambda_type: 1.0
-    lambda_gain: 0.1
+    lambda_type: 5.0
+    lambda_gain: 0.5
     lambda_freq: 1.0
     lambda_q: 0.1
     matcher_lambda_freq: 5.0
@@ -151,10 +152,10 @@ curriculum:
   - name: stage_1_frozen_warmup
     epochs: 37
     filter_types: all
-    lambda_type: 1.0
-    lambda_gain: 1.0
-    lambda_freq: 1.0
-    lambda_q: 1.0
+    lambda_type: 5.0
+    lambda_gain: 5.0
+    lambda_freq: 0.5
+    lambda_q: 0.25
     matcher_lambda_freq: 1.0
     matcher_lambda_gain: 2.0
     matcher_lambda_q: 0.5
@@ -162,14 +163,15 @@ curriculum:
   - name: stage_2_full_finetune
     epochs: 18
     filter_types: all
-    lambda_type: 1.0
-    lambda_gain: 1.0
-    lambda_freq: 1.0
-    lambda_q: 1.0
+    lambda_type: 5.0
+    lambda_gain: 5.0
+    lambda_freq: 0.5
+    lambda_q: 0.25
     matcher_lambda_freq: 1.0
     matcher_lambda_gain: 2.0
     matcher_lambda_q: 0.5
     matcher_lambda_type_match: 0.5
 gumbel:
-  start_tau: 1.5
-  min_tau: 0.1
+  start_tau: 1.0
+  min_tau: 0.3
+  warmup_epochs: 0

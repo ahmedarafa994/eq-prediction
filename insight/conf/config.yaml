@@ -4,7 +4,7 @@ data:
   num_bands: 5
   sample_rate: 44100
   audio_duration: 5.0
-  dataset_type: musdb
+  dataset_type: synthetic
   musdb_root: /teamspace/lightning_storage/SNAP_DATA_SET/musdb18_hq
   musdb_subsets:
   - train

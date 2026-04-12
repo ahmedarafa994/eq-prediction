@@ -1081,6 +1081,7 @@ class StreamingTCNModel(nn.Module):
         clap_model_path=None,
         mert_checkpoint="m-a-p/MERT-v1-95M",
         two_stage=False,
+        hierarchical_type_head=False,
     ):
         super().__init__()
         self.n_mels = n_mels
@@ -1177,6 +1178,7 @@ class StreamingTCNModel(nn.Module):
                 n_fft=n_fft,
                 sample_rate=sample_rate,
                 dsp_cascade=self.dsp_cascade,
+                hierarchical_type_head=hierarchical_type_head,
             )
 
         # Streaming state
@@ -1282,13 +1284,16 @@ class StreamingTCNModel(nn.Module):
         # 3. Compute frequency response
         H_mag = self.dsp_cascade(gain_db, freq, q, self.n_fft, filter_type)
 
-        # Soft H_mag path: differentiable w.r.t. type_logits (used for spectral loss during training)
+        # Soft H_mag path: differentiable w.r.t. gain/freq/q (used for spectral loss during training)
+        # CRITICAL: detach type_probs to prevent spectral loss from overriding type classification.
+        # Without detach, spectral loss rewards wrong types that produce similar frequency responses
+        # (e.g. highshelf approximating peaking), causing peaking type to collapse.
         if self.training or force_soft_response:
             H_mag_soft = self.dsp_cascade.forward_soft(
                 gain_db,
                 freq,
                 q,
-                type_probs,
+                type_probs.detach(),
                 self.n_fft,
             )
         else:
@@ -1309,6 +1314,7 @@ class StreamingTCNModel(nn.Module):
             "shelf_bias": param_aux.get("shelf_bias"),
             "shelf_attention": param_aux.get("shelf_attention"),
             "h_db_pred": param_aux.get("h_db_pred"),
+            "hier_aux": param_aux.get("hier_aux"),
             "attn_weights": attn_weights,
         }
 
