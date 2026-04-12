@@ -28,8 +28,14 @@ from loss_multitype import MultiTypeEQLoss as SimplifiedEQLoss
 from loss_multitype import HungarianBandMatcher
 from metrics import compute_eq_metrics
 from dataset import SyntheticEQDataset, collate_fn
-from dataset_musdb import MUSDB18EQDataset
-from dataset_litdata import LitdataEQDataset
+try:
+    from dataset_musdb import MUSDB18EQDataset
+except ImportError:
+    MUSDB18EQDataset = None
+try:
+    from dataset_litdata import LitdataEQDataset
+except ImportError:
+    LitdataEQDataset = None
 import yaml
 from pathlib import Path
 import time
@@ -254,8 +260,7 @@ class Trainer:
             "duration_range": tuple(data_cfg["duration_range"])
             if data_cfg.get("duration_range") is not None
             else None,
-            "adversarial_fraction": data_cfg.get("adversarial_fraction", 0.0),
-        }
+            }
 
         if dataset_type == "litdata":
             litdata_dir = data_cfg.get("litdata_dir")
@@ -751,6 +756,20 @@ class Trainer:
         self.criterion.lambda_type = float(
             stage.get("lambda_type", self.criterion.lambda_type)
         )
+
+        # Dynamic loss weights from curriculum stage
+        for weight_name in ["lambda_gain", "lambda_freq", "lambda_q", "lambda_spectral", "lambda_type_match"]:
+            if weight_name in stage:
+                setattr(self.criterion, weight_name, float(stage[weight_name]))
+
+        # Dynamic matcher weights from curriculum stage
+        # Matcher is nested inside self.criterion.param_loss
+        matcher = getattr(getattr(self.criterion, "param_loss", None), "matcher", None)
+        if matcher is not None:
+            for mw_name in ["matcher_lambda_freq", "matcher_lambda_gain", "matcher_lambda_q", "matcher_lambda_type_match"]:
+                if mw_name in stage:
+                    attr_name = mw_name.replace("matcher_", "")
+                    setattr(matcher, attr_name, float(stage[mw_name]))
 
         if stage_idx != self._current_curriculum_stage_idx:
             self._current_curriculum_stage_idx = stage_idx
@@ -1408,7 +1427,13 @@ class Trainer:
         if result.missing_keys:
             print(f"  [resume] {len(result.missing_keys)} keys initialized randomly (not in checkpoint): {[k.split('.')[-1] for k in result.missing_keys]}")
         try:
-            self.optimizer.load_state_dict(state["optimizer_state_dict"])
+            opt_sd = state["optimizer_state_dict"]
+            self.optimizer.load_state_dict(opt_sd)
+            # Ensure optimizer state tensors are on the same device as model params
+            for s in self.optimizer.state.values():
+                for k, v in s.items():
+                    if isinstance(v, torch.Tensor):
+                        s[k] = v.to(self.device)
         except Exception as e:
             print(f"  [resume] Could not restore optimizer state ({e}); starting fresh optimizer")
         self.global_step = state.get("global_step", 0)

@@ -1,14 +1,3 @@
-# Wav2Vec2 Unfreezing config — fine-tune the pretrained backbone
-# Resume from frozen baseline checkpoint (epoch 40) with backbone gradients enabled.
-#
-# Key differences from config_wav2vec2.yaml:
-#   - encoder.backend still "wav2vec2_frozen" (same class, now supports unfreeze)
-#   - encoder.freeze_epochs: 2 — head-only warmup before backbone unfreezing
-#   - encoder.backbone_lr: 1e-5 — 5× lower than base_lr to preserve pretrained features
-#   - batch_size: 512 (from 768) — backbone grads need ~3× more VRAM
-#   - gradient_accumulation_steps: 6 (from 4) — keeps effective batch ~3072
-#   - max_epochs: 60 — longer run with unfrozen backbone
-#
 experiment_name: idsp-eq-wav2vec2-unfreeze
 seed: 42
 data:
@@ -41,21 +30,12 @@ data:
   - highshelf
   - highpass
   - lowpass
-  type_weights:
-  - 0.2
-  - 0.2
-  - 0.2
-  - 0.2
-  - 0.2
-  adversarial_fraction: 0.25
-  hp_lp_gain_target: zero
   duration_range:
   - 0.5
   - 2.0
   train_split: 0.8
   val_split: 0.1
   test_split: 0.1
-  # Reduced batch size — backbone grads consume ~3× more VRAM
   batch_size: 512
   num_workers: 8
   precompute_mels: false
@@ -63,17 +43,15 @@ data:
 model:
   use_full_spectrum: true
   two_stage: true
-  type_pretrain_epochs: 0  # Skip — head already pretrained from frozen run
+  type_pretrain_epochs: 0
   encoder:
-    backend: wav2vec2_frozen  # Same class, but freeze_epochs controls when backbone unfreezes
+    backend: wav2vec2_frozen
     wav2vec2_checkpoint: /teamspace/studios/this_studio/insight/pretrained/wav2vec2-base
     ast_model_name: vit_small_patch16_224
     ast_checkpoint_path: /teamspace/studios/this_studio/insight/pretrained_models/vit_small_patch16_224/pytorch_model.bin
     clap_model_path: /teamspace/studios/this_studio/insight/pretrained_models/laion/clap-htsat-unfused
-    # --- Unfreezing schedule ---
-    freeze_epochs: 42       # First 42 epochs: frozen (includes resume from 40 + 2 epoch warmup)
-    backbone_lr: 1.0e-05   # 5× lower than base_lr — gentle backbone adaptation
-    # --------------------------
+    freeze_epochs: 5
+    backbone_lr: 1.0e-05
     type: tcn
     n_mels: 128
     embedding_dim: 256
@@ -86,10 +64,8 @@ model:
   num_bands: 5
   type_conditioned_frequency: true
   n_shelf_bands: 16
-  # Base LR for encoder projection / layer_weights
   learning_rate: 5.0e-05
   weight_decay: 0.05
-  # Head gets 2× base = 1e-4 (same as frozen run)
   head_lr_multiplier: 2.0
   spectral_pretrain_path: null
 loss:
@@ -139,14 +115,13 @@ loss:
 trainer:
   use_torch_compile: false
   use_gradient_checkpointing: true
-  precompute_cache_path: ""
+  precompute_cache_path: ''
   max_epochs: 60
   accelerator: auto
   devices: 1
   precision: bf16-mixed
   log_every_n_steps: 10
   fast_dev_run: false
-  # Higher accumulation compensates for smaller batch (512 × 6 = 3072 effective)
   gradient_accumulation_steps: 6
   early_stopping_patience: 20
   monitor_val_metric: primary_val_score
@@ -154,24 +129,58 @@ trainer:
   mode: min
 curriculum:
   stages:
-    # Stage 1: Head warmup on unfrozen checkpoint (backbone still frozen via freeze_epochs=42)
-    - name: unfreeze_warmup
-      epochs: 42
-      filter_types: [peaking, lowshelf, highshelf, highpass, lowpass]
-      gain_bounds: [-12.0, 12.0]
-      q_bounds: [0.05, 15.0]
-      type_weights: [0.2, 0.2, 0.2, 0.2, 0.2]
-      adversarial_fraction: 0.2
-      lambda_type: 2.0
-    # Stage 2: Backbone unfrozen — full fine-tuning with gentle backbone LR
-    - name: wav2vec2_finetune
-      epochs: 18
-      filter_types: [peaking, lowshelf, highshelf, highpass, lowpass]
-      gain_bounds: [-12.0, 12.0]
-      q_bounds: [0.05, 15.0]
-      type_weights: [0.2, 0.2, 0.2, 0.2, 0.2]
-      adversarial_fraction: 0.2
-      lambda_type: 1.0
+  - name: stage_0_coarse_structure
+    epochs: 5
+    filter_types:
+    - peaking
+    - lowshelf
+    - highshelf
+    - highpass
+    - lowpass
+    gain_bounds:
+    - -12.0
+    - 12.0
+    q_bounds:
+    - 0.05
+    - 15.0
+    lambda_type: 1.0
+    lambda_gain: 0.1
+    lambda_freq: 1.0
+    lambda_q: 0.1
+    matcher_lambda_freq: 5.0
+    matcher_lambda_gain: 0.1
+    matcher_lambda_q: 0.1
+    matcher_lambda_type_match: 0.1
+  - name: unfreeze_warmup
+    epochs: 30
+    filter_types:
+    - peaking
+    - lowshelf
+    - highshelf
+    - highpass
+    - lowpass
+    gain_bounds:
+    - -12.0
+    - 12.0
+    q_bounds:
+    - 0.05
+    - 15.0
+    lambda_type: 2.0
+  - name: wav2vec2_finetune
+    epochs: 25
+    filter_types:
+    - peaking
+    - lowshelf
+    - highshelf
+    - highpass
+    - lowpass
+    gain_bounds:
+    - -12.0
+    - 12.0
+    q_bounds:
+    - 0.05
+    - 15.0
+    lambda_type: 1.0
 gumbel:
   start_tau: 1.5
   min_tau: 0.1

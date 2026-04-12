@@ -694,8 +694,13 @@ class MultiTypeEQLoss(nn.Module):
                     -(log_probs * smoothed_targets).sum(dim=1)
                 )
 
-                # Mean over all samples (not weight-sum-normalized)
-                loss_type = per_sample_loss.mean()
+                # Gain-gated masking: zero out type gradients for
+                # flat/ambiguous filters (abs(gain) < 1.0 dB)
+                target_gain_flat = matched_gain.reshape(-1)
+                valid_type_mask = (torch.abs(target_gain_flat) >= 1.0).to(per_sample_loss.dtype)
+                masked_per_sample_loss = per_sample_loss * valid_type_mask
+                num_valid = valid_type_mask.sum()
+                loss_type = masked_per_sample_loss.sum() / (num_valid + 1e-8)
 
             # Batch-level type collapse regularization.
             probs_batch = pred_type_logits.softmax(dim=-1)
