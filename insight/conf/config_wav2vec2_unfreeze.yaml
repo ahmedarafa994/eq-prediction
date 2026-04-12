@@ -79,7 +79,7 @@ model:
 loss:
   lambda_param: 0.5
   lambda_hmag: 1.5
-  lambda_type: 2.0
+  lambda_type: 5.0
   lambda_gain: 5.0
   lambda_freq: 0.5
   lambda_q: 0.25
@@ -87,17 +87,17 @@ loss:
   lambda_spectral: 5.0
   lambda_typed_spectral: 3.0
   label_smoothing: 0.01
-  focal_gamma: 2.5
+  focal_gamma: 1.5
   type_loss_mode: focal
   lambda_type_match: 1.0
   lambda_type_prior: 0.05
   lambda_type_entropy: 0.02
   class_weight_multipliers:
-  - 2.5
-  - 1.5
-  - 2.5
   - 1.0
-  - 1.0
+  - 3.0
+  - 3.0
+  - 2.0
+  - 2.0
   sign_penalty_weight: 0.5
   lambda_embed_var: 0.1
   lambda_contrastive: 0.1

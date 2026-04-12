@@ -18,7 +18,7 @@ from scipy.optimize import linear_sum_assignment
 import numpy as np
 
 from loss import MultiResolutionSTFTLoss
-from differentiable_eq import FILTER_HIGHPASS, FILTER_LOWPASS
+from differentiable_eq import FILTER_HIGHPASS, FILTER_LOWPASS, FILTER_LOWSHELF, FILTER_HIGHSHELF
 
 
 def log_cosh_loss(pred, target):
@@ -171,8 +171,10 @@ class HungarianBandMatcher:
             p_correct_type = (
                 pred_probs.unsqueeze(2) * target_one_hot.unsqueeze(1)
             ).sum(-1)  # (B, N, N)
+            # Increase type mismatch penalty from 0.5 to 2.0 to force type-aware matching
+            # This makes matching "stubborn" about type alignment.
             type_cost = 1.0 - p_correct_type
-            cost = cost + self.lambda_type_match * type_cost
+            cost = cost + 2.0 * type_cost
 
         return cost
 
@@ -674,8 +676,12 @@ class MultiTypeEQLoss(nn.Module):
             targets_flat = matched_filter_type.reshape(B * N)  # (B*N,)
 
             # Apply gain-gated masking to zero out type gradients for ambiguous (flat) filters
+            # EXEMPT HP/LP from gain-gating since they always have 0 dB gain by definition
             target_gain_flat = matched_gain.reshape(-1)
-            valid_type_mask = (torch.abs(target_gain_flat) >= 1.0).to(pred_type_logits.dtype)
+            target_type_flat = matched_filter_type.reshape(-1)
+            is_hplp = (target_type_flat == FILTER_HIGHPASS) | (target_type_flat == FILTER_LOWPASS)
+            has_gain = (torch.abs(target_gain_flat) >= 0.5)
+            valid_type_mask = (has_gain | is_hplp).to(pred_type_logits.dtype)
 
             if self.type_loss_mode == "balanced_softmax":
                 # Balanced Softmax: logit correction with class priors.
@@ -698,11 +704,16 @@ class MultiTypeEQLoss(nn.Module):
                 ).float() + self.type_label_smoothing / n_classes
 
                 p_t = (probs * smoothed_targets).sum(dim=1)  # (B*N,)
-                focal_weight = (1.0 - p_t).pow(self.focal_gamma)  # (B*N,)
+                # Increase focal gamma to focus more on hard (shelf/HP/LP) errors
+                focal_weight = (1.0 - p_t).pow(3.5)  # (B*N,)
 
                 # Class-balanced alpha: alpha_t for each sample
                 alpha_t = self.type_class_weights[targets_flat]  # (B*N,)
                 alpha_t = alpha_t / alpha_t.mean()  # renormalize so mean(alpha)=1
+
+                # Individual shelf boost (multiplies alpha)
+                shelf_mask = (targets_flat == FILTER_LOWSHELF) | (targets_flat == FILTER_HIGHSHELF)
+                alpha_t[shelf_mask] *= 1.5
 
                 # Per-sample loss: alpha_t * (1-p_t)^gamma * CE
                 per_sample_loss = alpha_t * focal_weight * (
