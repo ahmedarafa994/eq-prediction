@@ -21,9 +21,10 @@
 ### v1.1 Backbone Fine-tuning & Accuracy Push
 
 - [ ] **Phase 6: Backbone Unfreezing** — Launch end-to-end wav2vec2 fine-tuning
-      **Plans:** 2 plans
+      **Plans:** 3 plans
       - [ ] 06-01-PLAN.md — Pre-flight verification and config calibration for resume
       - [ ] 06-02-PLAN.md — Launch fine-tuning and monitor backbone unfreeze transition
+      - [ ] 06-03-PLAN.md — Gap closure: Calibrate VRAM and verify stable fine-tuning
 - [ ] **Phase 7: Training Strategy & Accuracy Push** — LLRD, EMA, loss rebalancing to hit targets
 
 ---
@@ -79,5 +80,5 @@
 | 3. Loss Architecture Restructuring | v1.0 | 2/2 | Complete | 2026-04-06 |
 | 4. Q, Type & Frequency Refinement | v1.0 | 2/2 | Complete | 2026-04-06 |
 | 5. Inference Refinement & Confidence | v1.0 | 2/2 | Complete | 2026-04-06 |
-| 6. Backbone Unfreezing | v1.1 | 0/2 | Pending | — |
+| 6. Backbone Unfreezing | v1.1 | 0/3 | Pending | — |
 | 7. Training Strategy & Accuracy Push | v1.1 | 0/0 | Pending | — |
