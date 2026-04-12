@@ -32,10 +32,6 @@ try:
     from dataset_musdb import MUSDB18EQDataset
 except ImportError:
     MUSDB18EQDataset = None
-try:
-    from dataset_litdata import LitdataEQDataset
-except ImportError:
-    LitdataEQDataset = None
 import yaml
 from pathlib import Path
 import time
@@ -99,6 +95,12 @@ def apply_stage_to_training_state(train_dataset, criterion, stage):
     apply_fn = getattr(train_dataset, "apply_curriculum_stage", None)
     if callable(apply_fn):
         apply_fn(stage)
+
+    # Apply dynamic component loss weights from curriculum stage
+    for weight_name in ["lambda_gain", "lambda_freq", "lambda_q", "lambda_type", "lambda_spectral", "lambda_type_match",
+                        "matcher_lambda_gain", "matcher_lambda_freq", "matcher_lambda_q", "matcher_lambda_type_match"]:
+        if weight_name in stage:
+            setattr(criterion, weight_name, float(stage[weight_name]))
 
     current_prior = None
     prior_getter = getattr(train_dataset, "get_type_prior", None)
@@ -753,27 +755,10 @@ class Trainer:
         if callable(set_focus):
             set_focus(focus)
 
-        self.criterion.lambda_type = float(
-            stage.get("lambda_type", self.criterion.lambda_type)
-        )
-
-        # Dynamic loss weights from curriculum stage
-        for weight_name in ["lambda_gain", "lambda_freq", "lambda_q", "lambda_spectral", "lambda_type_match"]:
-            if weight_name in stage:
-                setattr(self.criterion, weight_name, float(stage[weight_name]))
-
-        # Dynamic matcher weights from curriculum stage
-        # Matcher is nested inside self.criterion.param_loss
-        matcher = getattr(getattr(self.criterion, "param_loss", None), "matcher", None)
-        if matcher is not None:
-            for mw_name in ["matcher_lambda_freq", "matcher_lambda_gain", "matcher_lambda_q", "matcher_lambda_type_match"]:
-                if mw_name in stage:
-                    attr_name = mw_name.replace("matcher_", "")
-                    setattr(matcher, attr_name, float(stage[mw_name]))
-
         if stage_idx != self._current_curriculum_stage_idx:
             self._current_curriculum_stage_idx = stage_idx
             stage_name = stage.get("name", f"stage_{stage_idx}")
+            weights_str = f"L_type={self.criterion.lambda_type:.2f} | L_gain={self.criterion.lambda_gain:.2f} | L_freq={self.criterion.lambda_freq:.2f} | L_q={self.criterion.lambda_q:.2f} | L_spec={self.criterion.lambda_spectral:.2f}"
             print(
                 f"  [curriculum] epoch={epoch} stage={stage_name} "
                 f"filter_types={stage.get('filter_types', 'all')} "
@@ -781,7 +766,7 @@ class Trainer:
                 f"q_bounds={stage.get('q_bounds', 'default')} "
                 f"type_weights={stage.get('type_weights', 'base')} "
                 f"adversarial_fraction={stage.get('adversarial_fraction', getattr(self.train_dataset, 'adversarial_fraction', 'default'))} "
-                f"lambda_type={self.criterion.lambda_type:.3f}"
+                f"weights: {weights_str}"
             )
 
     def _gain_aux_alignment(self, batch, wet_mel, output):
