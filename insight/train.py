@@ -26,7 +26,10 @@ from loss_multitype import MultiTypeEQLoss as SimplifiedEQLoss
 from loss_multitype import HungarianBandMatcher
 from metrics import compute_eq_metrics
 from dataset import SyntheticEQDataset, collate_fn
-from dataset_musdb import MUSDB18EQDataset
+try:
+    from dataset_musdb import MUSDB18EQDataset
+except ImportError:
+    MUSDB18EQDataset = None
 import yaml
 from pathlib import Path
 import time
@@ -90,6 +93,11 @@ def apply_stage_to_training_state(train_dataset, criterion, stage):
     apply_fn = getattr(train_dataset, "apply_curriculum_stage", None)
     if callable(apply_fn):
         apply_fn(stage)
+
+    # Apply dynamic component loss weights from curriculum stage
+    for weight_name in ["lambda_gain", "lambda_freq", "lambda_q", "lambda_type", "lambda_spectral", "lambda_type_match"]:
+        if weight_name in stage:
+            setattr(criterion, weight_name, float(stage[weight_name]))
 
     current_prior = None
     prior_getter = getattr(train_dataset, "get_type_prior", None)
@@ -649,13 +657,10 @@ class Trainer:
         if callable(set_focus):
             set_focus(focus)
 
-        self.criterion.lambda_type = float(
-            stage.get("lambda_type", self.criterion.lambda_type)
-        )
-
         if stage_idx != self._current_curriculum_stage_idx:
             self._current_curriculum_stage_idx = stage_idx
             stage_name = stage.get("name", f"stage_{stage_idx}")
+            weights_str = f"L_type={self.criterion.lambda_type:.2f} | L_gain={self.criterion.lambda_gain:.2f} | L_freq={self.criterion.lambda_freq:.2f} | L_q={self.criterion.lambda_q:.2f} | L_spec={self.criterion.lambda_spectral:.2f}"
             print(
                 f"  [curriculum] epoch={epoch} stage={stage_name} "
                 f"filter_types={stage.get('filter_types', 'all')} "
@@ -663,7 +668,7 @@ class Trainer:
                 f"q_bounds={stage.get('q_bounds', 'default')} "
                 f"type_weights={stage.get('type_weights', 'base')} "
                 f"adversarial_fraction={stage.get('adversarial_fraction', getattr(self.train_dataset, 'adversarial_fraction', 'default'))} "
-                f"lambda_type={self.criterion.lambda_type:.3f}"
+                f"weights: {weights_str}"
             )
 
     def _gain_aux_alignment(self, batch, wet_mel, output):

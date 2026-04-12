@@ -275,12 +275,15 @@ class PermutationInvariantParamLoss(nn.Module):
     Uses Huber loss for robustness to outliers.
     """
 
-    def __init__(self, lambda_freq=1.0, lambda_q=0.5, lambda_type_match=0.5):
+    def __init__(self, lambda_gain=2.0, lambda_freq=1.0, lambda_q=0.5, lambda_type_match=0.5):
         super().__init__()
         self.matcher = HungarianBandMatcher(
-            lambda_freq, lambda_q, lambda_type_match=lambda_type_match
+            lambda_freq, lambda_q, lambda_gain=lambda_gain, lambda_type_match=lambda_type_match
         )
         self.huber = nn.HuberLoss(delta=5.0)
+        self.lambda_gain = lambda_gain
+        self.lambda_freq = lambda_freq
+        self.lambda_q = lambda_q
 
     def forward(
         self,
@@ -392,8 +395,13 @@ class MultiTypeEQLoss(nn.Module):
         self.lambda_spread = lambda_spread
         self.lambda_embed_var = lambda_embed_var
         self.lambda_contrastive = lambda_contrastive
+        self.lambda_type_match = lambda_type_match
         self.lambda_type_entropy = lambda_type_entropy
         self.lambda_type_prior = lambda_type_prior
+        self.matcher_lambda_gain = kwargs.get("matcher_lambda_gain", lambda_gain)
+        self.matcher_lambda_freq = kwargs.get("matcher_lambda_freq", lambda_freq)
+        self.matcher_lambda_q = kwargs.get("matcher_lambda_q", lambda_q)
+        self.matcher_lambda_type_match = kwargs.get("matcher_lambda_type_match", lambda_type_match)
         self.embed_var_threshold = embed_var_threshold
         self.warmup_epochs = warmup_epochs
         self.current_epoch = 0
@@ -408,8 +416,12 @@ class MultiTypeEQLoss(nn.Module):
         self.gain_mae_ema = 10.0  # EMA of per-batch gain MAE (dB), alpha=0.1 — start high (realistic)
 
         self.param_loss = PermutationInvariantParamLoss(
+            lambda_gain=lambda_gain,
+            lambda_freq=lambda_freq,
+            lambda_q=lambda_q,
             lambda_type_match=lambda_type_match
         )
+        self.huber = nn.HuberLoss(delta=5.0)
         # Class prior-aware type losses.
         # If priors are provided from config/data, use them; otherwise fallback to
         # a balanced default prior.
@@ -594,6 +606,12 @@ class MultiTypeEQLoss(nn.Module):
         else:
             pred_type_logits_for_match = pred_type_logits
 
+        # Ensure matcher uses the current dynamic weights from curriculum
+        self.param_loss.matcher.lambda_gain = self.matcher_lambda_gain
+        self.param_loss.matcher.lambda_freq = self.matcher_lambda_freq
+        self.param_loss.matcher.lambda_q = self.matcher_lambda_q
+        self.param_loss.matcher.lambda_type_match = self.matcher_lambda_type_match
+
         # 1. Parameter regression (permutation-invariant) + type matching in one pass.
         # Call the inner matcher directly so we get the same permutation applied to
         # filter types — param_loss.forward() only returns scalars and discards the
@@ -626,10 +644,10 @@ class MultiTypeEQLoss(nn.Module):
             components["sign_penalty"] = torch.tensor(0.0, device=pred_gain.device)
 
         # Freq and Q still use Huber on log-space
-        loss_freq = self.param_loss.huber(
+        loss_freq = self.huber(
             torch.log(pred_freq + 1e-8), torch.log(matched_freq + 1e-8)
         )
-        loss_q = self.param_loss.huber(
+        loss_q = self.huber(
             torch.log(pred_q + 1e-8), torch.log(matched_q + 1e-8)
         )
 
@@ -642,18 +660,10 @@ class MultiTypeEQLoss(nn.Module):
         components["loss_freq"] = loss_freq
         components["loss_q"] = loss_q
 
-        # Use independent per-parameter weights when lambda_param is disabled (0.0)
-        if self.lambda_param > 0:
-            loss_param = (
-                self.lambda_param * (loss_freq + loss_q) + self.lambda_gain * loss_gain
-            )
-        else:
-            loss_param = (
-                self.lambda_gain * loss_gain
-                + self.lambda_freq * loss_freq
-                + self.lambda_q * loss_q
-            )
-        components["param_loss"] = loss_param
+        # Apply dynamic component weights from curriculum stage
+        loss_gain = loss_gain * self.lambda_gain
+        loss_freq = loss_freq * self.lambda_freq
+        loss_q = loss_q * self.lambda_q
 
         # 2. Filter type classification against Hungarian-matched targets.
         # D-04: During warmup, type loss is zero (gain-only training)
@@ -663,15 +673,20 @@ class MultiTypeEQLoss(nn.Module):
             logits_flat = pred_type_logits.reshape(B * N, C)  # (B*N, 5)
             targets_flat = matched_filter_type.reshape(B * N)  # (B*N,)
 
+            # Apply gain-gated masking to zero out type gradients for ambiguous (flat) filters
+            target_gain_flat = matched_gain.reshape(-1)
+            valid_type_mask = (torch.abs(target_gain_flat) >= 1.0).to(pred_type_logits.dtype)
+
             if self.type_loss_mode == "balanced_softmax":
                 # Balanced Softmax: logit correction with class priors.
                 # This counteracts class-frequency bias without oversampling.
                 prior_log = torch.log(self.type_class_priors + 1e-8).to(logits_flat.dtype)
                 logits_bal = logits_flat + prior_log.unsqueeze(0)
-                loss_type = F.cross_entropy(
+                per_sample_loss = F.cross_entropy(
                     logits_bal,
                     targets_flat,
                     label_smoothing=self.type_label_smoothing,
+                    reduction="none",
                 )
             else:
                 # Default: class-balanced focal loss.
@@ -694,8 +709,13 @@ class MultiTypeEQLoss(nn.Module):
                     -(log_probs * smoothed_targets).sum(dim=1)
                 )
 
-                # Mean over all samples (not weight-sum-normalized)
-                loss_type = per_sample_loss.mean()
+            masked_per_sample_loss = per_sample_loss * valid_type_mask
+            # Avoid division by zero if mask is entirely 0
+            num_valid = valid_type_mask.sum()
+            loss_type = masked_per_sample_loss.sum() / (num_valid + 1e-8)
+
+            # Apply dynamic weight to type loss
+            loss_type = loss_type * self.lambda_type
 
             # Batch-level type collapse regularization.
             probs_batch = pred_type_logits.softmax(dim=-1)
