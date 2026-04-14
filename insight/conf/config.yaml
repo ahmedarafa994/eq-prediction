@@ -35,6 +35,8 @@ data:
   - 0.2
   - 0.2
   - 0.2
+  one_band_probability: 1.0
+  val_one_band_probability: 0.0
   adversarial_fraction: 0.25
   hp_lp_gain_target: zero
   duration_range:
@@ -53,7 +55,7 @@ data:
   train_split: 0.8
   val_split: 0.1
   test_split: 0.1
-  batch_size: 4096
+  batch_size: 2048
   num_workers: 4
   precompute_mels: false
   freeze_val_set: false
@@ -94,13 +96,14 @@ loss:
   lambda_q: 0.5
   lambda_gain_zero: 0.25
   lambda_spectral: 1.5
+  lambda_slope: 0.5
   lambda_typed_spectral: 1.0
   label_smoothing: 0.01
   focal_gamma: 2.0
   type_loss_mode: focal
   lambda_type_match: 1.0
   lambda_type_prior: 0.05
-  lambda_type_entropy: 0.5
+  lambda_type_entropy: 2.0
   class_weight_multipliers:
   - 1.0
   - 2.0
@@ -128,7 +131,7 @@ loss:
   audio_n_mels: 64
   audio_n_mfcc: 20
 trainer:
-  use_torch_compile: false
+  use_torch_compile: true
   use_gradient_checkpointing: false
   precompute_cache_path: data/dataset_phase3_200k.pt
   max_epochs: 60
@@ -154,11 +157,14 @@ trainer:
     gain_mae_db_matched: 8.0
     type_accuracy_matched_min: 0.25
     primary_val_score: 12.0
+  # AUDIT: es_type — Independent type accuracy monitoring for early stopping
+  # If type accuracy stays below this threshold for alert_grace_epochs, alert
+  type_accuracy_stagnation_threshold: 0.30
   fail_on_alert: false
   alert_grace_epochs: 10
 curriculum:
   stages:
-  - name: multitype_lowshelf_focus
+  - name: discovery_single_band
     epochs: 10
     filter_types:
     - peaking
@@ -174,13 +180,14 @@ curriculum:
     - 5.0
     type_weights:
     - 0.2
-    - 0.35
-    - 0.15
-    - 0.15
-    - 0.15
+    - 0.2
+    - 0.2
+    - 0.2
+    - 0.2
+    one_band_probability: 1.0
     adversarial_fraction: 0.4
     lambda_type: 8.0
-  - name: multitype_midrange
+  - name: interaction_mixed_bands
     epochs: 15
     filter_types:
     - peaking
@@ -195,14 +202,15 @@ curriculum:
     - 0.2
     - 8.0
     type_weights:
-    - 0.25
-    - 0.3
     - 0.2
-    - 0.125
-    - 0.125
+    - 0.2
+    - 0.2
+    - 0.2
+    - 0.2
+    one_band_probability: 0.7
     adversarial_fraction: 0.3
     lambda_type: 4.0
-  - name: multitype_full_range
+  - name: complexity_multi_band_focus
     epochs: 35
     filter_types:
     - peaking
@@ -222,9 +230,10 @@ curriculum:
     - 0.2
     - 0.2
     - 0.2
+    one_band_probability: 0.2
     adversarial_fraction: 0.2
     lambda_type: 1.0
 gumbel:
   start_tau: 0.5
-  min_tau: 0.1
+  min_tau: 0.05
   warmup_epochs: 5

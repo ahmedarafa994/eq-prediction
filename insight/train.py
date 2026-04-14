@@ -113,7 +113,7 @@ def apply_stage_to_training_state(train_dataset, criterion, stage):
         apply_fn(stage)
 
     # Apply dynamic component loss weights from curriculum stage
-    for weight_name in ["lambda_gain", "lambda_freq", "lambda_q", "lambda_type", "lambda_spectral", "lambda_type_match",
+    for weight_name in ["lambda_gain", "lambda_freq", "lambda_q", "lambda_type", "lambda_spectral", "lambda_slope", "lambda_type_match",
                         "matcher_lambda_gain", "matcher_lambda_freq", "matcher_lambda_q", "matcher_lambda_type_match"]:
         if weight_name in stage:
             setattr(criterion, weight_name, float(stage[weight_name]))
@@ -377,12 +377,14 @@ class Trainer:
             "duration_range": tuple(data_cfg["duration_range"])
             if data_cfg.get("duration_range") is not None
             else None,
+            "one_band_probability": float(data_cfg.get("one_band_probability", 0.0)),
         }
         synthetic_val_kwargs = {
             **val_ds_kwargs,
             "duration_range": tuple(data_cfg["duration_range"])
             if data_cfg.get("duration_range") is not None
             else None,
+            "one_band_probability": float(data_cfg.get("val_one_band_probability", 0.0)),
         }
 
         if dataset_type == "litdata":
@@ -601,6 +603,7 @@ class Trainer:
             lambda_gain=loss_cfg.get("lambda_gain", 1.0),
             lambda_freq=loss_cfg.get("lambda_freq", 1.0),
             lambda_q=loss_cfg.get("lambda_q", 1.0),
+            lambda_slope=loss_cfg.get("lambda_slope", 0.0),
             lambda_gain_zero=loss_cfg.get("lambda_gain_zero", 1.0),
             label_smoothing=loss_cfg.get("label_smoothing", 0.02),
             focal_gamma=loss_cfg.get("focal_gamma", 2.0),
@@ -1170,6 +1173,7 @@ class Trainer:
             self.criterion.lambda_freq = 0.0
             self.criterion.lambda_q = 0.0
             self.criterion.lambda_spectral = 0.0
+            self.criterion.lambda_slope = 0.0
             self.criterion.lambda_typed_spectral = 0.0
             self.criterion.lambda_hdb = 0.0
         else:
@@ -1179,6 +1183,7 @@ class Trainer:
             self.criterion.lambda_freq = loss_cfg.get("lambda_freq", 1.0)
             self.criterion.lambda_q = loss_cfg.get("lambda_q", 1.0)
             self.criterion.lambda_spectral = loss_cfg.get("lambda_spectral", 5.0)
+            self.criterion.lambda_slope = loss_cfg.get("lambda_slope", 0.0)
             self.criterion.lambda_typed_spectral = loss_cfg.get("lambda_typed_spectral", 2.0)
             # AUDIT: MEDIUM-03 — lambda_hdb uses config default (H_db ramp removed, consolidated into loss warmup)
             self.criterion.lambda_hdb = loss_cfg.get("lambda_hdb", 2.0)
@@ -1192,7 +1197,7 @@ class Trainer:
         # C-06: Always apply curriculum to the loss criterion (type priors, lambda
         # weights, gumbel tau) even when dataset has precomputed cache.  Only skip
         # dataset-level overrides (apply_curriculum_stage on the dataset itself).
-        for weight_name in ["lambda_gain", "lambda_freq", "lambda_q", "lambda_type", "lambda_spectral", "lambda_type_match",
+        for weight_name in ["lambda_gain", "lambda_freq", "lambda_q", "lambda_type", "lambda_spectral", "lambda_slope", "lambda_type_match",
                             "matcher_lambda_gain", "matcher_lambda_freq", "matcher_lambda_q", "matcher_lambda_type_match"]:
             if weight_name in stage:
                 setattr(self.criterion, weight_name, float(stage[weight_name]))
@@ -1223,13 +1228,21 @@ class Trainer:
         if stage_idx != self._current_curriculum_stage_idx:
             self._current_curriculum_stage_idx = stage_idx
             stage_name = stage.get("name", f"stage_{stage_idx}")
-            weights_str = f"L_type={self.criterion.lambda_type:.2f} | L_gain={self.criterion.lambda_gain:.2f} | L_freq={self.criterion.lambda_freq:.2f} | L_q={self.criterion.lambda_q:.2f} | L_spec={self.criterion.lambda_spectral:.2f}"
+            weights_str = (
+                f"L_type={self.criterion.lambda_type:.2f} | "
+                f"L_gain={self.criterion.lambda_gain:.2f} | "
+                f"L_freq={self.criterion.lambda_freq:.2f} | "
+                f"L_q={self.criterion.lambda_q:.2f} | "
+                f"L_spec={self.criterion.lambda_spectral:.2f} | "
+                f"L_slope={self.criterion.lambda_slope:.2f}"
+            )
             print(
                 f"  [curriculum] epoch={epoch} stage={stage_name} "
                 f"filter_types={stage.get('filter_types', 'all')} "
                 f"gain_bounds={stage.get('gain_bounds', self.gain_bounds)} "
                 f"q_bounds={stage.get('q_bounds', 'default')} "
                 f"type_weights={stage.get('type_weights', 'base')} "
+                f"one_band_probability={stage.get('one_band_probability', getattr(self.train_dataset, 'one_band_probability', 'default'))} "
                 f"adversarial_fraction={stage.get('adversarial_fraction', getattr(self.train_dataset, 'adversarial_fraction', 'default'))} "
                 f"weights: {weights_str}"
             )
@@ -1248,6 +1261,11 @@ class Trainer:
                 lambda_freq=self.criterion.lambda_freq,
                 lambda_q=self.criterion.lambda_q,
                 lambda_spectral=self.criterion.lambda_spectral,
+                lambda_slope=self.criterion.lambda_slope,
+                one_band_probability=stage.get(
+                    "one_band_probability",
+                    getattr(self.train_dataset, "one_band_probability", None),
+                ),
             )
 
     def _gain_aux_alignment(self, batch, wet_mel, output):
@@ -1550,14 +1568,29 @@ class Trainer:
 
                     # AUDIT: CRITICAL-07 — Sanitize optimizer state: reset any Adam momentum/variance
                     # buffers that contain NaN (prevents permanent training death).
-                    # Also reset the 'step' count which can become NaN/inf and prevent convergence.
-                    for state in self.optimizer.state.values():
-                        for k, v in state.items():
+                    # AUDIT FIX: Specifically handle Adam's exp_avg (momentum) and exp_avg_sq (RMS)
+                    # to prevent "ghost" momentum from corrupted second moments.
+                    # When either is corrupted, also reset the step count to prevent Adam bias
+                    # correction mismatch (step count continues from old value with zeroed momentum).
+                    for param_id, state in self.optimizer.state.items():
+                        had_nan_state = False
+                        for k, v in list(state.items()):
                             if isinstance(v, torch.Tensor) and not torch.isfinite(v).all():
                                 v.zero_()
-                            # Reset scalar state values (step count) that may be NaN/inf
+                                had_nan_state = True
+                                if k in ("exp_avg", "exp_avg_sq"):
+                                    self.logger.log_event(
+                                        "optimizer_state_corrupted",
+                                        key=k, action="zeroed",
+                                        step=self.global_step,
+                                        param_id=param_id,
+                                    )
                             elif isinstance(v, float) and not math.isfinite(v):
                                 state[k] = 0.0
+                        # AUDIT FIX: Reset step count when momentum states were corrupted
+                        # to prevent Adam bias correction from using wrong step count
+                        if had_nan_state and "step" in state:
+                            state["step"] = 0.0
                 else:
                     self.model.step()
 
@@ -2544,7 +2577,8 @@ class Trainer:
             else:
                 self.patience_counter += 1
             # Only save best.pt (primary metric) and last.pt (resume point).
-            # Additional metric tracking is logged; separate files are unnecessary.
+            # AUDIT: HIGH-09 — Reduced from 5 concurrent "best" checkpoints to 2.
+            # Additional metric tracking is logged via best_named_metrics; separate files are unnecessary.
             save_tags = ["last"]
             if is_best:
                 save_tags.append("best")
@@ -2577,8 +2611,7 @@ class Trainer:
                 self.best_named_metrics["val_spectral_loss"],
             ):
                 self.best_named_metrics["val_spectral_loss"] = spectral_loss
-            # Always save last.pt for resume capability
-            save_tags.append("last")
+            # last.pt is always saved (included in initial save_tags)
             self.save_checkpoint(epoch, monitor_value, save_tags, metrics=metrics, is_best=is_best)
 
             self.history.append(

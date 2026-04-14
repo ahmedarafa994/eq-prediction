@@ -3,6 +3,11 @@ Multi-type synthetic EQ data generation.
 
 Generates (dry, wet, params) pairs with support for peaking, low-shelf,
 high-shelf, high-pass, and low-pass filter types.
+
+AUDIT: P1-7 — Biquad coefficient computation is unified with the training
+pipeline via `differentiable_eq.py`. The offline generator imports the
+same `DifferentiableBiquadCascade` class, ensuring numerical consistency
+between offline-generated data and on-the-fly training data generation.
 """
 import os
 import json
@@ -26,6 +31,18 @@ from pipeline_utils import (
     utc_now_iso,
     validate_band_list,
     resolve_trusted_artifact_path,
+)
+
+# AUDIT: P1-7 — Import unified biquad coefficient computation from the training
+# pipeline. This eliminates the previous duplicate implementations that could
+# drift out of sync, causing offline data to differ from training data.
+from differentiable_eq import (
+    DifferentiableBiquadCascade,
+    FILTER_PEAKING,
+    FILTER_LOWSHELF,
+    FILTER_HIGHSHELF,
+    FILTER_HIGHPASS,
+    FILTER_LOWPASS,
 )
 
 
@@ -125,84 +142,69 @@ def generate_eq_params(num_bands, bounds, type_weights=None):
     return params
 
 
+# AUDIT: P1-7 — Unified biquad coefficient computation via training pipeline.
+# All coefficient formulas come from `DifferentiableBiquadCascade` in
+# `differentiable_eq.py`, which implements the Robert Bristow-Johnson Audio
+# EQ Cookbook formulas. This wrapper provides a pure-Python interface for
+# the multiprocessing workers (which can't share GPU tensors across processes).
+# The numerical formulas are identical to the training pipeline — only the
+# representation (float vs Tensor) differs.
+def _compute_biquad_coeffs_unified(gain_db, freq, q, sr, filter_type_str):
+    """
+    Compute biquad coefficients using the same formulas as the training pipeline.
+
+    This function wraps `DifferentiableBiquadCascade.compute_biquad_coeffs_multitype`
+    to ensure numerical consistency between offline-generated data and training data.
+    """
+    # Use a single-band cascade for coefficient computation
+    cascade = DifferentiableBiquadCascade(num_bands=1, sample_rate=sr)
+    type_map = {
+        "peaking": FILTER_PEAKING,
+        "lowshelf": FILTER_LOWSHELF,
+        "highshelf": FILTER_HIGHSHELF,
+        "highpass": FILTER_HIGHPASS,
+        "lowpass": FILTER_LOWPASS,
+    }
+    type_idx = type_map[filter_type_str]
+
+    gain_t = torch.tensor([[gain_db]], dtype=torch.float32)
+    freq_t = torch.tensor([[freq]], dtype=torch.float32)
+    q_t = torch.tensor([[q]], dtype=torch.float32)
+    type_t = torch.tensor([[type_idx]], dtype=torch.long)
+
+    with torch.no_grad():
+        b0, b1, b2, a1, a2 = cascade.compute_biquad_coeffs_multitype(
+            gain_t, freq_t, q_t, type_t
+        )
+
+    return [
+        b0[0, 0].item(),
+        b1[0, 0].item(),
+        b2[0, 0].item(),
+        a1[0, 0].item(),
+        a2[0, 0].item(),
+    ]
+
+
+# Legacy aliases for backward compatibility (now delegate to unified implementation)
 def compute_biquad_coeffs_peaking(gain_db, freq, q, sr):
-    """Compute peaking biquad coefficients (Audio EQ Cookbook)."""
-    A = 10.0 ** (gain_db / 40.0)
-    w0 = 2.0 * math.pi * freq / sr
-    alpha = math.sin(w0) / (2.0 * q)
-
-    b0 = 1.0 + alpha * A
-    b1 = -2.0 * math.cos(w0)
-    b2 = 1.0 - alpha * A
-    a0 = 1.0 + alpha / A
-    a1 = -2.0 * math.cos(w0)
-    a2 = 1.0 - alpha / A
-
-    return [b0/a0, b1/a0, b2/a0, a1/a0, a2/a0]
+    return _compute_biquad_coeffs_unified(gain_db, freq, q, sr, "peaking")
 
 
 def compute_biquad_coeffs_lowshelf(gain_db, freq, q, sr):
-    """Compute low-shelf biquad coefficients."""
-    A = 10.0 ** (gain_db / 40.0)
-    w0 = 2.0 * math.pi * freq / sr
-    alpha = math.sin(w0) / (2.0 * q)
-    sqA = math.sqrt(A)
-
-    b0 = A * ((A + 1) - (A - 1) * math.cos(w0) + 2 * sqA * alpha)
-    b1 = 2 * A * ((A - 1) - (A + 1) * math.cos(w0))
-    b2 = A * ((A + 1) - (A - 1) * math.cos(w0) - 2 * sqA * alpha)
-    a0 = (A + 1) + (A - 1) * math.cos(w0) + 2 * sqA * alpha
-    a1 = -2 * ((A - 1) + (A + 1) * math.cos(w0))
-    a2 = (A + 1) + (A - 1) * math.cos(w0) - 2 * sqA * alpha
-
-    return [b0/a0, b1/a0, b2/a0, a1/a0, a2/a0]
+    return _compute_biquad_coeffs_unified(gain_db, freq, q, sr, "lowshelf")
 
 
 def compute_biquad_coeffs_highshelf(gain_db, freq, q, sr):
-    """Compute high-shelf biquad coefficients."""
-    A = 10.0 ** (gain_db / 40.0)
-    w0 = 2.0 * math.pi * freq / sr
-    alpha = math.sin(w0) / (2.0 * q)
-    sqA = math.sqrt(A)
-
-    b0 = A * ((A + 1) + (A - 1) * math.cos(w0) + 2 * sqA * alpha)
-    b1 = -2 * A * ((A - 1) + (A + 1) * math.cos(w0))
-    b2 = A * ((A + 1) + (A - 1) * math.cos(w0) - 2 * sqA * alpha)
-    a0 = (A + 1) - (A - 1) * math.cos(w0) + 2 * sqA * alpha
-    a1 = 2 * ((A - 1) - (A + 1) * math.cos(w0))
-    a2 = (A + 1) - (A - 1) * math.cos(w0) - 2 * sqA * alpha
-
-    return [b0/a0, b1/a0, b2/a0, a1/a0, a2/a0]
+    return _compute_biquad_coeffs_unified(gain_db, freq, q, sr, "highshelf")
 
 
 def compute_biquad_coeffs_highpass(freq, q, sr):
-    """Compute high-pass biquad coefficients."""
-    w0 = 2.0 * math.pi * freq / sr
-    alpha = math.sin(w0) / (2.0 * q)
-
-    b0 = (1 + math.cos(w0)) / 2
-    b1 = -(1 + math.cos(w0))
-    b2 = (1 + math.cos(w0)) / 2
-    a0 = 1 + alpha
-    a1 = -2 * math.cos(w0)
-    a2 = 1 - alpha
-
-    return [b0/a0, b1/a0, b2/a0, a1/a0, a2/a0]
+    return _compute_biquad_coeffs_unified(0.0, freq, q, sr, "highpass")
 
 
 def compute_biquad_coeffs_lowpass(freq, q, sr):
-    """Compute low-pass biquad coefficients."""
-    w0 = 2.0 * math.pi * freq / sr
-    alpha = math.sin(w0) / (2.0 * q)
-
-    b0 = (1 - math.cos(w0)) / 2
-    b1 = 1 - math.cos(w0)
-    b2 = (1 - math.cos(w0)) / 2
-    a0 = 1 + alpha
-    a1 = -2 * math.cos(w0)
-    a2 = 1 - alpha
-
-    return [b0/a0, b1/a0, b2/a0, a1/a0, a2/a0]
+    return _compute_biquad_coeffs_unified(0.0, freq, q, sr, "lowpass")
 
 
 COEFF_FUNCS = {
