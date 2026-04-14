@@ -738,7 +738,10 @@ class MultiTypeEQParameterHead(nn.Module):
         self.type_film_beta = nn.Parameter(torch.zeros(num_filter_types, hidden_dim))
 
         # Gumbel-Softmax temperature for differentiable type selection
-        self.register_buffer('gumbel_tau', torch.tensor(1.0))
+        # AUDIT FIX: Start at 0.5 (not 1.0) to provide meaningful type gradients
+        # from epoch 1. Lower tau = sharper softmax = more decisive type signal
+        # to the parameter head and loss function.
+        self.register_buffer('gumbel_tau', torch.tensor(0.5))
 
         # DC/Nyquist gain scale for shelf type evidence from per-band H_db.
         # DC gain is the analytically exact discriminant: lowshelf has gain at DC,
@@ -920,12 +923,11 @@ class MultiTypeEQParameterHead(nn.Module):
             nn.Linear(64, num_filter_types),
         )
         with torch.no_grad():
-            # Small peaking bias to counteract shelf_bias_head which adds
-            # logits to lowshelf/highshelf during forward. Without this,
-            # peaking gets systematically outcompeted. Bias: [peaking=0.5,
-            # lowshelf=0, highshelf=0, highpass=0, lowpass=0]
+            # AUDIT FIX: Initialize for truly uniform initial predictions.
+            # Zero bias + very small weights (gain=0.01) ensures all types
+            # start with nearly equal probability, preventing early collapse.
             self.type_head[-1].bias.zero_()
-            self.type_head[-1].bias[FILTER_PEAKING] = 0.5
+            nn.init.xavier_uniform_(self.type_head[-1].weight, gain=0.01)
 
         # Hierarchical two-stage type head (optional)
         if hierarchical_type_head:
@@ -1244,6 +1246,7 @@ class MultiTypeEQParameterHead(nn.Module):
         # ── Compute DC/Nyquist gain for shelf evidence (used by both paths) ──
         dc_gain = h_db_pred[:, :, 0]         # (B, N) gain at DC per band
         nyquist_gain = h_db_pred[:, :, -1]   # (B, N) gain at Nyquist per band
+        heuristic_scale = 0.1 if self.training else 1.0
 
         # ── Type logits: hierarchical or flat ──
         hier_aux = None  # Will hold (broad_logits, pass_logits, shelf_logits) if hierarchical
@@ -1271,10 +1274,18 @@ class MultiTypeEQParameterHead(nn.Module):
             dc_gate = torch.sigmoid((dc_gain.abs() - 0.5) * 2.0)
             nyq_gate = torch.sigmoid((nyquist_gain.abs() - 0.5) * 2.0)
             type_logits = type_logits.clone()
-            type_logits[..., FILTER_LOWSHELF] += dc_gain * dc_gate * self.dc_shelf_scale
-            type_logits[..., FILTER_HIGHSHELF] += nyquist_gain * nyq_gate * self.dc_shelf_scale
+            type_logits[..., FILTER_LOWSHELF] += (
+                dc_gain * dc_gate * self.dc_shelf_scale * heuristic_scale
+            )
+            type_logits[..., FILTER_HIGHSHELF] += (
+                nyquist_gain * nyq_gate * self.dc_shelf_scale * heuristic_scale
+            )
             peaking_gate = (1.0 - dc_gate) * (1.0 - nyq_gate)
-            type_logits[..., FILTER_PEAKING] += peaking_gate * self.dc_shelf_scale
+            # Center the peaking gate around zero to avoid a persistent positive
+            # peaking offset at initialization.
+            type_logits[..., FILTER_PEAKING] += (
+                (peaking_gate - 0.5) * self.dc_shelf_scale * heuristic_scale
+            )
         else:
             # Original flat 5-class type head
             type_logits = self.type_head(type_input)
@@ -1285,21 +1296,21 @@ class MultiTypeEQParameterHead(nn.Module):
                 shelf_attention = type_logits.new_zeros(
                     type_logits.shape[0], self.num_bands, self.n_mels
                 )
-            low_shelf_bias = shelf_bias[..., 0] * 0.1
-            high_shelf_bias = shelf_bias[..., 1] * 0.1
+            low_shelf_bias = shelf_bias[..., 0] * 0.1 * heuristic_scale
+            high_shelf_bias = shelf_bias[..., 1] * 0.1 * heuristic_scale
             type_logits = type_logits.clone()
             type_logits[..., FILTER_LOWSHELF] += low_shelf_bias
             type_logits[..., FILTER_HIGHSHELF] += high_shelf_bias
             type_logits[..., FILTER_PEAKING] -= 0.15 * (
                 shelf_bias[..., 0] + shelf_bias[..., 1]
-            )
+            ) * heuristic_scale
 
             # Direct non-learned shelf evidence from the feature map.
             if mel_profile is not None and self.n_shelf_bands > 0:
                 feature_map = self._compute_shelf_feature_map(mel_profile)  # (B, 3, n_mels)
                 prefix_suffix = feature_map[:, 0, :]  # (B, n_mels)
-                direct_lo = prefix_suffix[:, 0:1] * self.direct_shelf_scale  # (B, 1)
-                direct_hi = -prefix_suffix[:, -1:] * self.direct_shelf_scale  # (B, 1)
+                direct_lo = prefix_suffix[:, 0:1] * self.direct_shelf_scale * heuristic_scale  # (B, 1)
+                direct_hi = -prefix_suffix[:, -1:] * self.direct_shelf_scale * heuristic_scale  # (B, 1)
                 type_logits[..., FILTER_LOWSHELF] += direct_lo  # broadcast over bands
                 type_logits[..., FILTER_HIGHSHELF] += direct_hi
                 type_logits[..., FILTER_PEAKING] -= 0.5 * (direct_lo + direct_hi)
@@ -1307,10 +1318,18 @@ class MultiTypeEQParameterHead(nn.Module):
             # DC/Nyquist gain — gated to prevent h_db_head gaming
             dc_gate = torch.sigmoid((dc_gain.abs() - 0.5) * 2.0)
             nyq_gate = torch.sigmoid((nyquist_gain.abs() - 0.5) * 2.0)
-            type_logits[..., FILTER_LOWSHELF] += dc_gain * dc_gate * self.dc_shelf_scale
-            type_logits[..., FILTER_HIGHSHELF] += nyquist_gain * nyq_gate * self.dc_shelf_scale
+            type_logits[..., FILTER_LOWSHELF] += (
+                dc_gain * dc_gate * self.dc_shelf_scale * heuristic_scale
+            )
+            type_logits[..., FILTER_HIGHSHELF] += (
+                nyquist_gain * nyq_gate * self.dc_shelf_scale * heuristic_scale
+            )
             peaking_gate = (1.0 - dc_gate) * (1.0 - nyq_gate)
-            type_logits[..., FILTER_PEAKING] += peaking_gate * self.dc_shelf_scale
+            # Center the peaking gate around zero to avoid a persistent positive
+            # peaking offset at initialization.
+            type_logits[..., FILTER_PEAKING] += (
+                (peaking_gate - 0.5) * self.dc_shelf_scale * heuristic_scale
+            )
 
         if self.training:
             type_probs = F.gumbel_softmax(
@@ -1481,7 +1500,8 @@ class TypeGroupedParameterHead(nn.Module):
         self.log_f_min = math.log(20.0)
         self.log_f_max = math.log(20000.0)
 
-        self.register_buffer("gumbel_tau", torch.tensor(1.0))
+        # AUDIT FIX: Start at 0.5 (not 1.0) for meaningful type gradients
+        self.register_buffer("gumbel_tau", torch.tensor(0.5))
 
         # Trunk for base band embeddings
         self.trunk = nn.Sequential(

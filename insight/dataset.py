@@ -72,6 +72,7 @@ class SyntheticEQDataset(data.Dataset):
         freq_range=(20.0, 20000.0),
         q_range=(0.1, 10.0),
         type_weights=None,
+        one_band_probability=0.0,
         hp_lp_gain_target="zero",
         signal_types=("noise", "pink_noise", "sweep", "harmonic", "speech_like", "percussive"),
         signal_type_weights=None,  # AUDIT: V-09 — Add configurable signal type weights
@@ -93,6 +94,7 @@ class SyntheticEQDataset(data.Dataset):
         self.freq_range = freq_range
         self.q_range = q_range
         self.type_weights = type_weights or DEFAULT_TYPE_WEIGHTS
+        self.one_band_probability = float(max(0.0, min(1.0, one_band_probability)))
         # AUDIT: V-07 — Validate type weights sum to 1.0 (within tolerance)
         weight_sum = sum(self.type_weights)
         if abs(weight_sum - 1.0) > 1e-6:
@@ -213,6 +215,7 @@ class SyntheticEQDataset(data.Dataset):
             "freq_range": list(self.freq_range),
             "q_range": list(self.q_range),
             "type_weights": list(self.type_weights),
+            "one_band_probability": float(self.one_band_probability),
             "hp_lp_gain_target": self.hp_lp_gain_target,
             "signal_types": list(self.signal_types),
             "augment": bool(self.augment),
@@ -241,6 +244,7 @@ class SyntheticEQDataset(data.Dataset):
             "freq_range": list(self.freq_range),
             "q_range": list(self.q_range),
             "type_weights": list(self.type_weights),
+            "one_band_probability": float(self.one_band_probability),
             "signal_types": list(self.signal_types),
             # AUDIT: V-09 — Include signal type weights in hash for cache invalidation
             "signal_type_weights": {st: self.signal_type_weights.get(st, 0.0)
@@ -331,6 +335,17 @@ class SyntheticEQDataset(data.Dataset):
             for i, (old, new) in enumerate(zip(old_weights, self.type_weights)):
                 print(f"    {FILTER_NAMES[i]}: {old:.3f} -> {new:.3f}")
             print(f"    Sum: {sum(self.type_weights):.6f}")
+        if "one_band_probability" in stage:
+            prev_prob = self.one_band_probability
+            self.one_band_probability = float(
+                max(0.0, min(1.0, stage["one_band_probability"]))
+            )
+            print(
+                "  [curriculum] Band complexity mix: "
+                f"1-band={self.one_band_probability:.0%}, "
+                f"{self.num_bands}-band={1.0 - self.one_band_probability:.0%} "
+                f"(was {prev_prob:.0%}/{1.0 - prev_prob:.0%})"
+            )
 
     def _generate_dry_signal(self, signal_type, num_samples=None):
         N = self.num_samples if num_samples is None else int(num_samples)
@@ -444,8 +459,12 @@ class SyntheticEQDataset(data.Dataset):
         freqs = []
         qs = []
         types = []
+        active_mask = []
 
-        for _ in range(self.num_bands):
+        active_bands = 1 if random.random() < self.one_band_probability else self.num_bands
+        active_bands = max(1, min(self.num_bands, active_bands))
+
+        for _ in range(active_bands):
             ftype = random.choices(
                 range(NUM_FILTER_TYPES), weights=self.type_weights, k=1
             )[0]
@@ -479,6 +498,15 @@ class SyntheticEQDataset(data.Dataset):
             freqs.append(f)
             qs.append(q)
             types.append(ftype)
+            active_mask.append(True)
+
+        # Fill remaining slots with identity-like placeholders so tensor shapes stay fixed.
+        for _ in range(self.num_bands - active_bands):
+            gains.append(0.0)
+            freqs.append(self._log_uniform(self.freq_range[0], self.freq_range[1]))
+            qs.append(1.0)
+            types.append(FILTER_PEAKING)
+            active_mask.append(False)
 
         # Sort by frequency for canonical ordering
         order = sorted(range(len(freqs)), key=lambda i: freqs[i])
@@ -486,12 +514,14 @@ class SyntheticEQDataset(data.Dataset):
         freqs = [freqs[i] for i in order]
         qs = [qs[i] for i in order]
         types = [types[i] for i in order]
+        active_mask = [active_mask[i] for i in order]
 
         return (
             torch.tensor(gains, dtype=torch.float32),
             torch.tensor(freqs, dtype=torch.float32),
             torch.tensor(qs, dtype=torch.float32),
             torch.tensor(types, dtype=torch.long),
+            torch.tensor(active_mask, dtype=torch.bool),
         )
 
     def _sample_gain(self):
@@ -524,6 +554,83 @@ class SyntheticEQDataset(data.Dataset):
         """Sample from log-uniform distribution."""
         return math.exp(random.uniform(math.log(low), math.log(high)))
 
+    def _init_drift_monitoring(self):
+        """Initialize tracking buffers for data drift detection."""
+        self._type_samples = []  # Track filter type distribution
+        self._freq_samples = []  # Track frequency distribution
+        self._q_samples = []     # Track Q distribution
+
+    def _record_sample_for_drift(self, gain_db, freq, q, filter_type):
+        """Record a sample for drift monitoring (called after each generation)."""
+        if not hasattr(self, '_type_samples'):
+            self._init_drift_monitoring()
+
+        if len(self._type_samples) < 5000:
+            # filter_type can be a tensor (num_bands,) or a scalar
+            if isinstance(filter_type, torch.Tensor):
+                types = filter_type.tolist()
+                self._type_samples.extend(types)
+            else:
+                self._type_samples.append(int(filter_type))
+        if len(self._freq_samples) < 5000:
+            self._freq_samples.append(float(freq.mean().item() if isinstance(freq, torch.Tensor) else np.mean(freq)))
+        if len(self._q_samples) < 5000:
+            self._q_samples.append(float(q.mean().item() if isinstance(q, torch.Tensor) else np.mean(q)))
+
+    def check_distribution_drift(self, alert_threshold=0.15):
+        """
+        Check if the current data distribution has drifted from baseline.
+        Uses KL divergence for type distribution and relative deviation for continuous.
+
+        AUDIT: P2-16 — Alert if distribution deviates significantly from expected.
+
+        Returns:
+            dict with drift metrics and alerts
+        """
+        if not hasattr(self, '_type_samples') or len(self._type_samples) < 100:
+            return {"status": "insufficient_data", "samples": len(getattr(self, '_type_samples', []))}
+
+        drift_report = {"status": "ok", "alerts": []}
+
+        # Check type distribution
+        type_counts = np.bincount(self._type_samples, minlength=5).astype(float)
+        type_probs = type_counts / type_counts.sum()
+        expected_probs = np.array(self.type_weights)
+
+        # KL divergence from expected
+        kl_div = np.sum(expected_probs * np.log((expected_probs + 1e-10) / (type_probs + 1e-10)))
+        drift_report["type_kl_divergence"] = float(kl_div)
+
+        if kl_div > alert_threshold:
+            alert = f"Type distribution drifted: KL={kl_div:.4f} > threshold={alert_threshold}"
+            drift_report["alerts"].append(alert)
+            drift_report["status"] = "drift_detected"
+            drift_report["type_distribution"] = type_probs.tolist()
+
+        # Check frequency distribution (mean should be near geometric mean of bounds)
+        freq_mean = np.mean(self._freq_samples)
+        expected_freq_mean = np.sqrt(self.freq_range[0] * self.freq_range[1])  # Geometric mean
+        freq_deviation = abs(freq_mean - expected_freq_mean) / expected_freq_mean
+        drift_report["freq_deviation"] = float(freq_deviation)
+
+        if freq_deviation > 0.2:
+            alert = f"Frequency distribution drifted: deviation={freq_deviation:.2%}"
+            drift_report["alerts"].append(alert)
+            drift_report["status"] = "drift_detected"
+
+        # Check Q distribution
+        q_mean = np.mean(self._q_samples)
+        expected_q_mean = np.sqrt(self.q_range[0] * self.q_range[1])
+        q_deviation = abs(q_mean - expected_q_mean) / expected_q_mean
+        drift_report["q_deviation"] = float(q_deviation)
+
+        if q_deviation > 0.3:
+            alert = f"Q distribution drifted: deviation={q_deviation:.2%}"
+            drift_report["alerts"].append(alert)
+            drift_report["status"] = "drift_detected"
+
+        return drift_report
+
     def _log_gain_distribution(self):
         """
         Log the current gain distribution histogram.
@@ -546,6 +653,90 @@ class SyntheticEQDataset(data.Dataset):
         print(f"    histogram (20 bins): {hist}")
         # Reset to avoid unbounded memory growth
         self._gain_samples = []
+
+    # AUDIT: P2-16 — Data distribution monitoring and drift detection
+    def _init_drift_monitoring(self):
+        """Initialize tracking buffers for data drift detection."""
+        self._type_samples = []  # Track filter type distribution
+        self._freq_samples = []  # Track frequency distribution
+        self._q_samples = []     # Track Q distribution
+        self._drift_baseline = None  # Baseline distribution for drift detection
+
+    def _record_sample_for_drift(self, gain_db, freq, q, filter_type):
+        """Record a sample for drift monitoring (called after each generation)."""
+        if not hasattr(self, '_type_samples'):
+            self._init_drift_monitoring()
+
+        if len(self._type_samples) < 5000:  # Limit memory
+            remaining = 5000 - len(self._type_samples)
+            if isinstance(filter_type, torch.Tensor):
+                flat_types = filter_type.detach().reshape(-1)
+                for t in flat_types[:remaining]:
+                    self._type_samples.append(int(t.item()))
+            elif isinstance(filter_type, (list, tuple, np.ndarray)):
+                for t in list(filter_type)[:remaining]:
+                    self._type_samples.append(int(t))
+            else:
+                self._type_samples.append(int(filter_type))
+        if len(self._freq_samples) < 5000:
+            self._freq_samples.append(float(freq.mean().item() if isinstance(freq, torch.Tensor) else freq))
+        if len(self._q_samples) < 5000:
+            self._q_samples.append(float(q.mean().item() if isinstance(q, torch.Tensor) else q))
+
+    def _check_distribution_drift(self, alert_threshold=0.15):
+        """
+        Check if the current data distribution has drifted from baseline.
+        Uses KL divergence for type distribution and KS statistic for continuous.
+
+        AUDIT: P2-16 — Alert if distribution deviates significantly from expected.
+
+        Returns:
+            dict with drift metrics and alerts
+        """
+        if not hasattr(self, '_type_samples') or len(self._type_samples) < 100:
+            return {"status": "insufficient_data", "samples": len(getattr(self, '_type_samples', []))}
+
+        import numpy as np
+        drift_report = {"status": "ok", "alerts": []}
+
+        # Check type distribution
+        type_counts = np.bincount(self._type_samples, minlength=5).astype(float)
+        type_probs = type_counts / type_counts.sum()
+        expected_probs = np.array(self.type_weights)
+
+        # KL divergence from expected
+        kl_div = np.sum(expected_probs * np.log((expected_probs + 1e-10) / (type_probs + 1e-10)))
+        drift_report["type_kl_divergence"] = float(kl_div)
+
+        if kl_div > alert_threshold:
+            alert = f"Type distribution drifted: KL={kl_div:.4f} > threshold={alert_threshold}"
+            drift_report["alerts"].append(alert)
+            drift_report["status"] = "drift_detected"
+            drift_report["type_distribution"] = type_probs.tolist()
+
+        # Check frequency distribution (mean should be near geometric mean of bounds)
+        freq_mean = np.mean(self._freq_samples)
+        expected_freq_mean = np.sqrt(self.freq_range[0] * self.freq_range[1])  # Geometric mean
+        freq_deviation = abs(freq_mean - expected_freq_mean) / expected_freq_mean
+        drift_report["freq_deviation"] = float(freq_deviation)
+
+        if freq_deviation > 0.2:  # 20% deviation threshold
+            alert = f"Frequency distribution drifted: deviation={freq_deviation:.2%}"
+            drift_report["alerts"].append(alert)
+            drift_report["status"] = "drift_detected"
+
+        # Check Q distribution
+        q_mean = np.mean(self._q_samples)
+        expected_q_mean = np.sqrt(self.q_range[0] * self.q_range[1])
+        q_deviation = abs(q_mean - expected_q_mean) / expected_q_mean
+        drift_report["q_deviation"] = float(q_deviation)
+
+        if q_deviation > 0.3:  # 30% deviation threshold (Q has wider range)
+            alert = f"Q distribution drifted: deviation={q_deviation:.2%}"
+            drift_report["alerts"].append(alert)
+            drift_report["status"] = "drift_detected"
+
+        return drift_report
 
     def _apply_eq_freq_domain(self, dry_audio, gain_db, freq, q, filter_type):
         """Apply multi-type EQ in frequency domain."""
@@ -754,9 +945,9 @@ class SyntheticEQDataset(data.Dataset):
 
         render_fallback = False
         wet_audio = None
-        gain_db = freq = q = filter_type = None
+        gain_db = freq = q = filter_type = active_band_mask = None
         for _ in range(3):
-            gain_db, freq, q, filter_type = self._sample_multitype_params()
+            gain_db, freq, q, filter_type, active_band_mask = self._sample_multitype_params()
             wet_audio = self._apply_eq_freq_domain(
                 dry_audio,
                 gain_db,
@@ -779,6 +970,7 @@ class SyntheticEQDataset(data.Dataset):
             )
             q = torch.ones(self.num_bands, dtype=torch.float32)
             filter_type = torch.zeros(self.num_bands, dtype=torch.long)
+            active_band_mask = torch.ones(self.num_bands, dtype=torch.bool)
 
         if self.augment:
             wet_audio, dry_audio = self._augment_audio_pair(wet_audio, dry_audio)
@@ -790,12 +982,21 @@ class SyntheticEQDataset(data.Dataset):
             "freq": freq,
             "q": q,
             "filter_type": filter_type,
-            "active_band_mask": torch.ones(self.num_bands, dtype=torch.bool),
+            "active_band_mask": active_band_mask,
             "render_fallback": render_fallback,
         }
 
         if self.precompute_mels:
             result["wet_mel"] = self._audio_to_mel(wet_audio)
+
+        # AUDIT: P2-16 — Record sample for drift monitoring
+        if not render_fallback:
+            self._record_sample_for_drift(
+                gain_db[active_band_mask],
+                freq[active_band_mask],
+                q[active_band_mask],
+                filter_type[active_band_mask],
+            )
 
         return result
 

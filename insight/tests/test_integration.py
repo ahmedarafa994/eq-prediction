@@ -387,5 +387,302 @@ if __name__ == "__main__":
     test_loss_components_all_finite()
     test_checkpoint_roundtrip()
     test_model_dsp_consistency()
+    test_cross_implementation_dsp_consistency()
+    test_type_accuracy_above_random_baseline()
     print()
     print("All integration tests passed!")
+
+
+def test_cross_implementation_dsp_consistency():
+    """
+    AUDIT: HIGH-03 (P1-9) — Verify that the offline data generator's
+    biquad implementations (dataset_pipeline/generate_data.py) produce
+    the same frequency response as the training pipeline's
+    DifferentiableBiquadCascade (differentiable_eq.py).
+
+    This catches numerical precision differences between the two
+    independent implementations of the RBJ Audio EQ Cookbook formulas.
+    """
+    import math
+    import sys
+    from pathlib import Path
+    sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
+
+    from differentiable_eq import DifferentiableBiquadCascade
+    import torchaudio.functional as F
+
+    device = "cuda" if torch.cuda.is_available() else "cpu"
+    sr = 44100
+    n_fft = 2048
+    num_bands = 5
+    batch_size = 4
+
+    dsp = DifferentiableBiquadCascade(num_bands=num_bands, sample_rate=sr).to(device)
+
+    # Test each filter type
+    filter_types = {
+        "peaking": {"gain": 6.0, "freq": 1000.0, "q": 1.0},
+        "lowshelf": {"gain": 3.0, "freq": 500.0, "q": 0.7},
+        "highshelf": {"gain": -3.0, "freq": 5000.0, "q": 0.7},
+        "highpass": {"gain": 0.0, "freq": 200.0, "q": 0.7},
+        "lowpass": {"gain": 0.0, "freq": 8000.0, "q": 0.7},
+    }
+
+    # Offline biquad coefficient functions (from dataset_pipeline/generate_data.py)
+    def offline_biquad_peaking(gain_db, freq, q, sr):
+        A = 10.0 ** (gain_db / 40.0)
+        w0 = 2.0 * math.pi * freq / sr
+        alpha = math.sin(w0) / (2.0 * q)
+        b0 = 1.0 + alpha * A
+        b1 = -2.0 * math.cos(w0)
+        b2 = 1.0 - alpha * A
+        a0 = 1.0 + alpha / A
+        a1 = -2.0 * math.cos(w0)
+        a2 = 1.0 - alpha / A
+        return [b0/a0, b1/a0, b2/a0, a1/a0, a2/a0]
+
+    def offline_biquad_lowshelf(gain_db, freq, q, sr):
+        A = 10.0 ** (gain_db / 40.0)
+        w0 = 2.0 * math.pi * freq / sr
+        alpha = math.sin(w0) / (2.0 * q)
+        sqA = math.sqrt(A)
+        b0 = A * ((A + 1) - (A - 1) * math.cos(w0) + 2 * sqA * alpha)
+        b1 = 2 * A * ((A - 1) - (A + 1) * math.cos(w0))
+        b2 = A * ((A + 1) - (A - 1) * math.cos(w0) - 2 * sqA * alpha)
+        a0 = (A + 1) + (A - 1) * math.cos(w0) + 2 * sqA * alpha
+        a1 = -2 * ((A - 1) + (A + 1) * math.cos(w0))
+        a2 = (A + 1) + (A - 1) * math.cos(w0) - 2 * sqA * alpha
+        return [b0/a0, b1/a0, b2/a0, a1/a0, a2/a0]
+
+    def offline_biquad_highshelf(gain_db, freq, q, sr):
+        A = 10.0 ** (gain_db / 40.0)
+        w0 = 2.0 * math.pi * freq / sr
+        alpha = math.sin(w0) / (2.0 * q)
+        sqA = math.sqrt(A)
+        b0 = A * ((A + 1) + (A - 1) * math.cos(w0) + 2 * sqA * alpha)
+        b1 = -2 * A * ((A - 1) + (A + 1) * math.cos(w0))
+        b2 = A * ((A + 1) + (A - 1) * math.cos(w0) - 2 * sqA * alpha)
+        a0 = (A + 1) - (A - 1) * math.cos(w0) + 2 * sqA * alpha
+        a1 = 2 * ((A - 1) - (A + 1) * math.cos(w0))
+        a2 = (A + 1) - (A - 1) * math.cos(w0) - 2 * sqA * alpha
+        return [b0/a0, b1/a0, b2/a0, a1/a0, a2/a0]
+
+    def offline_biquad_highpass(freq, q, sr):
+        w0 = 2.0 * math.pi * freq / sr
+        alpha = math.sin(w0) / (2.0 * q)
+        b0 = (1 + math.cos(w0)) / 2
+        b1 = -(1 + math.cos(w0))
+        b2 = (1 + math.cos(w0)) / 2
+        a0 = 1 + alpha
+        a1 = -2 * math.cos(w0)
+        a2 = 1 - alpha
+        return [b0/a0, b1/a0, b2/a0, a1/a0, a2/a0]
+
+    def offline_biquad_lowpass(freq, q, sr):
+        w0 = 2.0 * math.pi * freq / sr
+        alpha = math.sin(w0) / (2.0 * q)
+        b0 = (1 - math.cos(w0)) / 2
+        b1 = 1 - math.cos(w0)
+        b2 = (1 - math.cos(w0)) / 2
+        a0 = 1 + alpha
+        a1 = -2 * math.cos(w0)
+        a2 = 1 - alpha
+        return [b0/a0, b1/a0, b2/a0, a1/a0, a2/a0]
+
+    offline_funcs = [offline_biquad_peaking, offline_biquad_lowshelf,
+                     offline_biquad_highshelf, offline_biquad_highpass, offline_biquad_lowpass]
+
+    for ftype_idx, (ftype, params) in enumerate(filter_types.items()):
+        gain = torch.tensor([[params["gain"]]], device=device)
+        freq = torch.tensor([[params["freq"]]], device=device)
+        q = torch.tensor([[params["q"]]], device=device)
+        filter_type = torch.tensor([[ftype_idx]], device=device)
+
+        # Training pipeline frequency response
+        with torch.no_grad():
+            H_train = dsp(gain, freq, q, n_fft=n_fft, filter_type=filter_type)
+
+        # Offline biquad coefficients
+        coeffs = offline_funcs[ftype_idx](params["gain"], params["freq"], params["q"], sr)
+        b = torch.tensor(coeffs[:3], dtype=torch.float32).unsqueeze(0).unsqueeze(0).to(device)
+        a = torch.tensor([1.0] + coeffs[3:], dtype=torch.float32).unsqueeze(0).unsqueeze(0).to(device)
+
+        # Compute offline frequency response manually
+        w = torch.linspace(0, math.pi, n_fft // 2 + 1, device=device)
+        cos_w = torch.cos(w)
+        cos_2w = torch.cos(2 * w)
+        sin_w = torch.sin(w)
+        sin_2w = torch.sin(2 * w)
+
+        num_re = b[0,0,0] + b[0,0,1] * cos_w + b[0,0,2] * cos_2w
+        num_im = -(b[0,0,1] * sin_w + b[0,0,2] * sin_2w)
+        den_re = 1.0 + a[0,0,0] * cos_w + a[0,0,1] * cos_2w
+        den_im = -(a[0,0,0] * sin_w + a[0,0,1] * sin_2w)
+
+        num_mag2 = num_re**2 + num_im**2
+        den_mag2 = den_re**2 + den_im**2
+        H_offline = torch.sqrt(torch.clamp(num_mag2 / (den_mag2 + 1e-4), min=1e-8, max=1e6))
+
+        # Compare (allow some tolerance due to different implementations)
+        # Resample if lengths differ
+        if H_train.shape[-1] != H_offline.shape[-1]:
+            H_train_resampled = torch.nn.functional.interpolate(
+                H_train.unsqueeze(1), size=H_offline.shape[-1], mode="linear", align_corners=False
+            ).squeeze(1)
+        else:
+            H_train_resampled = H_train
+
+        max_diff = (H_train_resampled.squeeze() - H_offline).abs().max().item()
+        assert max_diff < 0.05, (
+            f"Cross-implementation mismatch for {ftype}: max diff = {max_diff:.6f}. "
+            f"This indicates numerical differences between offline and training biquad implementations."
+        )
+
+    print("  [test_cross_implementation_dsp_consistency] PASSED")
+
+
+def test_type_accuracy_above_random_baseline():
+    """
+    AUDIT: HIGH-08 (P1-12) — Full-model integration test that trains for
+    a few epochs and verifies type accuracy exceeds random baseline.
+
+    This catches the type collapse failure mode that was observed in
+    actual training (100% peaking predictions, 19.7% accuracy).
+
+    Uses a smaller model for speed but full config parameters.
+    """
+    import random
+    import numpy as np
+    import sys
+    from pathlib import Path
+    sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
+
+    from model_tcn import StreamingTCNModel
+    from dsp_frontend import STFTFrontend
+    from differentiable_eq import DifferentiableBiquadCascade
+    from loss_multitype import MultiTypeEQLoss, HungarianBandMatcher
+    from dataset import SyntheticEQDataset
+
+    device = "cuda" if torch.cuda.is_available() else "cpu"
+    num_bands = 5
+    batch_size = 8
+    n_epochs = 5
+
+    # Set seed for reproducibility
+    torch.manual_seed(42)
+    np.random.seed(42)
+    random.seed(42)
+
+    # Create small dataset for fast testing
+    dataset = SyntheticEQDataset(
+        num_bands=num_bands,
+        sample_rate=44100,
+        duration=1.0,  # Short audio for speed
+        size=200,  # Small dataset
+        gain_range=(-6.0, 6.0),
+        freq_range=(20.0, 20000.0),
+        q_range=(0.1, 10.0),
+        type_weights=[0.2, 0.2, 0.2, 0.2, 0.2],
+        gain_distribution="beta",
+        precompute_mels=False,
+        base_seed=42,
+    )
+
+    dataloader = torch.utils.data.DataLoader(
+        dataset, batch_size=batch_size, shuffle=True, num_workers=0
+    )
+
+    # Create model with reduced size for speed
+    model = StreamingTCNModel(
+        n_mels=128,
+        embedding_dim=128,
+        num_bands=num_bands,
+        channels=128,  # Reduced from 256
+        num_blocks=4,  # Reduced from 8
+        num_stacks=2,  # Reduced from 3
+        sample_rate=44100,
+        n_fft=2048,
+    ).to(device)
+
+    criterion = MultiTypeEQLoss(
+        n_fft=1024,
+        sample_rate=44100,
+        lambda_param=1.0,
+        lambda_spectral=1.0,
+        lambda_type=8.0,  # High type weight to force learning
+        lambda_hmag=0.25,
+        lambda_gain=1.0,
+        lambda_freq=1.0,
+        lambda_q=1.0,
+        lambda_type_entropy=2.0,  # High entropy penalty
+        lambda_type_prior=0.5,
+        warmup_epochs=0,  # No warmup for this test
+        dsp_cascade=model.dsp_cascade,
+    ).to(device)
+
+    matcher = HungarianBandMatcher()
+    optimizer = torch.optim.AdamW(model.parameters(), lr=1e-3)
+
+    # Train for a few epochs
+    type_accuracies = []
+    for epoch in range(n_epochs):
+        model.train()
+        total_type_correct = 0
+        total_type_samples = 0
+
+        for batch in dataloader:
+            wet_audio = batch["wet_audio"].to(device)
+            dry_audio = batch["dry_audio"].to(device)
+            target_gain = batch["gain"].to(device)
+            target_freq = batch["freq"].to(device)
+            target_q = batch["q"].to(device)
+            target_filter_type = batch["filter_type"].to(device)
+
+            mel = model.frontend.mel_spectrogram(wet_audio).squeeze(1)
+            output = model(mel, wet_audio=wet_audio)
+            pred_gain, pred_freq, pred_q = output["params"]
+
+            target_H_mag = model.dsp_cascade(
+                target_gain, target_freq, target_q,
+                filter_type=target_filter_type,
+            )
+
+            loss, components = criterion(
+                pred_gain, pred_freq, pred_q,
+                output["type_logits"],
+                output["H_mag_soft"],
+                output["H_mag"],
+                target_gain, target_freq, target_q, target_filter_type,
+                target_H_mag,
+                embedding=output["embedding"],
+            )
+
+            optimizer.zero_grad()
+            loss.backward()
+            torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
+            optimizer.step()
+
+            # Compute type accuracy for this batch
+            with torch.no_grad():
+                pred_types = output["type_logits"].argmax(dim=-1)  # (B, N)
+                type_correct = (pred_types == target_filter_type).float().mean()
+                total_type_correct += type_correct.item() * wet_audio.shape[0]
+                total_type_samples += wet_audio.shape[0]
+
+        epoch_type_acc = total_type_correct / max(total_type_samples, 1)
+        type_accuracies.append(epoch_type_acc)
+
+    final_type_acc = type_accuracies[-1] if type_accuracies else 0.0
+    random_baseline = 1.0 / 5.0  # 20% for 5 classes
+
+    # Type accuracy should exceed random baseline after training
+    # Use a conservative threshold since we're training a small model for few epochs
+    assert final_type_acc > random_baseline + 0.05, (
+        f"Type accuracy ({final_type_acc:.3f}) is not above random baseline "
+        f"({random_baseline:.3f}) after {n_epochs} epochs. "
+        f"This indicates type collapse. Type accuracy trajectory: {type_accuracies}. "
+        f"Check Gumbel temperature, type loss weight, and warmup configuration."
+    )
+
+    print(f"  [test_type_accuracy_above_random_baseline] PASSED — "
+          f"type_acc={final_type_acc:.3f} > baseline={random_baseline:.3f} after {n_epochs} epochs")

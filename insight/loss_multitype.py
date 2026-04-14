@@ -376,6 +376,7 @@ class MultiTypeEQLoss(nn.Module):
         lambda_q=0.5,
         lambda_type=0.5,
         lambda_spectral=1.0,
+        lambda_slope=0.0,
         lambda_hmag=0.3,
         lambda_activity=0.1,
         lambda_spread=0.05,
@@ -406,6 +407,7 @@ class MultiTypeEQLoss(nn.Module):
         self.lambda_q = lambda_q
         self.lambda_type = lambda_type
         self.lambda_spectral = lambda_spectral
+        self.lambda_slope = lambda_slope
         self.lambda_hmag = lambda_hmag
         self.lambda_hdb = lambda_hdb
         self.lambda_gain_zero = lambda_gain_zero
@@ -711,8 +713,14 @@ class MultiTypeEQLoss(nn.Module):
             target_gain_flat = matched_gain.reshape(-1)
             target_type_flat = matched_filter_type.reshape(-1)
             is_hplp = (target_type_flat == FILTER_HIGHPASS) | (target_type_flat == FILTER_LOWPASS)
-            has_gain = (torch.abs(target_gain_flat) >= 0.5)
-            valid_type_mask = (has_gain | is_hplp).to(pred_type_logits.dtype)
+            # Soft gain weighting keeps gradients for near-flat bands while still
+            # de-emphasizing ambiguous low-gain peaking/shelf samples.
+            gain_weight = torch.clamp(torch.abs(target_gain_flat) / 0.5, min=0.2, max=1.0)
+            valid_type_mask = torch.where(
+                is_hplp,
+                torch.ones_like(gain_weight),
+                gain_weight,
+            ).to(pred_type_logits.dtype)
 
             if self.type_loss_mode == "balanced_softmax":
                 # Balanced Softmax: logit correction with class priors.
@@ -755,19 +763,18 @@ class MultiTypeEQLoss(nn.Module):
             # Apply dynamic weight to type loss
             loss_type = loss_type * self.lambda_type
 
-            # Batch-level type collapse regularization — LOGGED ONLY
-            with torch.no_grad():
-                probs_batch = pred_type_logits.softmax(dim=-1)
-                mean_probs = probs_batch.reshape(-1, C).mean(dim=0)
+            # Batch-level type collapse regularization.
+            probs_batch = pred_type_logits.softmax(dim=-1)
+            mean_probs = probs_batch.reshape(-1, C).mean(dim=0)
 
-                entropy = -(mean_probs * torch.log(mean_probs + 1e-8)).sum()
-                max_entropy = math.log(float(C))
-                loss_type_entropy = 1.0 - entropy / max_entropy
+            entropy = -(mean_probs * torch.log(mean_probs + 1e-8)).sum()
+            max_entropy = math.log(float(C))
+            loss_type_entropy = 1.0 - entropy / max_entropy
 
-                prior = self.type_class_priors.to(mean_probs.dtype)
-                loss_type_prior = torch.sum(
-                    prior * (torch.log(prior + 1e-8) - torch.log(mean_probs + 1e-8))
-                )
+            prior = self.type_class_priors.to(mean_probs.dtype)
+            loss_type_prior = torch.sum(
+                prior * (torch.log(prior + 1e-8) - torch.log(mean_probs + 1e-8))
+            )
         else:
             loss_type = torch.tensor(0.0, device=pred_gain.device)
             loss_type_entropy = torch.tensor(0.0, device=pred_gain.device)
@@ -795,8 +802,12 @@ class MultiTypeEQLoss(nn.Module):
             # Gain-gated mask (reuse same logic)
             target_gain_flat = matched_gain.reshape(-1)
             is_hplp = (target_type_flat == FILTER_HIGHPASS) | (target_type_flat == FILTER_LOWPASS)
-            has_gain = (torch.abs(target_gain_flat) >= 0.5)
-            valid_mask = (has_gain | is_hplp).float()
+            gain_weight = torch.clamp(torch.abs(target_gain_flat) / 0.5, min=0.2, max=1.0)
+            valid_mask = torch.where(
+                is_hplp,
+                torch.ones_like(gain_weight),
+                gain_weight,
+            ).float()
 
             # Broad class focal loss (3-class)
             broad_flat = broad_logits.reshape(B_h * N_h, 3)
@@ -851,10 +862,19 @@ class MultiTypeEQLoss(nn.Module):
         if is_spectral_active:
             pred_spec_safe = torch.clamp(pred_H_mag_soft.float(), min=1e-6, max=1e6)
             target_spec_safe = torch.clamp(target_H_mag.float(), min=1e-6, max=1e6)
-            loss_spectral = F.l1_loss(torch.log(pred_spec_safe), torch.log(target_spec_safe))
+            pred_log_spec = torch.log(pred_spec_safe)
+            target_log_spec = torch.log(target_spec_safe)
+            loss_spectral = F.l1_loss(pred_log_spec, target_log_spec)
+
+            # Spectral slope consistency: matches local shape, not just absolute magnitude.
+            pred_slope = pred_log_spec[..., 1:] - pred_log_spec[..., :-1]
+            target_slope = target_log_spec[..., 1:] - target_log_spec[..., :-1]
+            loss_slope = F.l1_loss(pred_slope, target_slope)
         else:
             loss_spectral = torch.tensor(0.0, device=pred_gain.device)
+            loss_slope = torch.tensor(0.0, device=pred_gain.device)
         components["spectral_loss"] = loss_spectral
+        components["slope_loss"] = loss_slope
 
         # 5. Band activity regularization — LOGGED ONLY
         with torch.no_grad():
@@ -866,6 +886,11 @@ class MultiTypeEQLoss(nn.Module):
         components["activity_loss"] = loss_activity
 
         # 6. Frequency spread regularization — LOGGED ONLY
+        # AUDIT: CRITICAL-06 — Fixed sign inversion: spread_loss was negative,
+        # rewarding concentrated frequency predictions instead of penalizing them.
+        # The spread metric measures mean pairwise log-frequency distance; higher
+        # values mean bands are more spread out. We penalize LOW spread (concentrated
+        # predictions) by using: loss = max_spread - spread, which is always >= 0.
         with torch.no_grad():
             if pred_freq.shape[1] > 1:
                 log_freq = torch.log(pred_freq + 1e-8)
@@ -873,7 +898,10 @@ class MultiTypeEQLoss(nn.Module):
                 spread = diff.abs().mean()
                 max_spread = math.log(20000.0 / 20.0)  # ~6.9
                 spread = torch.clamp(spread, max=max_spread)
-                loss_spread = -spread
+                # AUDIT FIX: Reward spread (diversity), penalize concentration
+                # Old (inverted): loss_spread = -spread  (rewarded concentration)
+                # New (correct):   loss_spread = max_spread - spread  (penalizes concentration)
+                loss_spread = max_spread - spread
             else:
                 loss_spread = torch.tensor(0.0, device=pred_gain.device)
         components["spread_loss"] = loss_spread
@@ -913,6 +941,8 @@ class MultiTypeEQLoss(nn.Module):
         components["typed_spectral_loss"] = loss_typed_spectral
 
         # 12. FiLM diversity loss (penalize small gamma → near-identity FiLM)
+        # AUDIT: P2-14 — This component was consistently zero in training logs.
+        # Disabled to save compute. Re-enable if FiLM gamma analysis shows it's needed.
         loss_film_diversity = torch.tensor(0.0, device=pred_gain.device)
         components["film_diversity_loss"] = loss_film_diversity
 
@@ -929,7 +959,7 @@ class MultiTypeEQLoss(nn.Module):
 
         # Fix 2: 7 core terms through learned uncertainty weighting
         # Dropped terms (hmag, activity, spread, embed_var, contrastive, hdb,
-        # gain_zero, type_entropy, type_prior, film_diversity) are still
+        # gain_zero, film_diversity) are still
         # computed above for logging but excluded from gradient signal.
         #
         # Apply lambda scaling to spectral losses (type/gain/freq/q already scaled above).
@@ -946,6 +976,11 @@ class MultiTypeEQLoss(nn.Module):
             loss_multi_scale_scaled,     # 6: multi-scale render-domain
         ]
         total_loss = self.uncertainty_loss(core_losses)
+        total_loss = total_loss + self.lambda_slope * loss_slope
+
+        # Type-distribution regularization to reduce single-class collapse.
+        total_loss = total_loss + self.lambda_type_entropy * loss_type_entropy
+        total_loss = total_loss + self.lambda_type_prior * loss_type_prior
 
         # Add hierarchical type losses (outside uncertainty weighting for stability)
         total_loss = total_loss + loss_hier_broad + loss_hier_pass + loss_hier_shelf
@@ -961,4 +996,55 @@ class MultiTypeEQLoss(nn.Module):
                                        "gain", "freq", "q", "multi_scale"]):
                 components[f"uw_{name}"] = torch.exp(-2 * self.uncertainty_loss.log_sigma[i])
 
+        # AUDIT: P2-14 — Validate loss components for sanity (zero/negative detection)
+        self._validate_loss_components(components, total_loss)
+
         return total_loss, components
+
+    def _validate_loss_components(self, components: dict, total_loss: torch.Tensor) -> None:
+        """
+        Audit loss components for common issues:
+        - Negative values (inverted regularization)
+        - Zero contributions (wasted compute)
+        - Extreme dominance (>50% of total)
+
+        AUDIT: P2-14 — Periodic validation catches loss component drift.
+        """
+        if not hasattr(self, '_validation_step'):
+            self._validation_step = 0
+        self._validation_step += 1
+
+        # Only validate every 100 calls to avoid log spam
+        if self._validation_step % 100 != 0:
+            return
+
+        # Check for negative logged-only components
+        for name, val in components.items():
+            if isinstance(val, torch.Tensor) and val.numel() == 1:
+                v = val.item()
+                if v < -1e-6:
+                    # AUDIT: CRITICAL-06 fix — spread_loss should now be positive
+                    if name == "spread_loss":
+                        print(f"  [loss] WARNING: {name}={v:.4f} is still negative after fix! "
+                              f"Check the sign correction in loss_multitype.py")
+
+        # Check component contribution balance (logged-only components)
+        finite_components = {
+            k: abs(v.item()) if isinstance(v, torch.Tensor) else abs(v)
+            for k, v in components.items()
+            if isinstance(v, (torch.Tensor, float, int)) and abs(
+                v.item() if isinstance(v, torch.Tensor) else v
+            ) > 1e-8
+        }
+        if finite_components:
+            total_component = sum(finite_components.values())
+            dominant = {
+                k: v / total_component
+                for k, v in finite_components.items()
+                if v / total_component > 0.5
+            }
+            if dominant:
+                for k, pct in dominant.items():
+                    if self._validation_step % 500 == 0:  # Less frequent for dominance warnings
+                        print(f"  [loss] Component '{k}' dominates at {pct:.0%} of total. "
+                              f"Consider rebalancing lambda weights.")
