@@ -98,6 +98,10 @@ class DifferentiableBiquadCascade(nn.Module):
         super().__init__()
         self.num_bands = num_bands
         self.sample_rate = sample_rate
+        # C-08: track how often alpha hits the 10.0 clamp ceiling
+        self._alpha_clamp_count = 0
+        # AUDIT: CRITICAL-01 V-02 — track H_mag clamping for diagnostics
+        self._hmag_clamp_count = 0
 
     def compute_biquad_coeffs(self, gain_db, freq, q):
         """
@@ -107,7 +111,18 @@ class DifferentiableBiquadCascade(nn.Module):
         """
         A = 10.0 ** (gain_db / 40.0)
         w0 = 2.0 * torch.pi * freq / self.sample_rate
-        alpha = torch.sin(w0) / (2.0 * q + 1e-8)
+        # AUDIT: CRITICAL-01 V-01 — Add epsilon to denominator to prevent division by zero
+        # when Q is near zero. Use 1e-4 for numerical stability.
+        alpha = torch.sin(w0) / (2.0 * q + 1e-4)
+        alpha_raw = alpha
+        # V-02: Clamp alpha to prevent extreme values at low Q — add both min and max bounds
+        # because alpha can also be too small, causing numerical issues in coefficient formulas
+        alpha = torch.clamp(alpha, min=1e-6, max=10.0)
+        # C-08: track alpha clamp hits (shared counter with multitype path)
+        self._alpha_clamp_count += int((alpha_raw > 10.0).any().item())
+        if self._alpha_clamp_count % 1000 == 0 and self._alpha_clamp_count > 0:
+            print(f"[C-08 WARN] DifferentiableBiquadCascade: alpha hit 10.0 clamp "
+                  f"{self._alpha_clamp_count} times total. Consider tightening Q floor.")
 
         b0 = 1.0 + alpha * A
         b1 = -2.0 * torch.cos(w0)
@@ -141,7 +156,16 @@ class DifferentiableBiquadCascade(nn.Module):
         w0 = 2.0 * torch.pi * freq / self.sample_rate
         cos_w0 = torch.cos(w0)
         sin_w0 = torch.sin(w0)
-        alpha = sin_w0 / (2.0 * q + 1e-8)
+        # AUDIT: CRITICAL-01 V-01 — Add epsilon to denominator to prevent division by zero
+        # when Q is near zero. Use 1e-4 for numerical stability.
+        alpha_raw = sin_w0 / (2.0 * q + 1e-4)
+        # V-02: Clamp alpha to prevent extreme values at low Q — add both min and max bounds
+        alpha = torch.clamp(alpha_raw, min=1e-6, max=10.0)
+        # C-08: track alpha clamp hits (shared counter with peaking path)
+        self._alpha_clamp_count += int((alpha_raw > 10.0).any().item())
+        if self._alpha_clamp_count % 1000 == 0 and self._alpha_clamp_count > 0:
+            print(f"[C-08 WARN] DifferentiableBiquadCascade: alpha hit 10.0 clamp "
+                  f"{self._alpha_clamp_count} times total. Consider tightening Q floor.")
         sqrt_A = torch.sqrt(torch.clamp(A, min=1e-8))
         two_sqrt_A_alpha = 2.0 * sqrt_A * alpha
 
@@ -185,89 +209,24 @@ class DifferentiableBiquadCascade(nn.Module):
         lp_a1 = -2.0 * cos_w0
         lp_a2 = 1.0 - alpha
 
-        # Select coefficients based on filter type using torch.where
-        ft = filter_type
-        b0 = torch.where(
-            ft == FILTER_PEAKING,
-            peak_b0,
-            torch.where(
-                ft == FILTER_LOWSHELF,
-                ls_b0,
-                torch.where(
-                    ft == FILTER_HIGHSHELF,
-                    hs_b0,
-                    torch.where(ft == FILTER_HIGHPASS, hp_b0, lp_b0),
-                ),
-            ),
-        )
-        b1 = torch.where(
-            ft == FILTER_PEAKING,
-            peak_b1,
-            torch.where(
-                ft == FILTER_LOWSHELF,
-                ls_b1,
-                torch.where(
-                    ft == FILTER_HIGHSHELF,
-                    hs_b1,
-                    torch.where(ft == FILTER_HIGHPASS, hp_b1, lp_b1),
-                ),
-            ),
-        )
-        b2 = torch.where(
-            ft == FILTER_PEAKING,
-            peak_b2,
-            torch.where(
-                ft == FILTER_LOWSHELF,
-                ls_b2,
-                torch.where(
-                    ft == FILTER_HIGHSHELF,
-                    hs_b2,
-                    torch.where(ft == FILTER_HIGHPASS, hp_b2, lp_b2),
-                ),
-            ),
-        )
-        a0 = torch.where(
-            ft == FILTER_PEAKING,
-            peak_a0,
-            torch.where(
-                ft == FILTER_LOWSHELF,
-                ls_a0,
-                torch.where(
-                    ft == FILTER_HIGHSHELF,
-                    hs_a0,
-                    torch.where(ft == FILTER_HIGHPASS, hp_a0, lp_a0),
-                ),
-            ),
-        )
-        a1 = torch.where(
-            ft == FILTER_PEAKING,
-            peak_a1,
-            torch.where(
-                ft == FILTER_LOWSHELF,
-                ls_a1,
-                torch.where(
-                    ft == FILTER_HIGHSHELF,
-                    hs_a1,
-                    torch.where(ft == FILTER_HIGHPASS, hp_a1, lp_a1),
-                ),
-            ),
-        )
-        a2 = torch.where(
-            ft == FILTER_PEAKING,
-            peak_a2,
-            torch.where(
-                ft == FILTER_LOWSHELF,
-                ls_a2,
-                torch.where(
-                    ft == FILTER_HIGHSHELF,
-                    hs_a2,
-                    torch.where(ft == FILTER_HIGHPASS, hp_a2, lp_a2),
-                ),
-            ),
-        )
+        # Select coefficients based on filter type using gather (single op vs 5 nested where)
+        b0_all = torch.stack([peak_b0, ls_b0, hs_b0, hp_b0, lp_b0], dim=-1)  # (B, N, 5)
+        b1_all = torch.stack([peak_b1, ls_b1, hs_b1, hp_b1, lp_b1], dim=-1)
+        b2_all = torch.stack([peak_b2, ls_b2, hs_b2, hp_b2, lp_b2], dim=-1)
+        a0_all = torch.stack([peak_a0, ls_a0, hs_a0, hp_a0, lp_a0], dim=-1)
+        a1_all = torch.stack([peak_a1, ls_a1, hs_a1, hp_a1, lp_a1], dim=-1)
+        a2_all = torch.stack([peak_a2, ls_a2, hs_a2, hp_a2, lp_a2], dim=-1)
+        ft_idx = filter_type.unsqueeze(-1)  # (B, N, 1)
+        b0 = b0_all.gather(-1, ft_idx).squeeze(-1)
+        b1 = b1_all.gather(-1, ft_idx).squeeze(-1)
+        b2 = b2_all.gather(-1, ft_idx).squeeze(-1)
+        a0 = a0_all.gather(-1, ft_idx).squeeze(-1)
+        a1 = a1_all.gather(-1, ft_idx).squeeze(-1)
+        a2 = a2_all.gather(-1, ft_idx).squeeze(-1)
 
         # Normalize by a0 (clamp to prevent near-zero division)
-        a0 = torch.clamp(a0, min=1e-4)
+        # M-05: floor raised from 1e-4 to 1e-3 for better numerical stability
+        a0 = torch.clamp(a0, min=1e-3)
         b0 = b0 / a0
         b1 = b1 / a0
         b2 = b2 / a0
@@ -303,7 +262,19 @@ class DifferentiableBiquadCascade(nn.Module):
         num_mag2 = num_re**2 + num_im**2
         den_mag2 = den_re**2 + den_im**2
 
-        H_mag = torch.sqrt(torch.clamp(num_mag2 / (den_mag2 + 1e-6), min=1e-10))
+        # AUDIT: CRITICAL-01 V-02 — Increased epsilon to 1e-3 for headroom against high-Q resonance
+        # Added upper-bound clamping to prevent inf propagation when den_mag2 is near zero
+        ratio = num_mag2 / (den_mag2 + 1e-3)
+        # Track and log clamping diagnostics
+        clamp_min_mask = ratio < 1e-8
+        clamp_max_mask = ratio > 1e6
+        if clamp_min_mask.any() or clamp_max_mask.any():
+            self._hmag_clamp_count += int((clamp_min_mask | clamp_max_mask).sum().item())
+            if self._hmag_clamp_count % 1000 == 0 and self._hmag_clamp_count > 0:
+                print(f"[V-02 WARN] DifferentiableBiquadCascade: H_mag hit clamping bounds "
+                      f"{self._hmag_clamp_count} times total (min=1e-8, max=1e6). "
+                      f"Consider checking for extreme gain/freq/Q values.")
+        H_mag = torch.sqrt(torch.clamp(ratio, min=1e-8, max=1e6))
 
         return H_mag
 
@@ -328,8 +299,10 @@ class DifferentiableBiquadCascade(nn.Module):
                 gain_db, freq, q, filter_type
             )
         H_mag_bands = self.freq_response(b0, b1, b2, a1, a2, n_fft)
-        H_mag_total = torch.prod(H_mag_bands, dim=1)
-        # Clamp to prevent inf/NaN from product of 5 bands
+        # M-10: log-space product prevents overflow from multiplying 5 bands
+        log_H = torch.log(H_mag_bands.clamp(min=1e-8))
+        log_H_total = log_H.sum(dim=1)
+        H_mag_total = torch.exp(log_H_total)
         H_mag_total = torch.clamp(H_mag_total, min=1e-6, max=1e4)
         return H_mag_total
 
@@ -358,7 +331,11 @@ class DifferentiableBiquadCascade(nn.Module):
 
         H_stack = torch.stack(H_per_type, dim=2)
         H_soft_bands = (H_stack * type_probs.unsqueeze(-1)).sum(dim=2)
-        H_mag_total = torch.clamp(H_soft_bands.prod(dim=1), min=1e-6, max=1e4)
+        # M-10: log-space product prevents overflow from multiplying 5 bands
+        log_H = torch.log(H_soft_bands.clamp(min=1e-8))
+        log_H_total = log_H.sum(dim=1)
+        H_mag_total = torch.exp(log_H_total)
+        H_mag_total = torch.clamp(H_mag_total, min=1e-6, max=1e4)
         return H_mag_total
 
     def process_audio(
@@ -674,6 +651,32 @@ class MultiTypeEQParameterHead(nn.Module):
     - Gain is type-aware: HP/LP gains are suppressed via type probabilities.
     - Frequency is mapped through type-specific log-frequency bounds.
     - Type prediction uses both global and per-band mel evidence.
+
+    ⚠️  TYPE COLLAPSE WARNING AND MITIGATION STRATEGY ⚠️
+    ─────────────────────────────────────────────────────
+    The type classification head is prone to "type collapse" — where the
+    model predicts a single filter type (typically peaking) for all bands,
+    achieving ~20% accuracy (random baseline for 5 types).
+
+    Root causes:
+    1. Gumbel temperature too high (tau > 1.0): makes softmax nearly
+       uniform, providing no discriminative signal to the parameter head.
+    2. lambda_type too low relative to parameter regression losses:
+       the optimizer prioritizes gain/freq/Q accuracy over type learning.
+    3. Detached type gradients during warmup: if type_logits are detached
+       from the gain gradient path during warmup, the encoder never learns
+       type-discriminative features.
+
+    Mitigations (see conf/config.yaml):
+    - gumbel.start_tau: 0.5 (NOT 2.0 — tau=2.0 is effectively uniform)
+    - curriculum.stages[0].lambda_type: 8.0 (strong type signal in stage 1)
+    - loss.lambda_type_entropy: 0.5 (penalizes peaked type distributions)
+    - loss.class_weight_multipliers: [1.0, 2.0, 2.0, 2.0, 2.0]
+      (boosts non-peaking type weights to counter peaking dominance)
+
+    If type accuracy stays below 25% after 10 epochs, the training run
+    should be terminated and the above parameters reviewed.
+    See tests/test_type_collapse.py for automated detection.
     """
 
     def __init__(
@@ -697,6 +700,7 @@ class MultiTypeEQParameterHead(nn.Module):
         self.n_shelf_bands = n_shelf_bands
         self.hierarchical_type_head = hierarchical_type_head
         self.n_fft_bins = n_fft // 2 + 1
+        print(f"  [model] hierarchical_type_head={hierarchical_type_head}")
         self.sample_rate = sample_rate
         self._dsp_cascade = dsp_cascade  # for Fix 5 shape features (plain attr, not submodule)
         self.log_f_min = FILTER_LOG_FREQ_BOUNDS[FILTER_PEAKING][0]

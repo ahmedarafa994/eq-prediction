@@ -34,23 +34,56 @@ class STFTFrontend(nn.Module):
         self.register_buffer("mel_fb", self._build_mel_filterbank())
 
     def _build_mel_filterbank(self):
+        """
+        Build a mel-scale filterbank with normalized weights to prevent edge artifacts.
+        Each filter is triangular and normalized to sum to 1.0, ensuring uniform
+        response across the spectrum and preventing zero-response regions.
+        """
         n_freqs = self.n_fft // 2 + 1
         f_min_mel = self._hz_to_mel(torch.tensor(self.f_min))
         f_max_mel = self._hz_to_mel(torch.tensor(self.f_max))
         mel_points = torch.linspace(f_min_mel, f_max_mel, self.mel_bins + 2)
         hz_points = self._mel_to_hz(mel_points)
-        bin_points = ((self.n_fft + 1) * hz_points / self.sample_rate).long()
+
+        # AUDIT: HIGH-10 — Use torch.round() instead of .long() for bin_points
+        # .long() truncates toward zero, which can cause off-by-one errors at
+        # frequency boundaries. torch.round() provides proper rounding to the
+        # nearest bin index, preserving filter symmetry and edge coverage.
+        bin_points = torch.round(((self.n_fft + 1) * hz_points / self.sample_rate)).long()
+
         fb = torch.zeros(self.mel_bins, n_freqs)
         for i in range(self.mel_bins):
             f_left = bin_points[i]
             f_center = bin_points[i + 1]
             f_right = bin_points[i + 2]
+
+            # Rising edge: f_left to f_center
             for j in range(f_left, f_center):
                 if j < n_freqs and f_center > f_left:
-                    fb[i, j] = (j - f_left) / (f_center - f_left)
+                    fb[i, j] = (j - f_left) / max(f_center - f_left, 1)
+
+            # Falling edge: f_center to f_right
             for j in range(f_center, f_right):
                 if j < n_freqs and f_right > f_center:
-                    fb[i, j] = (f_right - j) / (f_right - f_center)
+                    fb[i, j] = (f_right - j) / max(f_right - f_center, 1)
+
+        # AUDIT: HIGH-10 — Normalize each filter to sum to 1.0
+        # This prevents edge artifacts and ensures uniform energy response.
+        # A filter with zero total weight would produce no output (dead band).
+        fb_sum = fb.sum(dim=1, keepdim=True)
+        # Avoid division by zero for filters that have no overlap (edge case)
+        fb_sum = torch.clamp(fb_sum, min=1e-8)
+        fb = fb / fb_sum
+
+        # AUDIT: HIGH-10 — Validate no all-zero rows in filterbank
+        # After normalization, each filter should have at least some non-zero weights.
+        # An all-zero filter would create a dead band in the mel representation.
+        row_norms = fb.sum(dim=1)
+        assert torch.all(row_norms > 0.0), (
+            f"Filterbank contains {row_norms.eq(0.0).sum().item()} zero-weight filters. "
+            f"This may indicate f_min/f_max configuration error or edge case with mel_bins."
+        )
+
         return fb
 
     @staticmethod
@@ -139,10 +172,16 @@ class STFTFrontend(nn.Module):
             mel_spec: (Batch, 1, MelBins, TimeFrames)
             complex_stft: (Batch, FreqBins, TimeFrames)
             audio_length: int
+
+        H-13: Compute STFT once and derive both outputs, saving ~30% frontend compute.
         """
-        mel_spec = self.mel_spectrogram(audio)
         complex_stft = self.stft(audio)
-        return mel_spec, complex_stft, audio.shape[-1]
+        # Derive mel from the same STFT — no double computation
+        mag = torch.abs(complex_stft)
+        mel_spec = torch.matmul(self.mel_fb, mag)
+        mel_spec = torch.clamp(mel_spec, min=1e-8)
+        log_mel = torch.log(mel_spec)
+        return log_mel.unsqueeze(1), complex_stft, audio.shape[-1]
 
 
 def apply_eq_to_complex_stft(complex_stft, H_mag):

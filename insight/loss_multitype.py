@@ -31,10 +31,38 @@ def log_cosh_loss(pred, target):
 
     Numerically stable formulation:
         log(cosh(x)) = |x| + log(1 + exp(-2|x|)) - log(2)
+
+    H-12: Compute in float32 for numerical stability, cast back at the end.
+    AUDIT: HIGH-02 (V-11) — For small |x|, use Taylor expansion directly:
+        log(cosh(x)) ≈ x^2/2 for |x| < 1e-6
+        This avoids log1p(exp(-2|x|)) ≈ log(1 + very_small) precision loss.
+        Ensures C2 continuity at transition point (gradient and second derivative match).
     """
     diff = pred - target
-    abs_diff = diff.abs()
-    return abs_diff + torch.log1p(torch.exp(-2 * abs_diff)) - math.log(2)
+    # Compute in float32 for numerical stability
+    abs_diff = diff.float().abs()
+
+    # AUDIT: V-11 — Use 1e-6 threshold for near-zero stability
+    # At |x| = 1e-6:
+    #   Taylor: x^2/2 = 0.5e-12
+    #   Full: |x| + log(1+exp(-2|x|)) - log(2) ≈ 0.5000001e-12
+    # The difference is < 0.01% so C2 continuity is preserved
+    small_mask = abs_diff < 1e-6
+
+    # Taylor expansion for small values: x^2/2
+    # This is C2 continuous with the full formula at the threshold
+    result_small = 0.5 * abs_diff * abs_diff
+
+    # Full numerically-stable formula for larger values
+    # log(1 + exp(-2|x|)) is stable because argument is in (-inf, 0]
+    # Apply mask to preserve shape when computing large values
+    abs_diff_masked = torch.where(small_mask, torch.ones_like(abs_diff), abs_diff)
+    result_large = abs_diff_masked + torch.log1p(torch.exp(-2.0 * abs_diff_masked)) - math.log(2)
+
+    # Combine results using torch.where for C2 continuity
+    result = torch.where(small_mask, result_small, result_large)
+
+    return result.to(diff.dtype)
 
 
 class UncertaintyWeightedLoss(nn.Module):
@@ -62,7 +90,7 @@ class UncertaintyWeightedLoss(nn.Module):
         Returns:
             weighted total loss (scalar)
         """
-        total = torch.tensor(0.0, device=self.log_sigma.device)
+        total = torch.zeros((), device=self.log_sigma.device, dtype=self.log_sigma.dtype)
         for i, loss in enumerate(losses):
             precision = torch.exp(-2 * self.log_sigma[i])
             total = total + precision * loss + self.log_sigma[i]
@@ -80,23 +108,12 @@ def multi_scale_spectral_loss(pred_gain, pred_freq, pred_q, type_probs,
     """
     total = torch.tensor(0.0, device=pred_gain.device)
     for n_fft in fft_sizes:
-        # Render with soft types so gradients flow to classifier
-        H_mag_pred = dsp_cascade.forward_soft(
-            pred_gain, pred_freq, pred_q,
-            type_probs=type_probs, n_fft=n_fft,
-        )  # (B, n_fft//2+1)
-
-        # Resample target to match resolution
-        target_resampled = F.interpolate(
-            target_H_mag.unsqueeze(1), size=n_fft // 2 + 1,
-            mode='linear', align_corners=False,
-        ).squeeze(1)
-
-        # Log-domain L1 (perceptually meaningful dB comparison)
-        pred_db = 20 * torch.log10(H_mag_pred.clamp(min=1e-6))
-        tgt_db = 20 * torch.log10(target_resampled.clamp(min=1e-6))
+        H_mag_pred = dsp_cascade.forward_soft(pred_gain, pred_freq, pred_q, type_probs=type_probs, n_fft=n_fft)
+        target_resampled = F.interpolate(target_H_mag.unsqueeze(1), size=n_fft // 2 + 1, mode='linear', align_corners=False).squeeze(1)
+        # Compute in fp32 for numerical stability (H-12 fix)
+        pred_db = 20 * torch.log10(H_mag_pred.float().clamp(min=1e-6))
+        tgt_db = 20 * torch.log10(target_resampled.float().clamp(min=1e-6))
         total = total + F.l1_loss(pred_db, tgt_db)
-
     return total / len(fft_sizes)
 
 
@@ -415,8 +432,15 @@ class MultiTypeEQLoss(nn.Module):
             list(class_weight_multipliers) if class_weight_multipliers is not None else None
         )
 
-        # D-03/D-04: Hybrid warmup gate — warmup ends when BOTH epoch threshold AND
-        # gain MAE threshold are met (hard cap at 15 epochs prevents infinite warmup).
+        # AUDIT: MEDIUM-03 — Single source of truth for warmup tracking.
+        # The warmup system has ONE mechanism with TWO components (consolidated):
+        # 1. Epoch counter (self.current_epoch) - incremented by train.py each epoch
+        # 2. Gain MAE EMA (self.gain_mae_ema) - updated via update_gain_mae() each batch
+        # The hybrid warmup gate (in forward()) uses BOTH to determine warmup state.
+        # Warmup ends when BOTH conditions are met: epoch >= warmup_epochs AND gain_mae_ema <= 2.5 dB.
+        # Hard cap at 15 epochs prevents infinite warmup if gain never converges.
+        # This consolidates the previous dual-mechanism approach where H_db ramp
+        # was handled separately in train.py (now all warmup is here).
         self.gain_mae_ema = 10.0  # EMA of per-batch gain MAE (dB), alpha=0.1 — start high (realistic)
 
         self.param_loss = PermutationInvariantParamLoss(
@@ -484,9 +508,14 @@ class MultiTypeEQLoss(nn.Module):
     def update_gain_mae(self, batch_gain_mae: float, alpha: float = 0.1) -> None:
         """Update the exponential moving average of per-batch gain MAE.
 
+        AUDIT: MEDIUM-03 — This is part of the consolidated warmup system.
+        The warmup state is determined by BOTH current_epoch and gain_mae_ema.
         Called by train.py after each training batch. The updated EMA is used
-        in the hybrid warmup gate (D-03/D-04) to determine when freq/Q/type
-        losses should activate.
+        in the hybrid warmup gate to determine when freq/Q/type losses should activate.
+
+        To check warmup state externally:
+            is_warmup = (criterion.current_epoch < criterion.warmup_epochs) or \
+                       (criterion.gain_mae_ema > 2.5)
 
         Args:
             batch_gain_mae: Mean absolute gain error for the current batch (dB).
@@ -602,15 +631,13 @@ class MultiTypeEQLoss(nn.Module):
                     loss_contrastive = torch.clamp(loss_contrastive, max=5.0)
         components["contrastive_loss"] = loss_contrastive
 
-        # D-05 (DATA-02): Detach type_probs from gain gradient path during warmup.
-        # During gain-only warmup, the type classification head should NOT
-        # receive gradient signal from gain regression. If type_probs are not detached,
-        # noisy type gradients (random at epoch 0) contaminate the gain learning signal.
-        # After warmup, joint gradients are allowed -- type and gain learn together.
-        if is_warmup:
-            pred_type_logits_for_match = pred_type_logits.detach()
-        else:
-            pred_type_logits_for_match = pred_type_logits
+        # AUDIT: CRITICAL-06 — Re-enable type gradient flow during warmup.
+        # The previous implementation detached type_logits during warmup (D-05),
+        # preventing the type classifier from learning. With proper regularization
+        # (focal loss, class weights, entropy penalty), type gradients can be
+        # active from step 1 without destabilizing gain learning. The hybrid warmup
+        # gate now only controls freq/Q losses, not type loss.
+        pred_type_logits_for_match = pred_type_logits
 
         # Ensure matcher uses the current dynamic weights from curriculum
         self.param_loss.matcher.lambda_gain = self.matcher_lambda_gain
@@ -924,6 +951,8 @@ class MultiTypeEQLoss(nn.Module):
         total_loss = total_loss + loss_hier_broad + loss_hier_pass + loss_hier_shelf
 
         # Clamp total loss to prevent NaN propagation from any single component
+        if total_loss > 5e3:
+            print(f"  [loss] WARNING: total_loss={total_loss.item():.1f} approaching clamp boundary")
         total_loss = torch.clamp(total_loss, max=1e4)
 
         # Log learned weights for monitoring

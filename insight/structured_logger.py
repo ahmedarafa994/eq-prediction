@@ -3,10 +3,13 @@ Structured logging for training pipeline observability.
 
 AUDIT: CRITICAL-30 — Provides machine-readable JSON logs and optional
 WandB/TensorBoard integration for real-time metric visualization.
+AUDIT: MEDIUM-30 — Optional Prometheus metrics export for production monitoring.
+AUDIT: MEDIUM-29 — SLA tracking for epoch duration, GPU utilization, data loading overhead.
 """
 
 import json
 import math
+import time
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
@@ -14,6 +17,129 @@ from typing import Any
 
 def utc_now_iso() -> str:
     return datetime.now(timezone.utc).replace(microsecond=0).isoformat()
+
+
+# ---------------------------------------------------------------------------
+# Prometheus metrics (AUDIT: MEDIUM-30)
+# ---------------------------------------------------------------------------
+
+_PROMETHEUS_REGISTRY = None
+
+def _get_prometheus_registry():
+    """Get or create Prometheus registry (lazy init)."""
+    global _PROMETHEUS_REGISTRY
+    if _PROMETHEUS_REGISTRY is None:
+        try:
+            from prometheus_client import CollectorRegistry
+            _PROMETHEUS_REGISTRY = CollectorRegistry()
+        except ImportError:
+            pass
+    return _PROMETHEUS_REGISTRY
+
+
+class PrometheusMetrics:
+    """
+    Optional Prometheus metrics for ML training monitoring.
+
+    Usage:
+        metrics = PrometheusMetrics()
+        metrics.record_metric("training_loss", 0.5, labels={"component": "gain"})
+        metrics.start_http_server(port=9090)  # Optional: expose /metrics endpoint
+    """
+
+    def __init__(self):
+        self._initialized = False
+        self._gauges = {}
+        self._counters = {}
+        self._histograms = {}
+
+        try:
+            from prometheus_client import Gauge, Counter, Histogram
+            self._Gauge = Gauge
+            self._Counter = Counter
+            self._Histogram = Histogram
+            self._has_prometheus = True
+        except ImportError:
+            self._has_prometheus = False
+            return
+
+        reg = _get_prometheus_registry()
+        if reg is None:
+            self._has_prometheus = False
+            return
+
+        # Training metrics
+        self.training_loss = self._Gauge(
+            "idsp_training_loss", "Current training loss value",
+            ["component"], registry=reg,
+        )
+        self.validation_metric = self._Gauge(
+            "idsp_validation_metric", "Validation metric values",
+            ["metric_name"], registry=reg,
+        )
+        self.epoch_duration = self._Histogram(
+            "idsp_epoch_duration_seconds", "Time taken per epoch",
+            buckets=[30, 60, 120, 180, 300, 600], registry=reg,
+        )
+        self.data_loading_overhead = self._Histogram(
+            "idsp_data_loading_overhead_seconds", "Time spent on data loading per epoch",
+            buckets=[1, 5, 10, 30, 60, 120], registry=reg,
+        )
+        self.gpu_utilization = self._Gauge(
+            "idsp_gpu_utilization_percent", "GPU utilization percentage",
+            registry=reg,
+        )
+        self.gradient_norm = self._Gauge(
+            "idsp_gradient_norm", "Gradient norm per component",
+            ["component"], registry=reg,
+        )
+        self.alert_triggered = self._Counter(
+            "idsp_alert_total", "Total number of quality alerts triggered",
+            ["severity", "metric"], registry=reg,
+        )
+        self._initialized = True
+
+    def record_metric(self, name: str, value: float, labels: dict = None):
+        if not self._initialized:
+            return
+        try:
+            if "loss" in name.lower():
+                self.training_loss.labels(component=name).set(value)
+            elif any(m in name for m in ["val", "accuracy", "mae", "score"]):
+                self.validation_metric.labels(metric_name=name).set(value)
+        except Exception:
+            pass
+
+    def record_epoch_duration(self, seconds: float):
+        if self._initialized:
+            self.epoch_duration.observe(seconds)
+
+    def record_data_loading_overhead(self, seconds: float):
+        if self._initialized:
+            self.data_loading_overhead.observe(seconds)
+
+    def record_gpu_utilization(self, pct: float):
+        if self._initialized:
+            self.gpu_utilization.set(pct)
+
+    def record_gradient_norm(self, component: str, norm: float):
+        if self._initialized:
+            self.gradient_norm.labels(component=component).set(norm)
+
+    def record_alert(self, severity: str, metric: str):
+        if self._initialized:
+            self.alert_triggered.labels(severity=severity, metric=metric).inc()
+
+    def start_http_server(self, port: int = 9090):
+        """Expose /metrics endpoint for Prometheus scraping."""
+        if not self._initialized:
+            return
+        try:
+            from prometheus_client import start_http_server
+            start_http_server(port, registry=_get_prometheus_registry())
+            print(f"  [prometheus] Metrics server started on port {port}")
+        except Exception as e:
+            print(f"  [prometheus] Failed to start HTTP server: {e}")
 
 
 class StructuredLogger:
