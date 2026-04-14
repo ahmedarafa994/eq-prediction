@@ -262,9 +262,9 @@ class DifferentiableBiquadCascade(nn.Module):
         num_mag2 = num_re**2 + num_im**2
         den_mag2 = den_re**2 + den_im**2
 
-        # AUDIT: CRITICAL-01 V-02 — Increased epsilon to 1e-3 for headroom against high-Q resonance
-        # Added upper-bound clamping to prevent inf propagation when den_mag2 is near zero
-        ratio = num_mag2 / (den_mag2 + 1e-3)
+        # AUDIT: CRITICAL-01 V-02 — Epsilon 1e-4 prevents division-by-zero without attenuating
+        # legitimate shelf/filter responses. Upper-bound clamping catches resonance overflow.
+        ratio = num_mag2 / (den_mag2 + 1e-4)
         # Track and log clamping diagnostics
         clamp_min_mask = ratio < 1e-8
         clamp_max_mask = ratio > 1e6
