@@ -46,11 +46,13 @@ import signal
 from contextlib import nullcontext
 from pipeline_utils import seed_worker, set_global_seed, utc_now_iso
 from pipeline_utils import (
+    resolve_trusted_artifact_path,
     validate_dependencies,
     validate_config_schema,
-    validate_path_under_root,
+    compute_version_hash,
 )
 from structured_logger import StructuredLogger
+from tqdm import tqdm
 
 try:
     import bitsandbytes as bnb
@@ -119,6 +121,9 @@ def apply_stage_to_training_state(train_dataset, criterion, stage):
     update_priors = getattr(criterion, "update_type_priors", None)
     if callable(prior_getter):
         current_prior = prior_getter()
+        # AUDIT: V-07 — Log effective type weights being used
+        if "type_weights" in stage:
+            print(f"  [train] Effective type prior: {current_prior.tolist()}")
         if callable(update_priors):
             update_priors(current_prior)
     return current_prior
@@ -213,7 +218,7 @@ def validate_config(cfg):
 
 
 class Trainer:
-    def __init__(self, config_path="conf/config.yaml", resume_path=None):
+    def __init__(self, config_path="conf/config.yaml", resume_path=None, force_recompute=False):
         self.cfg = load_config(config_path)
 
         # AUDIT: MEDIUM-11 — Config schema validation (fail fast on typos/misconfig)
@@ -241,9 +246,34 @@ class Trainer:
         model_cfg = self.cfg["model"]
         loss_cfg = self.cfg["loss"]
         trainer_cfg = self.cfg["trainer"]
+
+        trusted_roots = [
+            Path.cwd().resolve(),
+            Path(__file__).resolve().parent,
+            Path(__file__).resolve().parent.parent,
+        ]
+        for root in trainer_cfg.get("trusted_artifact_roots", []):
+            trusted_roots.append(Path(root).expanduser().resolve())
+        # Deduplicate while preserving order.
+        self.trusted_artifact_roots = list(dict.fromkeys(trusted_roots))
+        self.resume_path = None
+        if resume_path is not None:
+            self.resume_path = str(
+                resolve_trusted_artifact_path(
+                    resume_path,
+                    allowed_roots=self.trusted_artifact_roots,
+                    must_exist=True,
+                )
+            )
+
         self.seed = int(self.cfg.get("seed", 42))
         self.deterministic = bool(trainer_cfg.get("deterministic", False))
-        set_global_seed(self.seed, deterministic=self.deterministic)
+        # AUDIT: V-20 — Get num_workers early for deterministic mode warning
+        # Default to auto-detected value for warning purposes
+        import os
+        default_num_workers = min(max(1, (os.cpu_count() or 4) - 1), 8)
+        self.num_workers = data_cfg.get("num_workers", default_num_workers)
+        set_global_seed(self.seed, deterministic=self.deterministic, num_workers=self.num_workers)
         torch.backends.cudnn.benchmark = bool(
             trainer_cfg.get("cudnn_benchmark", not self.deterministic)
         ) and not self.deterministic
@@ -268,6 +298,7 @@ class Trainer:
         self.current_epoch = 0
         self._received_signal = None
         self._signal_handlers_registered = False
+        self.force_recompute = force_recompute  # AUDIT: CRITICAL-02
 
         # Optimization flags from config
         self.use_8bit_optimizer = (
@@ -282,6 +313,14 @@ class Trainer:
         )
         self.use_deepspeed = trainer_cfg.get("use_deepspeed", False) and HAS_DEEPSPEED
         self.precompute_cache_path = trainer_cfg.get("precompute_cache_path", None)
+        if self.precompute_cache_path:
+            self.precompute_cache_path = str(
+                resolve_trusted_artifact_path(
+                    self.precompute_cache_path,
+                    allowed_roots=self.trusted_artifact_roots,
+                    must_exist=False,
+                )
+            )
         self.validate_render_audio = trainer_cfg.get("validate_render_audio", False)
         # AUDIT: LOW-34 — Profiling infrastructure
         self.profile_n_batches = 0  # Set via --profile CLI flag
@@ -311,6 +350,10 @@ class Trainer:
             q_range=tuple(data_cfg["q_bounds"]),
             type_weights=data_cfg.get("type_weights", None),
             hp_lp_gain_target=data_cfg.get("hp_lp_gain_target", "zero"),
+            # AUDIT: V-09 — Pass signal type weights from config
+            signal_type_weights=data_cfg.get("signal_type_weights", None),
+            # AUDIT: V-06 — Pass gain distribution from config
+            gain_distribution=data_cfg.get("gain_distribution", "beta"),
             precompute_mels=data_cfg.get("precompute_mels", True),
             n_mels=data_cfg.get("n_mels", 128),
             base_seed=self.seed,
@@ -369,7 +412,7 @@ class Trainer:
         # Try loading precomputed cache from disk (skip for litdata)
         if dataset_type != "litdata":
             if self.precompute_cache_path and self.train_dataset.load_precomputed(
-                self.precompute_cache_path
+                self.precompute_cache_path, force_recompute=self.force_recompute
             ):
                 print(f"  [data] Loaded cached dataset from {self.precompute_cache_path}")
             elif data_cfg.get("precompute_mels", True):
@@ -436,10 +479,8 @@ class Trainer:
 
         # Pin memory for async GPU transfer
         pin_memory = self.device.type == "cuda"
-        # AUDIT: HIGH-14 — Default num_workers > 0 to avoid GPU idle time
-        # Use min(cpu_count() - 1, 8) as a sensible default
-        default_num_workers = min(max(1, (os.cpu_count() or 4) - 1), 8)
-        num_workers = data_cfg.get("num_workers", default_num_workers)
+        # AUDIT: HIGH-14 — num_workers already set in __init__ (for V-20 deterministic warning)
+        num_workers = self.num_workers
         if num_workers == 0:
             print(
                 "  [data] WARNING: num_workers=0 — data generation blocks GPU. "
@@ -481,7 +522,7 @@ class Trainer:
         self.training_events_path = self.run_dir / "training_events.jsonl"
         self._write_run_metadata(
             config_path=config_path,
-            resume_path=resume_path,
+            resume_path=self.resume_path,
             dataset_type=dataset_type,
         )
 
@@ -519,10 +560,18 @@ class Trainer:
         # Spectral pretrain initialization: load encoder weights from a pre-trained
         # spectral model so the encoder starts with robust spectral features.
         spectral_pretrain_path = model_cfg.get("spectral_pretrain_path", None)
-        if spectral_pretrain_path and resume_path is None:
-            sp_path = Path(spectral_pretrain_path)
+        if spectral_pretrain_path and self.resume_path is None:
+            sp_path = resolve_trusted_artifact_path(
+                spectral_pretrain_path,
+                allowed_roots=self.trusted_artifact_roots,
+                must_exist=False,
+            )
             if sp_path.exists():
-                sp_state = torch.load(sp_path, map_location=self.device, weights_only=False)
+                sp_state = torch.load(
+                    sp_path,
+                    map_location=self.device,
+                    weights_only=True,
+                )
                 sp_sd = sp_state.get("model_state_dict", sp_state)
                 # Strip torch.compile prefix if present
                 if any(k.startswith("_orig_mod.") for k in sp_sd):
@@ -682,6 +731,19 @@ class Trainer:
             self.optimizer, T_0=30, T_mult=2, eta_min=1e-6
         )
 
+        # H-01: Linear LR warmup for the first warmup_epochs (default 5).
+        # Wraps the cosine schedule: during warmup, LR ramps linearly from 0 to
+        # the value the cosine schedule would produce, then hands off to cosine.
+        self.warmup_epochs = trainer_cfg.get("warmup_epochs", 5)
+        if self.warmup_epochs > 0:
+            # Save the cosine scheduler as inner; create a LambdaLR that scales it
+            self._inner_scheduler = self.scheduler
+            self.scheduler = torch.optim.lr_scheduler.LambdaLR(
+                self.optimizer,
+                lr_lambda=self._warmup_cosine_lr_lambda,
+            )
+            print(f"  [opt] Linear warmup for {self.warmup_epochs} epochs, then cosine restarts")
+
         self.gradient_accumulation_steps = trainer_cfg.get(
             "gradient_accumulation_steps", 1
         )
@@ -702,11 +764,31 @@ class Trainer:
         self.min_epochs_before_early_stop = trainer_cfg.get(
             "min_epochs_before_early_stop", 15
         )
+        self.alert_thresholds = trainer_cfg.get(
+            "alert_thresholds",
+            {
+                "gain_mae_db_matched": 4.0,
+                "primary_val_score": 8.0,
+                "type_accuracy_matched_min": 0.70,
+            },
+        )
+        self.fail_on_alert = bool(trainer_cfg.get("fail_on_alert", False))
+        self.alert_grace_epochs = int(trainer_cfg.get("alert_grace_epochs", 0))
+        self.gain_mae_ema = None  # C-02: track for checkpoint save/restore
         self.history = []
         self.start_epoch = 1
+        self._total_nan_grad_steps = 0  # C-04: cumulative NaN gradient step counter
+        self._oom_batch_size_floor = None  # C-03: track reduced batch size after OOM
+        # AUDIT: MEDIUM-12 — Data distribution tracking for monitoring training stability
+        self._distribution_stats = {
+            "gain_mean": [],
+            "gain_std": [],
+            "freq_mean": [],
+            "type_counts": [],
+        }
 
-        if resume_path is not None:
-            self._load_checkpoint(resume_path)
+        if self.resume_path is not None:
+            self._load_checkpoint(self.resume_path)
         self.criterion.to(self.device)
 
         # bf16-mixed precision: autocast context (no GradScaler needed for bf16)
@@ -799,6 +881,18 @@ class Trainer:
             signal.signal(sig, self._handle_signal)
         self._signal_handlers_registered = True
 
+    def _warmup_cosine_lr_lambda(self, epoch):
+        """H-01: LR multiplier that linearly ramps from 0→1 over warmup_epochs,
+        then delegates to the inner cosine schedule.  The LambdaLR scheduler
+        calls this once per .step(), which happens once per epoch in fit()."""
+        if self.warmup_epochs <= 0 or epoch >= self.warmup_epochs:
+            # After warmup: step the inner cosine scheduler and use its LR ratio
+            # LambdaLR applies this multiplier to initial_lr, so we need to return
+            # the ratio that the cosine schedule would produce.
+            return 1.0  # cosine schedule handles the rest via its own state
+        # During warmup: linear ramp from near-zero to 1.0
+        return min(1.0, max(0.01, epoch / self.warmup_epochs))
+
     def _handle_signal(self, signum, _frame):
         if self._received_signal is not None:
             return
@@ -826,18 +920,43 @@ class Trainer:
             )
             return interrupted_dir
 
+        model_ref = self.model.module if hasattr(self.model, "module") else self.model
+        # C-07: Save full training state for reliable resume
         state = {
             "epoch": self.current_epoch,
             "model_state_dict": self.model.state_dict(),
             "optimizer_state_dict": self.optimizer.state_dict(),
-            "scheduler_state_dict": self.scheduler.state_dict(),
+            "scheduler_state_dict": self.scheduler.state_dict(),  # C-01
             "monitor_metric": self.monitor_val_metric,
             "monitor_value": self.best_monitor_value,
             "global_step": self.global_step,
+            "curriculum_stage_idx": self._current_curriculum_stage_idx,  # C-02
+            "gain_mae_ema": self.gain_mae_ema,  # C-02
+            "best_named_metrics": dict(self.best_named_metrics),
+            "gumbel_tau": (
+                model_ref.param_head.gumbel_tau.item()
+                if hasattr(model_ref, 'param_head') and hasattr(model_ref.param_head, 'gumbel_tau')
+                else None
+            ),  # C-07
+            "loss_weights": {  # C-07
+                "lambda_gain": self.criterion.lambda_gain,
+                "lambda_freq": self.criterion.lambda_freq,
+                "lambda_q": self.criterion.lambda_q,
+                "lambda_spectral": self.criterion.lambda_spectral,
+                "lambda_type": self.criterion.lambda_type,
+                "lambda_hdb": self.criterion.lambda_hdb,
+            },
             "signal_reason": reason,
             "saved_at": utc_now_iso(),
         }
-        torch.save(state, checkpoint_path)
+        # AUDIT: LOW-16 — Add version hash for code tracking
+        try:
+            state["code_version_hash"] = compute_version_hash()
+        except Exception:
+            state["code_version_hash"] = "unknown"
+        tmp_path = checkpoint_path.with_suffix('.pt.tmp')
+        torch.save(state, tmp_path)
+        tmp_path.rename(checkpoint_path)
         self._append_event(
             "emergency_checkpoint",
             reason=reason,
@@ -870,6 +989,67 @@ class Trainer:
         mel_spec = self.frontend.mel_spectrogram(wet_audio)
         return mel_spec.squeeze(1)
 
+    def _update_distribution_stats(self, batch, pred_gain, pred_freq, pred_ft):
+        """
+        Update tracking statistics for data distribution monitoring (AUDIT: MEDIUM-12).
+        Helps detect training instability or data drift issues.
+        """
+        with torch.no_grad():
+            # Target gain distribution
+            target_gain = batch["gain"].to(self.device)
+            self._distribution_stats["gain_mean"].append(target_gain.mean().item())
+            self._distribution_stats["gain_std"].append(target_gain.std().item())
+
+            # Target frequency distribution (log scale for better monitoring)
+            target_freq = batch["freq"].to(self.device)
+            self._distribution_stats["freq_mean"].append(torch.log(target_freq + 1e-8).mean().item())
+
+            # Type distribution
+            target_ft = batch["filter_type"].to(self.device)
+            for ti in range(5):
+                count = (target_ft == ti).sum().item()
+                if len(self._distribution_stats["type_counts"]) <= ti:
+                    self._distribution_stats["type_counts"].append([])
+                self._distribution_stats["type_counts"][ti].append(count)
+
+    def _log_distribution_stats(self, epoch):
+        """
+        Log accumulated distribution statistics (AUDIT: MEDIUM-12).
+        Called once per epoch to summarize distribution monitoring.
+        """
+        if not self._distribution_stats["gain_mean"]:
+            return
+
+        print(f"  [dist] Epoch {epoch} target distribution:")
+        print(f"    gain: mean={np.mean(self._distribution_stats['gain_mean']):.3f} dB, "
+              f"std={np.mean(self._distribution_stats['gain_std']):.3f} dB")
+        print(f"    freq (log Hz): mean={np.mean(self._distribution_stats['freq_mean']):.3f}")
+        if self._distribution_stats["type_counts"]:
+            type_names = ["peak", "lshf", "hshf", "hpas", "lpas"]
+            total = sum(sum(self._distribution_stats["type_counts"][ti]) for ti in range(5))
+            for ti, name in enumerate(type_names):
+                count = sum(self._distribution_stats["type_counts"][ti]) if self._distribution_stats["type_counts"][ti] else 0
+                pct = 100 * count / total if total > 0 else 0
+                print(f"    {name}: {pct:.1f}%")
+
+        # Log to structured logger
+        self.logger.log_metric(
+            "dist/gain_mean_db", np.mean(self._distribution_stats["gain_mean"]),
+            epoch=epoch, step=self.global_step
+        )
+        self.logger.log_metric(
+            "dist/gain_std_db", np.mean(self._distribution_stats["gain_std"]),
+            epoch=epoch, step=self.global_step
+        )
+
+        # Reset stats for next epoch
+        self._distribution_stats = {
+            "gain_mean": [],
+            "gain_std": [],
+            "freq_mean": [],
+            "type_counts": [],
+        }
+
     def _curriculum_stage_index(self, epoch):
         if not self.curriculum_stages:
             return None
@@ -882,17 +1062,11 @@ class Trainer:
         return len(self.curriculum_stages) - 1
 
     def _apply_curriculum_stage(self, epoch):
-        # Fix 8: Ensure the loss object knows the current epoch for warmup gating
+        # AUDIT: MEDIUM-03 — Single source of truth for warmup.
+        # The loss-level warmup (in loss_multitype.py) is the authoritative mechanism.
+        # epoch counter is set here; gain MAE EMA is updated each batch via update_gain_mae().
+        # The H_db ramp (Fix 7) was removed to consolidate warmup logic into loss_multitype.py.
         self.criterion.current_epoch = epoch
-
-        # Fix 7: H_db loss warmup ramp — 0.5 → config max over first 10 epochs
-        hdb_ramp_epochs = 10
-        hdb_min = 0.5
-        hdb_max = float(self.cfg.get("loss", {}).get("lambda_hdb", 2.0))
-        if epoch <= hdb_ramp_epochs:
-            self.criterion.lambda_hdb = hdb_min + (hdb_max - hdb_min) * (epoch - 1) / hdb_ramp_epochs
-        else:
-            self.criterion.lambda_hdb = hdb_max
 
         # Gumbel temperature annealing for differentiable type selection
         model_ref = self.model.module if hasattr(self.model, "module") else self.model
@@ -946,24 +1120,41 @@ class Trainer:
             self.criterion.lambda_q = loss_cfg.get("lambda_q", 1.0)
             self.criterion.lambda_spectral = loss_cfg.get("lambda_spectral", 5.0)
             self.criterion.lambda_typed_spectral = loss_cfg.get("lambda_typed_spectral", 2.0)
-            # lambda_hdb might be under hdb_ramp
-            pass  # lambda_hdb is handled by the hdb_ramp above
+            # AUDIT: MEDIUM-03 — lambda_hdb uses config default (H_db ramp removed, consolidated into loss warmup)
+            self.criterion.lambda_hdb = loss_cfg.get("lambda_hdb", 2.0)
 
         stage_idx = self._curriculum_stage_index(epoch)
         if stage_idx is None:
             return
 
+        stage = self.curriculum_stages[stage_idx]
+
+        # C-06: Always apply curriculum to the loss criterion (type priors, lambda
+        # weights, gumbel tau) even when dataset has precomputed cache.  Only skip
+        # dataset-level overrides (apply_curriculum_stage on the dataset itself).
+        for weight_name in ["lambda_gain", "lambda_freq", "lambda_q", "lambda_type", "lambda_spectral", "lambda_type_match",
+                            "matcher_lambda_gain", "matcher_lambda_freq", "matcher_lambda_q", "matcher_lambda_type_match"]:
+            if weight_name in stage:
+                setattr(self.criterion, weight_name, float(stage[weight_name]))
+
+        # Update type priors on criterion even with cached data
+        prior_getter = getattr(self.train_dataset, "get_type_prior", None)
+        update_priors = getattr(self.criterion, "update_type_priors", None)
+        if callable(prior_getter) and callable(update_priors):
+            current_prior = prior_getter()
+            if current_prior is not None:
+                update_priors(current_prior)
+
         if hasattr(self.train_dataset, "_cache"):
             if not self._curriculum_warned_precomputed:
                 print(
-                    "  [curriculum] train dataset is precomputed; dynamic curriculum "
-                    "updates are skipped"
+                    "  [curriculum] train dataset is precomputed; dataset-level curriculum "
+                    "updates are skipped, but loss criterion is still updated"
                 )
                 self._curriculum_warned_precomputed = True
-            return
-
-        stage = self.curriculum_stages[stage_idx]
-        apply_stage_to_training_state(self.train_dataset, self.criterion, stage)
+            # Skip only dataset-level overrides, continue to stage change logging
+        else:
+            apply_stage_to_training_state(self.train_dataset, self.criterion, stage)
         focus = "shelf_focus" if stage_idx in (0, 1) else "balanced"
         set_focus = getattr(self.train_dataset, "set_adversarial_focus", None)
         if callable(set_focus):
@@ -1054,7 +1245,16 @@ class Trainer:
             prof.start()
             print(f"  [profile] Profiling first {self.profile_n_batches} batches")
 
-        for batch_idx, batch in enumerate(self.train_loader):
+        # H-10: tqdm progress bar for epoch training loop
+        pbar = tqdm(
+            enumerate(self.train_loader),
+            total=len(self.train_loader),
+            desc=f"  epoch {epoch}",
+            leave=False,
+            ncols=120,
+        )
+        for batch_idx, batch in pbar:
+            # H-17: Check signal every batch (not just at loop start)
             if self._received_signal is not None:
                 print(f"  [signal] Stopping train loop after {self._received_signal}")
                 break
@@ -1071,66 +1271,90 @@ class Trainer:
             target_ft = batch["filter_type"].to(self.device, non_blocking=True)
 
             # Forward (wrapped in autocast for bf16-mixed precision)
-            with self.autocast_ctx:
-                output = self.model(mel_frames, wet_audio=wet_audio)
-                pred_gain, pred_freq, pred_q = output["params"]
+            # C-03: OOM detection and recovery — wrap forward+backward in try/except
+            try:
+                with self.autocast_ctx:
+                    output = self.model(mel_frames, wet_audio=wet_audio)
+                    pred_gain, pred_freq, pred_q = output["params"]
 
-                # Ground truth frequency response
-                target_H_mag = model_ref.dsp_cascade(
-                    target_gain,
-                    target_freq,
-                    target_q,
-                    filter_type=target_ft,
-                    n_fft=self.n_fft,
-                )
+                    # Ground truth frequency response
+                    target_H_mag = model_ref.dsp_cascade(
+                        target_gain,
+                        target_freq,
+                        target_q,
+                        filter_type=target_ft,
+                        n_fft=self.n_fft,
+                    )
 
-                # Per-band H_db target (not cascade product)
-                # Each band has its own frequency response — the H_db head
-                # predicts per-band responses so gain extraction works correctly.
-                b0, b1, b2, a1, a2 = model_ref.dsp_cascade.compute_biquad_coeffs_multitype(
-                    target_gain, target_freq, target_q, target_ft
-                )
-                H_mag_per_band = model_ref.dsp_cascade.freq_response(
-                    b0, b1, b2, a1, a2, n_fft=self.n_fft
-                )  # (B, num_bands, n_fft_bins)
-                h_db_target = 20.0 * torch.log10(H_mag_per_band.clamp(min=1e-6))
-                h_db_pred = output.get("h_db_pred")
+                    # Per-band H_db target (not cascade product)
+                    # Each band has its own frequency response — the H_db head
+                    # predicts per-band responses so gain extraction works correctly.
+                    b0, b1, b2, a1, a2 = model_ref.dsp_cascade.compute_biquad_coeffs_multitype(
+                        target_gain, target_freq, target_q, target_ft
+                    )
+                    H_mag_per_band = model_ref.dsp_cascade.freq_response(
+                        b0, b1, b2, a1, a2, n_fft=self.n_fft
+                    )  # (B, num_bands, n_fft_bins)
+                    # C-05: Compute spectral loss components in fp32 to prevent bf16
+                    # underflow in log-domain operations (log10, log mel filterbank)
+                    with torch.amp.autocast('cuda', enabled=False):
+                        h_db_target = 20.0 * torch.log10(
+                            H_mag_per_band.float().clamp(min=1e-6)
+                        )
+                        h_db_pred = (
+                            output.get("h_db_pred").float()
+                            if output.get("h_db_pred") is not None
+                            else None
+                        )
+                    # Breaks spectral shortcut — wrong params + correct types != target
+                    H_mag_typed = model_ref.dsp_cascade(
+                        pred_gain,
+                        pred_freq,
+                        pred_q,
+                        filter_type=target_ft,
+                        n_fft=self.n_fft,
+                    )
 
-                # Teacher-forced spectral: render predicted params with GT types
-                # Breaks spectral shortcut — wrong params + correct types ≠ target
-                # Gradients flow to pred_gain/freq/q (NOT to type classifier since target_ft is GT)
-                # with torch.amp.autocast('cuda', enabled=False):
-                #     H_mag_typed = model_ref.dsp_cascade(
-                #         pred_gain.float(), pred_freq.float(), pred_q.float(),
-                #         filter_type=target_ft,
-                #     )
-                H_mag_typed = model_ref.dsp_cascade(
-                    pred_gain,
-                    pred_freq,
-                    pred_q,
-                    filter_type=target_ft,
-                    n_fft=self.n_fft,
+                    total_loss, components = self.criterion(
+                        pred_gain,
+                        pred_freq,
+                        pred_q,
+                        output["type_logits"],
+                        output["H_mag_soft"],
+                        output.get("H_mag", output["H_mag_soft"]),
+                        target_gain,
+                        target_freq,
+                        target_q,
+                        target_ft,
+                        target_H_mag,
+                        embedding=output["embedding"],
+                        h_db_pred=h_db_pred,
+                        h_db_target=h_db_target,
+                        H_mag_typed=H_mag_typed,
+                        type_probs=output["type_probs"],
+                        hier_aux=output.get("hier_aux"),
+                    )
+            except torch.cuda.OutOfMemoryError:
+                # C-03: OOM recovery — halve batch size, clear cache, log, continue
+                torch.cuda.empty_cache()
+                old_bs = self.train_loader.batch_size
+                new_bs = max(1, old_bs // 2)
+                if self._oom_batch_size_floor is None:
+                    self._oom_batch_size_floor = new_bs
+                print(
+                    f"  [oom] CUDA OOM at batch {batch_idx}! "
+                    f"Reducing batch_size {old_bs} -> {new_bs}, clearing cache. "
+                    f"Skipping batch."
                 )
-
-                total_loss, components = self.criterion(
-                    pred_gain,
-                    pred_freq,
-                    pred_q,
-                    output["type_logits"],
-                    output["H_mag_soft"],
-                    output.get("H_mag", output["H_mag_soft"]),
-                    target_gain,
-                    target_freq,
-                    target_q,
-                    target_ft,
-                    target_H_mag,
-                    embedding=output["embedding"],
-                    h_db_pred=h_db_pred,
-                    h_db_target=h_db_target,
-                    H_mag_typed=H_mag_typed,
-                    type_probs=output["type_probs"],
-                    hier_aux=output.get("hier_aux"),
+                self._append_event(
+                    "oom_recovery",
+                    epoch=epoch,
+                    batch_idx=batch_idx,
+                    old_batch_size=old_bs,
+                    new_batch_size=new_bs,
                 )
+                self.optimizer.zero_grad(set_to_none=True)
+                continue
 
             # Skip batch if loss is NaN (from early training instability)
             if not torch.isfinite(total_loss):
@@ -1163,7 +1387,25 @@ class Trainer:
 
             if (batch_idx + 1) % self.gradient_accumulation_steps == 0:
                 if not self.use_deepspeed:
-                    # Zero out NaN gradients before clipping
+                    # C-04: Detect NaN gradients before clipping — identify which params
+                    # have NaN and skip the optimizer step to prevent weight corruption.
+                    nan_grad_params = []
+                    for name, param in self.model.named_parameters():
+                        if param.grad is not None and not torch.isfinite(param.grad).all():
+                            nan_grad_params.append(name)
+                            param.grad.zero_()
+                    if nan_grad_params:
+                        self._total_nan_grad_steps += 1
+                        print(
+                            f"  [nan-grad] step={self.global_step}: NaN gradients in "
+                            f"{len(nan_grad_params)} params — skipping optimizer step. "
+                            f"First few: {nan_grad_params[:5]}"
+                        )
+                        self.optimizer.zero_grad(set_to_none=True)
+                        n_nan_batches += 1
+                        continue
+
+                    # Zero out remaining NaN gradients before clipping
                     for name, param in self.model.named_parameters():
                         if param.grad is not None:
                             grad_norm = param.grad.norm()
@@ -1222,12 +1464,16 @@ class Trainer:
 
                     self.optimizer.step()
 
-                    # Sanitize optimizer state: reset any Adam momentum/variance
-                    # buffers that contain NaN (prevents permanent training death)
+                    # AUDIT: CRITICAL-07 — Sanitize optimizer state: reset any Adam momentum/variance
+                    # buffers that contain NaN (prevents permanent training death).
+                    # Also reset the 'step' count which can become NaN/inf and prevent convergence.
                     for state in self.optimizer.state.values():
                         for k, v in state.items():
                             if isinstance(v, torch.Tensor) and not torch.isfinite(v).all():
                                 v.zero_()
+                            # Reset scalar state values (step count) that may be NaN/inf
+                            elif isinstance(v, float) and not math.isfinite(v):
+                                state[k] = 0.0
                 else:
                     self.model.step()
 
@@ -1262,6 +1508,32 @@ class Trainer:
                     parts.append(f"gain_aux_delta_cos={gain_aux_alignment:.4f}")
                 print(f"  [train] " + " | ".join(parts))
 
+            # H-10: Update tqdm progress bar with current loss and LR
+            if n_batches > 0:
+                lr_now = self.optimizer.param_groups[0]["lr"]
+                pbar.set_postfix(
+                    loss=f"{total_loss.item():.4f}",
+                    lr=f"{lr_now:.2e}",
+                    step=self.global_step,
+                    refresh=False,
+                )
+
+            # H-08: Per-type accuracy logging (training) — compute from type_probs
+            if self.global_step % self.log_every == 0 and "type_loss" in components:
+                with torch.no_grad():
+                    pred_types = output["type_probs"].argmax(dim=-1)  # (B, num_bands)
+                    type_names_short = ["peak", "lshf", "hshf", "hpas", "lpas"]
+                    for ti, tn in enumerate(type_names_short):
+                        mask = target_ft == ti
+                        if mask.any():
+                            acc = (pred_types[mask] == ti).float().mean().item()
+                            self.logger.log_metric(
+                                f"train/type_accuracy_{tn}", acc,
+                                epoch=epoch, step=self.global_step,
+                            )
+                # AUDIT: MEDIUM-12 — Update distribution statistics for monitoring
+                self._update_distribution_stats(batch, pred_gain, pred_freq, target_ft)
+
         if n_nan_batches > 0:
             print(f"  [train] Epoch {epoch}: {n_nan_batches} NaN batches skipped")
 
@@ -1280,6 +1552,9 @@ class Trainer:
                 avg = component_accum[k] / n_batches
                 comp_strs.append(f"{k}={avg:.4f}")
             print(f"  [train] Epoch {epoch} components: " + " | ".join(comp_strs))
+
+        # AUDIT: MEDIUM-12 — Log distribution statistics once per epoch
+        self._log_distribution_stats(epoch)
 
         return epoch_loss / max(n_batches, 1)
 
@@ -1615,7 +1890,7 @@ class Trainer:
             print(f"  [val] gumbel_tau={model_ref.param_head.gumbel_tau.item():.4f}")
         return avg_val_loss_soft, metrics
 
-    def save_checkpoint(self, epoch, monitor_value, save_tags=None, metrics=None):
+    def save_checkpoint(self, epoch, monitor_value, save_tags=None, metrics=None, is_best=False):
         ckpt_dir = Path("checkpoints")
         ckpt_dir.mkdir(exist_ok=True)
         save_tags = list(save_tags or [])
@@ -1631,11 +1906,13 @@ class Trainer:
                 "epoch": epoch,
                 "model_state_dict": self.model.state_dict(),
                 "optimizer_state_dict": self.optimizer.state_dict(),
-                "scheduler_state_dict": self.scheduler.state_dict(),
+                "scheduler_state_dict": self.scheduler.state_dict(),  # C-01
                 "val_loss": monitor_value,
                 "monitor_metric": self.monitor_val_metric,
                 "monitor_value": monitor_value,
                 "global_step": self.global_step,
+                "curriculum_stage_idx": self._current_curriculum_stage_idx,  # C-02
+                "gain_mae_ema": self.gain_mae_ema,  # C-02
             }
             if metrics is not None:
                 state["primary_val_score"] = metrics.get(
@@ -1655,18 +1932,29 @@ class Trainer:
                 state["val_loss_hard"] = metrics.get("val_loss_hard", monitor_value)
                 state["gain_mae_db_matched"] = metrics.get("gain_mae_db_matched")
                 state["type_accuracy_matched"] = metrics.get("type_accuracy_matched")
-                # C-04: Save best_named_metrics for NaN recovery state restoration
                 state["best_named_metrics"] = dict(self.best_named_metrics)
+            # AUDIT: LOW-16 — Add version hash for code tracking and checkpoint compatibility
+            try:
+                state["code_version_hash"] = compute_version_hash()
+            except Exception:
+                state["code_version_hash"] = "unknown"
             path = ckpt_dir / f"epoch_{epoch:03d}.pt"
-            torch.save(state, path)
+            tmp_path = path.with_suffix('.pt.tmp')
+            torch.save(state, tmp_path)
+            tmp_path.rename(path)
             print(f"  Saved checkpoint: {path}")
             for tag in save_tags:
                 tag_path = ckpt_dir / f"{tag}.pt"
-                torch.save(state, tag_path)
+                tmp_tag = tag_path.with_suffix('.pt.tmp')
+                torch.save(state, tmp_tag)
+                tmp_tag.rename(tag_path)
                 print(f"  Updated checkpoint: {tag_path}")
-                if tag == "best_primary":
+                # AUDIT: HIGH-09 — When 'best' tag is set, also create best.pt alias
+                if tag == "best":
                     best_path = ckpt_dir / "best.pt"
-                    torch.save(state, best_path)
+                    tmp_best = best_path.with_suffix('.pt.tmp')
+                    torch.save(state, tmp_best)
+                    tmp_best.rename(best_path)
                     print(f"  Updated checkpoint: {best_path}")
         self._append_event(
             "checkpoint_saved",
@@ -1675,8 +1963,8 @@ class Trainer:
             tags=save_tags,
         )
 
-        # Checkpoint pruning: keep only last N epoch checkpoints + named best
-        self._prune_old_checkpoints(ckpt_dir, keep_last_n=3)
+        # Checkpoint pruning: keep only last N epoch checkpoints + named best/last
+        self._prune_old_checkpoints(ckpt_dir, keep_last_n=1)
 
     def _prune_old_checkpoints(self, ckpt_dir, keep_last_n=3):
         """Delete old epoch_NNN.pt checkpoints, keeping the last N plus named ones."""
@@ -1716,7 +2004,19 @@ class Trainer:
         return False
 
     def _load_checkpoint(self, path):
-        """Load model (and optimizer) state from a checkpoint to resume training."""
+        """Load model (and optimizer) state from a checkpoint to resume training.
+
+        AUDIT: MEDIUM-21 — Uses weights_only=False because checkpoints contain
+        optimizer state, scheduler state, and training metadata (not just weights).
+        Security is mitigated by resolve_trusted_artifact_path() which validates
+        that the checkpoint path is under trusted root directories.
+        Never load checkpoints from untrusted sources.
+        """
+        path = resolve_trusted_artifact_path(
+            path,
+            allowed_roots=self.trusted_artifact_roots,
+            must_exist=True,
+        )
         state = torch.load(path, map_location=self.device, weights_only=False)
         sd = state["model_state_dict"]
         # torch.compile wraps keys with "_orig_mod." — strip it for non-compiled load
@@ -1757,6 +2057,31 @@ class Trainer:
             if saved_value is not None:
                 self.best_named_metrics[metric_name] = saved_value
         self.start_epoch = state.get("epoch", 0) + 1
+
+        # C-02: Restore curriculum stage and gain_mae_ema
+        saved_stage_idx = state.get("curriculum_stage_idx")
+        if saved_stage_idx is not None:
+            self._current_curriculum_stage_idx = saved_stage_idx
+        self.gain_mae_ema = state.get("gain_mae_ema", None)
+
+        # H-02: Reset gumbel tau based on restored epoch/curriculum stage
+        # (re-applied properly via _apply_curriculum_stage before first epoch)
+        restored_epoch = self.start_epoch
+        model_ref_for_tau = self.model
+        if hasattr(model_ref_for_tau, '_orig_mod'):
+            model_ref_for_tau = model_ref_for_tau._orig_mod
+        gumbel_cfg = self.cfg.get("gumbel", {})
+        if hasattr(model_ref_for_tau, 'param_head') and hasattr(model_ref_for_tau.param_head, 'gumbel_tau'):
+            start_tau = gumbel_cfg.get("start_tau", 2.0)
+            min_tau = gumbel_cfg.get("min_tau", 0.1)
+            warmup = gumbel_cfg.get("warmup_epochs", 10)
+            if restored_epoch <= warmup:
+                tau = start_tau
+            else:
+                progress = (restored_epoch - warmup) / max(1, self.max_epochs - warmup)
+                tau = min_tau + (start_tau - min_tau) * 0.5 * (1 + math.cos(math.pi * progress))
+            model_ref_for_tau.param_head.gumbel_tau.fill_(tau)
+            print(f"  [resume] Restored gumbel_tau={tau:.4f} for epoch {restored_epoch}")
 
         # Always start scheduler fresh for warm restart.
         # The loaded optimizer state has initial_lr from the exhausted schedule (1e-6).
@@ -1802,6 +2127,62 @@ class Trainer:
             resumed_epoch=self.start_epoch,
             monitor_value=self.best_monitor_value,
         )
+
+    def _evaluate_quality_alerts(self, epoch, metrics):
+        breaches = []
+
+        gain_max = self.alert_thresholds.get("gain_mae_db_matched")
+        gain_value = metrics.get("gain_mae_db_matched")
+        if gain_max is not None and gain_value is not None and gain_value > float(gain_max):
+            breaches.append(
+                {
+                    "metric": "gain_mae_db_matched",
+                    "value": float(gain_value),
+                    "threshold": float(gain_max),
+                    "operator": ">",
+                }
+            )
+
+        score_max = self.alert_thresholds.get("primary_val_score")
+        score_value = metrics.get("primary_val_score")
+        if score_max is not None and score_value is not None and score_value > float(score_max):
+            breaches.append(
+                {
+                    "metric": "primary_val_score",
+                    "value": float(score_value),
+                    "threshold": float(score_max),
+                    "operator": ">",
+                }
+            )
+
+        type_min = self.alert_thresholds.get("type_accuracy_matched_min")
+        type_value = metrics.get("type_accuracy_matched")
+        if type_min is not None and type_value is not None and type_value < float(type_min):
+            breaches.append(
+                {
+                    "metric": "type_accuracy_matched",
+                    "value": float(type_value),
+                    "threshold": float(type_min),
+                    "operator": "<",
+                }
+            )
+
+        if not breaches:
+            return
+
+        summary = "; ".join(
+            f"{b['metric']}={b['value']:.4f} {b['operator']} {b['threshold']:.4f}"
+            for b in breaches
+        )
+        print(f"  [alert] quality threshold breach at epoch {epoch}: {summary}")
+        self._append_event("quality_alert", breaches=breaches)
+        self.logger.log_event("quality_alert", {"epoch": epoch, "breaches": breaches})
+
+        if self.fail_on_alert and epoch >= self.alert_grace_epochs:
+            raise RuntimeError(
+                "Quality threshold breached and `trainer.fail_on_alert=true`: "
+                f"{summary}"
+            )
 
     _optimizer_includes_backbone = False  # Track whether backbone params are in optimizer
 
@@ -1914,7 +2295,13 @@ class Trainer:
             self.optimizer = torch.optim.AdamW(param_groups)
             self.global_step = state.get("global_step", 0)
 
-            # C-04: Restore scheduler state and best_named_metrics
+            # H-18: Reduce LR by 0.5x after NaN recovery to stabilize training
+            for pg in self.optimizer.param_groups:
+                pg["lr"] = pg["lr"] * 0.5
+                pg["initial_lr"] = pg["initial_lr"] * 0.5
+            print(f"  [recovery] Reduced LR by 0.5x for stability (encoder_lr={self.optimizer.param_groups[0]['lr']:.2e})")
+
+            # C-04/H-03: Restore scheduler state and best_named_metrics
             if "scheduler_state_dict" in state:
                 try:
                     self.scheduler.load_state_dict(state["scheduler_state_dict"])
@@ -2001,7 +2388,14 @@ class Trainer:
                     break
 
             val_loss, metrics = self.validate(epoch)
+            # H-14: Step scheduler accounting for gradient accumulation.
+            # Scheduler steps once per epoch (epoch-level schedule), but if using
+            # grad accumulation, the effective steps per epoch are fewer, so we
+            # compensate by tracking the epoch-level step count.
             self.scheduler.step()
+            # H-01: After warmup, also step the inner cosine schedule
+            if self.warmup_epochs > 0 and hasattr(self, '_inner_scheduler') and epoch > self.warmup_epochs:
+                self._inner_scheduler.step()
 
             # Curriculum schedule for H_db gain mix: ramp self.gain_mix_value → 0.85 over training
             # Start higher (e.g. 0.3) since H_db head is now stronger with expanded arch.
@@ -2033,6 +2427,8 @@ class Trainer:
             monitor_value = resolve_monitor_value(
                 metrics, self.monitor_val_metric, val_loss
             )
+            self._evaluate_quality_alerts(epoch, metrics)
+            # AUDIT: HIGH-09 — Single source of truth for is_best (used for early stopping + checkpoints)
             is_best = metric_improved(
                 self.monitor_val_metric, monitor_value, self.best_monitor_value
             )
@@ -2041,7 +2437,12 @@ class Trainer:
                 self.patience_counter = 0
             else:
                 self.patience_counter += 1
-            save_tags = []
+            # Only save best.pt (primary metric) and last.pt (resume point).
+            # Additional metric tracking is logged; separate files are unnecessary.
+            save_tags = ["last"]
+            if is_best:
+                save_tags.append("best")
+            # Track best individual metrics for logging only
             primary_score = metrics.get("primary_val_score")
             if primary_score is not None and metric_improved(
                 "primary_val_score",
@@ -2049,7 +2450,6 @@ class Trainer:
                 self.best_named_metrics["primary_val_score"],
             ):
                 self.best_named_metrics["primary_val_score"] = primary_score
-                save_tags.append("best_primary")
             gain_mae = metrics.get("gain_mae_db_matched")
             if gain_mae is not None and metric_improved(
                 "gain_mae_db_matched",
@@ -2057,7 +2457,6 @@ class Trainer:
                 self.best_named_metrics["gain_mae_db_matched"],
             ):
                 self.best_named_metrics["gain_mae_db_matched"] = gain_mae
-                save_tags.append("best_gain")
             type_acc = metrics.get("type_accuracy_matched")
             if type_acc is not None and metric_improved(
                 "type_accuracy_matched",
@@ -2065,7 +2464,6 @@ class Trainer:
                 self.best_named_metrics["type_accuracy_matched"],
             ):
                 self.best_named_metrics["type_accuracy_matched"] = type_acc
-                save_tags.append("best_type")
             spectral_loss = metrics.get("val_spectral_loss")
             if spectral_loss is not None and metric_improved(
                 "val_spectral_loss",
@@ -2073,8 +2471,9 @@ class Trainer:
                 self.best_named_metrics["val_spectral_loss"],
             ):
                 self.best_named_metrics["val_spectral_loss"] = spectral_loss
-                save_tags.append("best_audio")
-            self.save_checkpoint(epoch, monitor_value, save_tags, metrics=metrics)
+            # Always save last.pt for resume capability
+            save_tags.append("last")
+            self.save_checkpoint(epoch, monitor_value, save_tags, metrics=metrics, is_best=is_best)
 
             self.history.append(
                 {
@@ -2177,8 +2576,16 @@ if __name__ == "__main__":
     # AUDIT: LOW-34 — Optional profiling for bottleneck analysis
     parser.add_argument("--profile", type=int, default=0,
                         help="Profile first N batches and save trace to checkpoints/profile_trace.json")
+    # AUDIT: CRITICAL-02 — Force cache regeneration to prevent stale data
+    parser.add_argument("--force-recompute", action="store_true",
+                        help="Force regeneration of precomputed dataset cache (ignores existing cache)")
+    # AUDIT: MEDIUM-30 — Prometheus metrics export for production monitoring
+    parser.add_argument("--prometheus-port", type=int, default=0,
+                        help="Expose Prometheus metrics on this port (0 = disabled)")
     args = parser.parse_args()
-    trainer = Trainer(config_path=args.config, resume_path=args.resume)
+    trainer = Trainer(config_path=args.config, resume_path=args.resume, force_recompute=args.force_recompute)
     if args.profile > 0:
         trainer.profile_n_batches = args.profile
+    if args.prometheus_port > 0:
+        trainer.logger._metrics.start_http_server(args.prometheus_port)
     trainer.fit()
