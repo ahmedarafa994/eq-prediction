@@ -10,6 +10,7 @@ import random
 import argparse
 import math
 import hashlib
+import tempfile
 from pathlib import Path
 from multiprocessing import Pool, cpu_count
 
@@ -29,7 +30,7 @@ from pipeline_utils import (
 
 
 FILTER_TYPES = ["peaking", "lowshelf", "highshelf", "highpass", "lowpass"]
-DEFAULT_TYPE_WEIGHTS = [0.5, 0.15, 0.15, 0.1, 0.1]
+DEFAULT_TYPE_WEIGHTS = [0.2, 0.2, 0.2, 0.2, 0.2]
 
 
 def sha256_file(path, chunk_size=1024 * 1024):
@@ -41,6 +42,16 @@ def sha256_file(path, chunk_size=1024 * 1024):
                 break
             digest.update(chunk)
     return digest.hexdigest()
+
+
+def display_path(path_value: str) -> str:
+    """Prefer workspace-relative paths in metadata to avoid absolute-path leakage."""
+    resolved = Path(path_value).resolve()
+    cwd = Path.cwd().resolve()
+    try:
+        return str(resolved.relative_to(cwd))
+    except ValueError:
+        return str(resolved)
 
 
 def log_uniform(low, high):
@@ -354,15 +365,21 @@ def process_file(args):
 
 def build_dataset(input_dir, output_dir, config):
     """Iterate over dry audio files and generate multi-type EQ data."""
+    trusted_roots = [
+        Path.cwd(),
+        Path(__file__).resolve().parent.parent,
+        Path(tempfile.gettempdir()),
+    ]
+
     # AUDIT: HIGH-11 — Validate input/output paths are under allowed roots
     input_root = resolve_trusted_artifact_path(
         input_dir,
-        allowed_roots=[Path.cwd(), Path(__file__).resolve().parent.parent],
+        allowed_roots=trusted_roots,
         must_exist=True
     )
     output_root = resolve_trusted_artifact_path(
         output_dir,
-        allowed_roots=[Path.cwd(), Path(__file__).resolve().parent.parent],
+        allowed_roots=trusted_roots,
         must_exist=False
     )
     os.makedirs(output_root, exist_ok=True)
@@ -486,8 +503,8 @@ def build_dataset(input_dir, output_dir, config):
     manifest = {
         "schema_version": PIPELINE_SCHEMA_VERSION,
         "created_at": utc_now_iso(),
-        "input_dir": str(input_root),
-        "output_dir": str(output_root),
+        "input_dir": display_path(str(input_root)),
+        "output_dir": display_path(str(output_root)),
         "config": config,
         "num_requested": len(tasks),
         "num_succeeded": len(successes),
@@ -545,7 +562,7 @@ if __name__ == "__main__":
         "gain_bounds": [-24.0, 24.0],
         "freq_bounds": [20.0, 20000.0],
         "q_bounds": [0.1, 10.0],
-        "type_weights": [0.5, 0.15, 0.15, 0.1, 0.1],
+        "type_weights": [0.2, 0.2, 0.2, 0.2, 0.2],
         "seed": 42,
         "max_processes": args.max_processes,
         "max_failure_rate": 0.01,

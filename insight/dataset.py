@@ -106,6 +106,12 @@ class SyntheticEQDataset(data.Dataset):
                 "SyntheticEQDataset only supports `hp_lp_gain_target='zero'`."
             )
         self.signal_types = signal_types
+        self.gain_distribution = str(gain_distribution).lower()
+        if self.gain_distribution not in {"beta", "uniform"}:
+            raise ValueError(
+                f"Unsupported gain_distribution={gain_distribution!r}. "
+                "Expected 'beta' or 'uniform'."
+            )
         # AUDIT: V-09 — Configure signal type weights with validation
         if signal_type_weights is None:
             self.signal_type_weights = DEFAULT_SIGNAL_TYPE_WEIGHTS.copy()
@@ -622,8 +628,9 @@ class SyntheticEQDataset(data.Dataset):
         Estimate memory usage per cached sample in bytes.
         Used for precompute memory estimation (AUDIT: MEDIUM-14).
         """
-        # Estimate based on cached components (after dropping audio):
-        # - wet_mel: (n_mels, time_frames) float32
+        # Estimate based on cached components (raw audio + optional mel):
+        # - wet_audio, dry_audio: (num_samples,) float32 each
+        # - wet_mel: (n_mels, time_frames) float32 when precompute_mels=True
         # - gain, freq, q: (num_bands,) float32 each
         # - filter_type: (num_bands,) int64
         # - active_band_mask: (num_bands,) bool
@@ -637,7 +644,7 @@ class SyntheticEQDataset(data.Dataset):
     def precompute(self, skip_memory_check: bool = False, warn_threshold: float = 0.5):
         """
         Pre-generate all samples and cache mel-spectrograms + params in memory.
-        Drops raw audio to save memory. Only caches what training needs.
+        Caches full training samples (wet_audio/dry_audio + params + optional wet_mel).
 
         AUDIT: CRITICAL-05 — Skip caching samples that used render fallback to prevent
         contaminating the training set with degenerate samples. These will be

@@ -18,6 +18,7 @@ Optimization features (QLoRA/Unsloth/DeepSpeed-inspired):
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
+import numpy as np
 torch.set_float32_matmul_precision("high")  # TF32 for 3x matmul throughput on Ampere+
 from torch.utils.data import DataLoader, random_split
 from functools import partial
@@ -49,6 +50,7 @@ from pipeline_utils import (
     resolve_trusted_artifact_path,
     validate_dependencies,
     validate_config_schema,
+    compute_metadata_signature,
     compute_version_hash,
 )
 from structured_logger import StructuredLogger
@@ -338,6 +340,8 @@ class Trainer:
 
         # Dataset selection: "musdb" for real audio, "synthetic" (or unset) for synthetic
         dataset_type = str(data_cfg.get("dataset_type", "synthetic")).lower()
+        self.dataset_type = dataset_type
+        self.config_path = str(Path(config_path).resolve())
         dataset_size = data_cfg.get("dataset_size", 30000)
         val_dataset_size = data_cfg.get("val_dataset_size", 2000)
         shared_ds_kwargs = dict(
@@ -486,42 +490,27 @@ class Trainer:
                 "  [data] WARNING: num_workers=0 — data generation blocks GPU. "
                 f"Set num_workers>=2 in config (auto-detected {os.cpu_count()} CPUs)"
             )
-        train_loader_generator = torch.Generator().manual_seed(self.seed + 101)
-        val_loader_generator = torch.Generator().manual_seed(self.seed + 202)
-        worker_init = partial(seed_worker, base_seed=self.seed)
+        self.pin_memory = pin_memory
+        self.worker_init = partial(seed_worker, base_seed=self.seed)
+        self.train_loader_seed = self.seed + 101
+        self.val_loader_seed = self.seed + 202
+        self.prefetch_factor = int(data_cfg.get("prefetch_factor", 4))
+        self.persistent_workers = bool(
+            data_cfg.get("persistent_workers", num_workers > 0)
+        )
+        self.current_batch_size = int(data_cfg["batch_size"])
+        self._dataloader_rebuild_count = 0
+        self._build_dataloaders(self.current_batch_size)
 
-        self.train_loader = DataLoader(
-            self.train_set,
-            batch_size=data_cfg["batch_size"],
-            shuffle=True,
-            num_workers=num_workers,
-            collate_fn=collate_fn,
-            pin_memory=pin_memory,
-            drop_last=True,
-            prefetch_factor=8 if num_workers > 0 else None,
-            persistent_workers=True if num_workers > 0 else False,
-            generator=train_loader_generator,
-            worker_init_fn=worker_init,
-        )
-        self.val_loader = DataLoader(
-            self.val_dataset,
-            batch_size=data_cfg["batch_size"],
-            shuffle=False,
-            num_workers=num_workers,
-            collate_fn=collate_fn,
-            pin_memory=pin_memory,
-            prefetch_factor=8 if num_workers > 0 else None,
-            persistent_workers=True if num_workers > 0 else False,
-            generator=val_loader_generator,
-            worker_init_fn=worker_init,
-        )
+        self.config_hash = compute_metadata_signature(self.cfg)
+        self.dataset_fingerprint = self._compute_dataset_fingerprint()
 
         self.run_dir = Path("checkpoints")
         self.run_dir.mkdir(exist_ok=True)
         self.run_metadata_path = self.run_dir / "run_metadata.json"
         self.training_events_path = self.run_dir / "training_events.jsonl"
         self._write_run_metadata(
-            config_path=config_path,
+            config_path=self.config_path,
             resume_path=self.resume_path,
             dataset_type=dataset_type,
         )
@@ -859,9 +848,75 @@ class Trainer:
             "train_examples": len(self.train_set),
             "val_examples": len(self.val_dataset),
             "test_examples": len(self.test_set),
+            "batch_size": self.current_batch_size,
+            "config_hash": getattr(self, "config_hash", None),
+            "dataset_fingerprint": getattr(self, "dataset_fingerprint", None),
         }
         with open(self.run_metadata_path, "w") as f:
             json.dump(payload, f, indent=2)
+
+    def _compute_dataset_fingerprint(self):
+        data_cfg = self.cfg.get("data", {})
+        payload = {
+            "dataset_type": self.dataset_type,
+            "train_examples": len(self.train_set),
+            "val_examples": len(self.val_dataset),
+            "test_examples": len(self.test_set),
+            "data_cfg": data_cfg,
+        }
+
+        cache_metadata = None
+        cache_metadata_fn = getattr(self.train_dataset, "_cache_metadata", None)
+        if callable(cache_metadata_fn):
+            try:
+                cache_metadata = cache_metadata_fn()
+            except Exception:
+                cache_metadata = None
+        if cache_metadata is not None:
+            payload["train_cache_signature"] = cache_metadata.get("signature")
+            payload["train_generation_hash"] = cache_metadata.get("generation_params_hash")
+
+        return compute_metadata_signature(payload)
+
+    def _build_dataloaders(self, batch_size):
+        num_workers = self.num_workers
+        prefetch_factor = self.prefetch_factor if num_workers > 0 else None
+        persistent_workers = self.persistent_workers if num_workers > 0 else False
+        train_loader_generator = torch.Generator().manual_seed(
+            self.train_loader_seed + self._dataloader_rebuild_count
+        )
+        val_loader_generator = torch.Generator().manual_seed(
+            self.val_loader_seed + self._dataloader_rebuild_count
+        )
+
+        self.train_loader = DataLoader(
+            self.train_set,
+            batch_size=batch_size,
+            shuffle=True,
+            num_workers=num_workers,
+            collate_fn=collate_fn,
+            pin_memory=self.pin_memory,
+            drop_last=True,
+            prefetch_factor=prefetch_factor,
+            persistent_workers=persistent_workers,
+            generator=train_loader_generator,
+            worker_init_fn=self.worker_init,
+        )
+        self.val_loader = DataLoader(
+            self.val_dataset,
+            batch_size=batch_size,
+            shuffle=False,
+            num_workers=num_workers,
+            collate_fn=collate_fn,
+            pin_memory=self.pin_memory,
+            prefetch_factor=prefetch_factor,
+            persistent_workers=persistent_workers,
+            generator=val_loader_generator,
+            worker_init_fn=self.worker_init,
+        )
+
+        self.current_batch_size = int(batch_size)
+        self._dataloader_rebuild_count += 1
 
     def _append_event(self, event, **payload):
         record = {
@@ -954,6 +1009,11 @@ class Trainer:
             state["code_version_hash"] = compute_version_hash()
         except Exception:
             state["code_version_hash"] = "unknown"
+        # AUDIT: LOW-16 — Add dependency versions for reproducibility
+        import sys
+        state["torch_version"] = torch.__version__
+        state["numpy_version"] = np.__version__
+        state["python_version"] = f"{sys.version_info.major}.{sys.version_info.minor}.{sys.version_info.micro}"
         tmp_path = checkpoint_path.with_suffix('.pt.tmp')
         torch.save(state, tmp_path)
         tmp_path.rename(checkpoint_path)
@@ -1211,12 +1271,51 @@ class Trainer:
                 return alignment.item()
         return None
 
+    def _handle_oom_batch_resize(self, epoch, batch_idx):
+        old_bs = int(self.current_batch_size)
+        new_bs = max(1, old_bs // 2)
+        if new_bs >= old_bs:
+            self._append_event(
+                "oom_unrecoverable",
+                epoch=epoch,
+                batch_idx=batch_idx,
+                batch_size=old_bs,
+            )
+            return False
+
+        torch.cuda.empty_cache()
+        self._build_dataloaders(new_bs)
+        if self._oom_batch_size_floor is None:
+            self._oom_batch_size_floor = new_bs
+        else:
+            self._oom_batch_size_floor = min(self._oom_batch_size_floor, new_bs)
+
+        self._append_event(
+            "oom_recovery",
+            epoch=epoch,
+            batch_idx=batch_idx,
+            old_batch_size=old_bs,
+            new_batch_size=new_bs,
+        )
+        self._write_run_metadata(
+            config_path=self.config_path,
+            resume_path=self.resume_path,
+            dataset_type=self.dataset_type,
+        )
+        print(
+            f"  [oom] CUDA OOM at batch {batch_idx}! "
+            f"Rebuilt dataloaders with batch_size {old_bs} -> {new_bs}. "
+            f"Restarting epoch {epoch}."
+        )
+        return True
+
     def train_one_epoch(self, epoch):
         self.model.train()
         self.criterion.train()
         epoch_loss = 0.0
         n_batches = 0
         n_nan_batches = 0
+        oom_restart_requested = False
 
         # Accumulate per-component losses for epoch-level logging
         component_accum = {}
@@ -1335,26 +1434,11 @@ class Trainer:
                         hier_aux=output.get("hier_aux"),
                     )
             except torch.cuda.OutOfMemoryError:
-                # C-03: OOM recovery — halve batch size, clear cache, log, continue
-                torch.cuda.empty_cache()
-                old_bs = self.train_loader.batch_size
-                new_bs = max(1, old_bs // 2)
-                if self._oom_batch_size_floor is None:
-                    self._oom_batch_size_floor = new_bs
-                print(
-                    f"  [oom] CUDA OOM at batch {batch_idx}! "
-                    f"Reducing batch_size {old_bs} -> {new_bs}, clearing cache. "
-                    f"Skipping batch."
-                )
-                self._append_event(
-                    "oom_recovery",
-                    epoch=epoch,
-                    batch_idx=batch_idx,
-                    old_batch_size=old_bs,
-                    new_batch_size=new_bs,
-                )
-                self.optimizer.zero_grad(set_to_none=True)
-                continue
+                if self._handle_oom_batch_resize(epoch, batch_idx):
+                    self.optimizer.zero_grad(set_to_none=True)
+                    oom_restart_requested = True
+                    break
+                raise
 
             # Skip batch if loss is NaN (from early training instability)
             if not torch.isfinite(total_loss):
@@ -1555,6 +1639,9 @@ class Trainer:
 
         # AUDIT: MEDIUM-12 — Log distribution statistics once per epoch
         self._log_distribution_stats(epoch)
+
+        if oom_restart_requested:
+            return None
 
         return epoch_loss / max(n_batches, 1)
 
@@ -1913,6 +2000,9 @@ class Trainer:
                 "global_step": self.global_step,
                 "curriculum_stage_idx": self._current_curriculum_stage_idx,  # C-02
                 "gain_mae_ema": self.gain_mae_ema,  # C-02
+                "config_hash": self.config_hash,
+                "dataset_fingerprint": self.dataset_fingerprint,
+                "batch_size": self.current_batch_size,
             }
             if metrics is not None:
                 state["primary_val_score"] = metrics.get(
@@ -1938,6 +2028,11 @@ class Trainer:
                 state["code_version_hash"] = compute_version_hash()
             except Exception:
                 state["code_version_hash"] = "unknown"
+            # AUDIT: LOW-16 — Add dependency versions for reproducibility
+            import sys
+            state["torch_version"] = torch.__version__
+            state["numpy_version"] = np.__version__
+            state["python_version"] = f"{sys.version_info.major}.{sys.version_info.minor}.{sys.version_info.micro}"
             path = ckpt_dir / f"epoch_{epoch:03d}.pt"
             tmp_path = path.with_suffix('.pt.tmp')
             torch.save(state, tmp_path)
@@ -2368,7 +2463,18 @@ class Trainer:
 
             self._apply_curriculum_stage(epoch)
 
-            train_loss = self.train_one_epoch(epoch)
+            while True:
+                train_loss = self.train_one_epoch(epoch)
+                if train_loss is not None or self._received_signal is not None:
+                    break
+                self._append_event(
+                    "oom_epoch_restart",
+                    epoch=epoch,
+                    batch_size=self.current_batch_size,
+                )
+                print(
+                    f"  [oom] Retrying epoch {epoch} with batch_size={self.current_batch_size}"
+                )
 
             if self._received_signal is not None:
                 print(f"  [signal] Training interrupted by {self._received_signal}")
@@ -2587,5 +2693,8 @@ if __name__ == "__main__":
     if args.profile > 0:
         trainer.profile_n_batches = args.profile
     if args.prometheus_port > 0:
-        trainer.logger._metrics.start_http_server(args.prometheus_port)
+        if getattr(trainer.logger, "_metrics", None) is not None:
+            trainer.logger._metrics.start_http_server(args.prometheus_port)
+        else:
+            print("  [prometheus] Metrics backend unavailable; install prometheus_client")
     trainer.fit()

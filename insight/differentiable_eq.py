@@ -1312,7 +1312,15 @@ class MultiTypeEQParameterHead(nn.Module):
             peaking_gate = (1.0 - dc_gate) * (1.0 - nyq_gate)
             type_logits[..., FILTER_PEAKING] += peaking_gate * self.dc_shelf_scale
 
-        type_probs = F.gumbel_softmax(type_logits, tau=self.gumbel_tau.clamp(min=0.05), hard=False, dim=-1)
+        if self.training:
+            type_probs = F.gumbel_softmax(
+                type_logits,
+                tau=self.gumbel_tau.clamp(min=0.05),
+                hard=False,
+                dim=-1,
+            )
+        else:
+            type_probs = torch.softmax(type_logits, dim=-1)
         filter_type = type_logits.argmax(dim=-1)
         type_probs_for_params = type_probs
 
@@ -1566,7 +1574,15 @@ class TypeGroupedParameterHead(nn.Module):
             type_input = torch.cat([trunk_out, global_mel], dim=-1)
 
         type_logits = self.type_classifier(type_input)
-        type_probs = F.gumbel_softmax(type_logits, tau=self.gumbel_tau.clamp(min=0.05), hard=False, dim=-1)
+        if self.training:
+            type_probs = F.gumbel_softmax(
+                type_logits,
+                tau=self.gumbel_tau.clamp(min=0.05),
+                hard=False,
+                dim=-1,
+            )
+        else:
+            type_probs = torch.softmax(type_logits, dim=-1)
         filter_type = type_logits.argmax(dim=-1)
 
         # ── STAGE 2: Parameter Prediction ─────────────────────────────────────

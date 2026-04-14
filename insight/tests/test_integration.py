@@ -277,7 +277,7 @@ def test_checkpoint_roundtrip():
     # Generate reference output
     with torch.no_grad():
         mel = frontend.mel_spectrogram(batch["wet_audio"]).squeeze(1)
-        ref_output = model(mel, wet_audio=batch["wet_audio"])
+        ref_output = model(mel, wet_audio=batch["wet_audio"], hard_types=True)
 
     # Save checkpoint
     import tempfile
@@ -308,7 +308,7 @@ def test_checkpoint_roundtrip():
     # Verify identical output
     with torch.no_grad():
         mel = frontend.mel_spectrogram(batch["wet_audio"]).squeeze(1)
-        new_output = model2(mel, wet_audio=batch["wet_audio"])
+        new_output = model2(mel, wet_audio=batch["wet_audio"], hard_types=True)
 
     for key in ref_output:
         if isinstance(ref_output[key], torch.Tensor):
@@ -352,14 +352,15 @@ def test_model_dsp_consistency():
 
     # Method 1: Direct call to DSP cascade
     with torch.no_grad():
-        H1 = model.dsp_cascade(gain, freq, q, filter_type=filter_type)
+        H1 = model.dsp_cascade(gain, freq, q, n_fft=1024, filter_type=filter_type)
 
     # Method 2: Via biquad coefficients + freq_response
     with torch.no_grad():
         b0, b1, b2, a1, a2 = model.dsp_cascade.compute_biquad_coeffs_multitype(
             gain, freq, q, filter_type
         )
-        H2 = model.dsp_cascade.freq_response(b0, b1, b2, a1, a2, n_fft=1024)
+        H2_bands = model.dsp_cascade.freq_response(b0, b1, b2, a1, a2, n_fft=1024)
+        H2 = H2_bands.prod(dim=1)
 
     # Responses should match (may differ in n_fft resolution)
     # Resample H1 to match H2's resolution if needed

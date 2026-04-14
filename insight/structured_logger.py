@@ -24,6 +24,7 @@ def utc_now_iso() -> str:
 # ---------------------------------------------------------------------------
 
 _PROMETHEUS_REGISTRY = None
+_PROMETHEUS_METRICS = None
 
 def _get_prometheus_registry():
     """Get or create Prometheus registry (lazy init)."""
@@ -35,6 +36,13 @@ def _get_prometheus_registry():
         except ImportError:
             pass
     return _PROMETHEUS_REGISTRY
+
+
+def _get_prometheus_metrics_singleton():
+    global _PROMETHEUS_METRICS
+    if _PROMETHEUS_METRICS is None:
+        _PROMETHEUS_METRICS = PrometheusMetrics()
+    return _PROMETHEUS_METRICS
 
 
 class PrometheusMetrics:
@@ -167,6 +175,7 @@ class StructuredLogger:
         self.enable_tensorboard = enable_tensorboard
         self._wandb_initialized = False
         self._tensorboard_initialized = False
+        self._metrics = _get_prometheus_metrics_singleton()
 
         if enable_wandb:
             self._init_wandb(wandb_project, wandb_run_name)
@@ -238,6 +247,9 @@ class StructuredLogger:
 
         self._write_jsonl(record)
 
+        # Emit to Prometheus when available.
+        self._metrics.record_metric(name, float(value))
+
         if self._wandb_initialized:
             import wandb
             log_dict = {name: value}
@@ -269,6 +281,12 @@ class StructuredLogger:
         if self._wandb_initialized:
             import wandb
             wandb.log({f"event/{event_name}": 1})
+
+        if event_name == "quality_alert":
+            breaches = (payload or {}).get("breaches", [])
+            for breach in breaches:
+                metric = str(breach.get("metric", "unknown"))
+                self._metrics.record_alert("warning", metric)
 
     def log_metrics_batch(self, metrics: dict, epoch: int = None, step: int = None):
         """

@@ -441,7 +441,7 @@ def build_sample_id(source_path: str | Path, source_root: str | Path | None = No
             relative_text = path.name
 
     stem = sanitize_path_fragment(str(Path(relative_text).with_suffix("")))
-    digest = hashlib.sha1(str(path).encode("utf-8")).hexdigest()[:10]
+    digest = hashlib.sha256(str(relative_text).encode("utf-8")).hexdigest()[:12]
     return f"{stem}-{digest}" if stem else digest
 
 

@@ -67,22 +67,19 @@ class STFTFrontend(nn.Module):
                 if j < n_freqs and f_right > f_center:
                     fb[i, j] = (f_right - j) / max(f_right - f_center, 1)
 
-        # AUDIT: HIGH-10 — Normalize each filter to sum to 1.0
-        # This prevents edge artifacts and ensures uniform energy response.
-        # A filter with zero total weight would produce no output (dead band).
+        # AUDIT: HIGH-10 — Normalize each filter to sum to 1.0.
+        # If a row has zero overlap under coarse FFT settings, repair it by
+        # assigning unit weight to the nearest center bin instead of hard failing.
         fb_sum = fb.sum(dim=1, keepdim=True)
-        # Avoid division by zero for filters that have no overlap (edge case)
-        fb_sum = torch.clamp(fb_sum, min=1e-8)
-        fb = fb / fb_sum
+        zero_rows = fb_sum.squeeze(1) <= 0.0
+        if zero_rows.any():
+            center_bins = torch.clamp(bin_points[1:-1], min=0, max=n_freqs - 1)
+            zero_indices = torch.where(zero_rows)[0]
+            for row_idx in zero_indices.tolist():
+                fb[row_idx, center_bins[row_idx].item()] = 1.0
+            fb_sum = fb.sum(dim=1, keepdim=True)
 
-        # AUDIT: HIGH-10 — Validate no all-zero rows in filterbank
-        # After normalization, each filter should have at least some non-zero weights.
-        # An all-zero filter would create a dead band in the mel representation.
-        row_norms = fb.sum(dim=1)
-        assert torch.all(row_norms > 0.0), (
-            f"Filterbank contains {row_norms.eq(0.0).sum().item()} zero-weight filters. "
-            f"This may indicate f_min/f_max configuration error or edge case with mel_bins."
-        )
+        fb = fb / torch.clamp(fb_sum, min=1e-8)
 
         return fb
 
@@ -112,6 +109,14 @@ class STFTFrontend(nn.Module):
                 return_complex=True,
                 center=False,
             )
+
+        # torch.stft(center=True) uses reflect padding by default.
+        # Reflect mode fails when pad >= input length (common in short synthetic tests),
+        # so fall back to constant padding for this edge case only.
+        pad_mode = "reflect"
+        if audio.shape[-1] <= (self.n_fft // 2):
+            pad_mode = "constant"
+
         return torch.stft(
             audio,
             self.n_fft,
@@ -120,6 +125,7 @@ class STFTFrontend(nn.Module):
             window=self.window,
             return_complex=True,
             center=True,
+            pad_mode=pad_mode,
         )
 
     def istft(self, complex_stft, length=None):
