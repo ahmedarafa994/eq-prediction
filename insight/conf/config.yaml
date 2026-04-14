@@ -90,7 +90,7 @@ model:
 loss:
   lambda_param: 1.0
   lambda_hmag: 0.25
-  lambda_type: 4.0
+  lambda_type: 12.0
   lambda_gain: 2.0
   lambda_freq: 1.0
   lambda_q: 0.5
@@ -100,10 +100,14 @@ loss:
   lambda_typed_spectral: 1.0
   label_smoothing: 0.01
   focal_gamma: 2.0
-  type_loss_mode: focal
+  type_loss_mode: soft_kl
+  soft_label_temperature: 0.35
   lambda_type_match: 1.0
   lambda_type_prior: 0.05
   lambda_type_entropy: 2.0
+  lambda_supcon: 0.05
+  supcon_temperature: 0.07
+  supcon_max_samples: 256
   class_weight_multipliers:
   - 1.0
   - 2.0

@@ -117,6 +117,128 @@ def multi_scale_spectral_loss(pred_gain, pred_freq, pred_q, type_probs,
     return total / len(fft_sizes)
 
 
+class SupConLoss(nn.Module):
+    """Supervised Contrastive Loss (Khosla et al. 2020).
+
+    Pulls embeddings of the same filter type together while pushing
+    different filter types apart. Applied to the type_input features
+    (the representation fed into the linear type classifier) so that
+    the classification layer receives well-separated clusters.
+
+    Args:
+        temperature: scaling for similarity. Lower = tighter clusters.
+    """
+
+    def __init__(self, temperature=0.07):
+        super().__init__()
+        self.temperature = temperature
+
+    def forward(self, features, labels):
+        """
+        Args:
+            features: (B*N, D) — type_input embeddings (before linear type_head)
+            labels: (B*N,) — filter type indices (after Hungarian matching)
+        Returns:
+            scalar loss
+        """
+        device = features.device
+        B_N = features.shape[0]
+        if B_N < 2:
+            return torch.tensor(0.0, device=device)
+
+        # Normalize features to unit sphere
+        feats = F.normalize(features, dim=1)
+
+        # Similarity matrix: (B*N, B*N)
+        sim = torch.matmul(feats, feats.T) / self.temperature
+
+        # Mask: positives are same-type pairs (excluding self)
+        labels = labels.unsqueeze(0)  # (1, B*N)
+        mask_pos = (labels == labels.T).float()  # (B*N, B*N)
+        mask_pos.fill_diagonal_(0.0)  # exclude self-pairs
+
+        # For numerical stability: subtract max per row
+        logits_max, _ = sim.max(dim=1, keepdim=True)
+        logits = sim - logits_max.detach()
+
+        # Log-sum-exp of all negatives + positives (denominator)
+        # Mask out self-pair from denominator too
+        mask_all = ~torch.eye(B_N, dtype=torch.bool, device=device)
+        exp_logits = torch.exp(logits) * mask_all.float()
+        log_sum_exp = torch.log(exp_logits.sum(dim=1, keepdim=True) + 1e-8)
+
+        # Mean log-likelihood over positive pairs
+        log_prob = logits - log_sum_exp
+
+        # Only compute for anchors that have at least one positive
+        num_positives = mask_pos.sum(dim=1)
+        has_positives = num_positives > 0
+
+        if not has_positives.any():
+            return torch.tensor(0.0, device=device)
+
+        mean_log_prob = (mask_pos * log_prob).sum(dim=1) / (num_positives + 1e-8)
+        loss = -mean_log_prob[has_positives].mean()
+        return loss
+
+
+def compute_physics_soft_labels(
+    gain, freq, q, target_H_mag, dsp_cascade, n_fft, temperature=2.0
+):
+    """Compute physics-informed soft type labels from DSP analysis.
+
+    For each band, renders the frequency response with all 5 filter types
+    and measures how well each type fits the target curve.  Types that
+    produce similar curves (e.g. lowshelf vs peaking at 20 Hz) get high
+    probability, reflecting the physical ambiguity.
+
+    Args:
+        gain: (B, N) target gains
+        freq: (B, N) target frequencies
+        q: (B, N) target Q values
+        target_H_mag: (B, F) target frequency response magnitude
+        dsp_cascade: DifferentiableBiquadCascade instance
+        n_fft: FFT size
+        temperature: softmax temperature (higher = softer labels)
+    Returns:
+        soft_labels: (B, N, 5) probability distribution over filter types
+    """
+    B, N = gain.shape
+    device = gain.device
+    n_fft_bins = n_fft // 2 + 1
+    n_types = 5
+
+    # Resample target to match n_fft if needed
+    target_len = target_H_mag.shape[-1]
+
+    mse_per_type = []
+    with torch.no_grad():
+        for t in range(n_types):
+            type_idx = torch.full((B, N), t, dtype=torch.long, device=device)
+            H_mag_t = dsp_cascade(gain, freq, q, filter_type=type_idx, n_fft=n_fft)
+            # Resample target to match predicted length if different
+            if H_mag_t.shape[-1] != target_len:
+                tgt = F.interpolate(
+                    target_H_mag.unsqueeze(1),
+                    size=H_mag_t.shape[-1],
+                    mode='linear',
+                    align_corners=False,
+                ).squeeze(1)
+            else:
+                tgt = target_H_mag
+            # MSE in log-magnitude space (dB-like)
+            pred_db = 20 * torch.log10(H_mag_t.float().clamp(min=1e-6))
+            tgt_db = 20 * torch.log10(tgt.float().clamp(min=1e-6))
+            mse = (pred_db - tgt_db.unsqueeze(1)).pow(2).mean(dim=-1)  # (B, N)
+            mse_per_type.append(mse)
+
+    # Stack: (B, N, 5)
+    mse_stack = torch.stack(mse_per_type, dim=-1)
+    # Softmax over types: lower MSE → higher probability
+    soft_labels = F.softmax(-mse_stack / temperature, dim=-1)
+    return soft_labels
+
+
 class HungarianBandMatcher:
     """
     Solves the band permutation problem using Hungarian (bipartite) matching.
@@ -348,13 +470,14 @@ class MultiTypeEQLoss(nn.Module):
 
     Components:
     - L_param: Permutation-invariant parameter regression (Huber)
-    - L_type: Filter type classification (cross-entropy)
+    - L_type: Filter type classification (focal / balanced-softmax / soft-label KL)
     - L_spectral: Spectral magnitude L1 (LOSS-05)
     - L_hmag: Frequency response magnitude L1 (hard types)
     - L_activity: Band activity regularization
     - L_spread: Frequency spread regularization
     - L_embed_var: Embedding variance regularization (anti-collapse)
-    - L_contrastive: Spectral contrastive loss (anti-collapse)
+    - L_contrastive: Spectral contrastive diagnostic (anti-collapse)
+    - L_supcon: Supervised contrastive loss on per-band embeddings
 
     Anti-collapse mechanism:
     The TCN encoder can collapse to producing near-identical embeddings for
@@ -388,8 +511,12 @@ class MultiTypeEQLoss(nn.Module):
         class_weight_multipliers=None,
         type_class_priors=None,
         type_loss_mode="focal",
+        soft_label_temperature=0.35,
         label_smoothing=0.05,
         focal_gamma=2.0,
+        lambda_supcon=0.0,
+        supcon_temperature=0.07,
+        supcon_max_samples=256,
         lambda_type_entropy=0.0,
         lambda_type_prior=0.0,
         sign_penalty_weight=0.0,
@@ -430,9 +557,13 @@ class MultiTypeEQLoss(nn.Module):
         self.current_epoch = 0
         self.sign_penalty_weight = sign_penalty_weight
         self.type_loss_mode = str(type_loss_mode).lower()
+        self.soft_label_temperature = float(soft_label_temperature)
         self.class_weight_multipliers = (
             list(class_weight_multipliers) if class_weight_multipliers is not None else None
         )
+        self.lambda_supcon = float(lambda_supcon)
+        self.supcon_temperature = float(supcon_temperature)
+        self.supcon_max_samples = int(supcon_max_samples)
 
         # AUDIT: MEDIUM-03 — Single source of truth for warmup tracking.
         # The warmup system has ONE mechanism with TWO components (consolidated):
@@ -476,6 +607,138 @@ class MultiTypeEQLoss(nn.Module):
             initial_log_sigmas=[0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0],
         )
         self._dsp_cascade = dsp_cascade  # stored as plain attr, NOT nn.Module
+
+    def _compute_physics_soft_labels(
+        self,
+        matched_gain,
+        matched_freq,
+        matched_q,
+        matched_filter_type,
+        num_fft_bins,
+        num_types,
+    ):
+        """
+        Build soft type targets from response similarity across all filter types.
+
+        For each band, render a single-band response with the matched parameters
+        and each candidate filter type, then convert per-type MSE scores into a
+        probability distribution via temperature-scaled softmax.
+        """
+        if self._dsp_cascade is None:
+            return F.one_hot(matched_filter_type, num_classes=num_types).float()
+
+        n_fft = max(2, int((num_fft_bins - 1) * 2))
+        temperature = max(self.soft_label_temperature, 1e-4)
+
+        with torch.no_grad():
+            tgt_b0, tgt_b1, tgt_b2, tgt_a1, tgt_a2 = (
+                self._dsp_cascade.compute_biquad_coeffs_multitype(
+                    matched_gain,
+                    matched_freq,
+                    matched_q,
+                    matched_filter_type,
+                )
+            )
+            target_band_mag = self._dsp_cascade.freq_response(
+                tgt_b0,
+                tgt_b1,
+                tgt_b2,
+                tgt_a1,
+                tgt_a2,
+                n_fft=n_fft,
+            )
+            target_band_log = torch.log(target_band_mag.float().clamp(min=1e-6))
+
+            mse_per_type = []
+            for type_idx in range(num_types):
+                candidate_type = torch.full_like(matched_filter_type, type_idx)
+                c_b0, c_b1, c_b2, c_a1, c_a2 = (
+                    self._dsp_cascade.compute_biquad_coeffs_multitype(
+                        matched_gain,
+                        matched_freq,
+                        matched_q,
+                        candidate_type,
+                    )
+                )
+                candidate_mag = self._dsp_cascade.freq_response(
+                    c_b0,
+                    c_b1,
+                    c_b2,
+                    c_a1,
+                    c_a2,
+                    n_fft=n_fft,
+                )
+                candidate_log = torch.log(candidate_mag.float().clamp(min=1e-6))
+                # Per-band spectral mismatch (B, N)
+                mse = F.mse_loss(candidate_log, target_band_log, reduction="none").mean(dim=-1)
+                mse_per_type.append(mse)
+
+            mse_stack = torch.stack(mse_per_type, dim=-1)  # (B, N, C)
+            soft_targets = torch.softmax(-mse_stack / temperature, dim=-1)
+
+        return soft_targets
+
+    def _supervised_contrastive_loss(self, band_embedding, labels, sample_weights=None):
+        """
+        Supervised contrastive loss over per-band embeddings.
+
+        Uses matched filter-type labels to pull same-type embeddings together
+        and push different-type embeddings apart.
+        """
+        if band_embedding is None:
+            return None
+
+        if band_embedding.dim() != 3:
+            return None
+
+        z = band_embedding.reshape(-1, band_embedding.shape[-1])
+        y = labels.reshape(-1)
+
+        if sample_weights is None:
+            w = torch.ones(z.shape[0], device=z.device, dtype=z.dtype)
+        else:
+            w = sample_weights.reshape(-1).to(dtype=z.dtype, device=z.device)
+
+        valid_idx = torch.where(w > 1e-4)[0]
+        if valid_idx.numel() < 3:
+            return None
+
+        if valid_idx.numel() > self.supcon_max_samples:
+            perm = torch.randperm(valid_idx.numel(), device=valid_idx.device)
+            valid_idx = valid_idx[perm[: self.supcon_max_samples]]
+
+        z = F.normalize(z[valid_idx], dim=-1)
+        y = y[valid_idx]
+        w = w[valid_idx]
+
+        m = z.shape[0]
+        if m < 3:
+            return None
+
+        temperature = max(self.supcon_temperature, 1e-4)
+        sim = torch.matmul(z, z.t()) / temperature
+        logits = sim - sim.max(dim=1, keepdim=True).values.detach()
+
+        eye_mask = torch.eye(m, device=z.device, dtype=torch.bool)
+        non_self = ~eye_mask
+        exp_logits = torch.exp(logits) * non_self
+        log_prob = logits - torch.log(exp_logits.sum(dim=1, keepdim=True) + 1e-8)
+
+        pos_mask = (y.unsqueeze(0) == y.unsqueeze(1)) & non_self
+        pos_count = pos_mask.sum(dim=1)
+        valid_anchor = pos_count > 0
+        if not valid_anchor.any():
+            return None
+
+        mean_log_prob_pos = (
+            (pos_mask.float() * log_prob).sum(dim=1) / pos_count.clamp(min=1)
+        )
+
+        anchor_weights = w / (w.mean() + 1e-8)
+        loss = -(
+            anchor_weights[valid_anchor] * mean_log_prob_pos[valid_anchor]
+        ).sum() / (anchor_weights[valid_anchor].sum() + 1e-8)
+        return loss
 
     def _refresh_type_class_weights(self):
         inv_w = 1.0 / self.type_class_priors.clamp(min=1e-6)
@@ -542,6 +805,7 @@ class MultiTypeEQLoss(nn.Module):
         target_audio=None,
         active_band_mask=None,
         embedding=None,
+        band_embedding=None,
         h_db_pred=None,
         h_db_target=None,
         H_mag_typed=None,
@@ -703,8 +967,12 @@ class MultiTypeEQLoss(nn.Module):
         # 2. Filter type classification against Hungarian-matched targets.
         # D-04: During warmup, type loss is zero (gain-only training)
         # Class-balanced focal loss to prevent peaking filter collapse
+        B, N, C = pred_type_logits.shape
+        valid_type_mask = torch.ones(
+            B * N, device=pred_gain.device, dtype=pred_type_logits.dtype
+        )
+
         if is_type_active:
-            B, N, C = pred_type_logits.shape
             logits_flat = pred_type_logits.reshape(B * N, C)  # (B*N, 5)
             targets_flat = matched_filter_type.reshape(B * N)  # (B*N,)
 
@@ -722,7 +990,22 @@ class MultiTypeEQLoss(nn.Module):
                 gain_weight,
             ).to(pred_type_logits.dtype)
 
-            if self.type_loss_mode == "balanced_softmax":
+            if self.type_loss_mode == "soft_kl":
+                soft_targets = self._compute_physics_soft_labels(
+                    matched_gain,
+                    matched_freq,
+                    matched_q,
+                    matched_filter_type,
+                    num_fft_bins=target_H_mag.shape[-1],
+                    num_types=C,
+                )
+                soft_targets_flat = soft_targets.reshape(B * N, C).to(logits_flat.dtype)
+                per_sample_loss = F.kl_div(
+                    F.log_softmax(logits_flat, dim=1),
+                    soft_targets_flat,
+                    reduction="none",
+                ).sum(dim=1)
+            elif self.type_loss_mode == "balanced_softmax":
                 # Balanced Softmax: logit correction with class priors.
                 # This counteracts class-frequency bias without oversampling.
                 prior_log = torch.log(self.type_class_priors + 1e-8).to(logits_flat.dtype)
@@ -846,6 +1129,18 @@ class MultiTypeEQLoss(nn.Module):
         components["hier_broad_loss"] = loss_hier_broad
         components["hier_pass_loss"] = loss_hier_pass
         components["hier_shelf_loss"] = loss_hier_shelf
+
+        # 2c. Supervised contrastive loss on per-band embeddings.
+        loss_supcon = torch.tensor(0.0, device=pred_gain.device)
+        if self.lambda_supcon > 0.0 and band_embedding is not None:
+            supcon_value = self._supervised_contrastive_loss(
+                band_embedding,
+                matched_filter_type,
+                sample_weights=valid_type_mask.reshape(B, N),
+            )
+            if supcon_value is not None and torch.isfinite(supcon_value):
+                loss_supcon = supcon_value
+        components["supcon_loss"] = loss_supcon
 
         # 3. Frequency response magnitude L1 — LOGGED ONLY (not in core_losses).
         # Computed under no_grad to avoid wasting GPU on unused gradient graphs.
@@ -977,6 +1272,7 @@ class MultiTypeEQLoss(nn.Module):
         ]
         total_loss = self.uncertainty_loss(core_losses)
         total_loss = total_loss + self.lambda_slope * loss_slope
+        total_loss = total_loss + self.lambda_supcon * loss_supcon
 
         # Type-distribution regularization to reduce single-class collapse.
         total_loss = total_loss + self.lambda_type_entropy * loss_type_entropy

@@ -84,7 +84,6 @@ python dataset_pipeline/generate_data.py            # Multi-type offline data ge
 
 - **`dataset.py`** — `SyntheticEQDataset`: generates (dry, wet, params) tuples on-the-fly using synthetic signals (noise, sweep, harmonic, speech_like) with random multi-type EQ applied in frequency domain. Supports `precompute()` mode that caches mel-spectrograms in memory.
 - **`dataset_pipeline/`** — Offline data generation with MUSDB18 real audio support.
-- **`augmentation.py`** — SpecAugment (frequency + time masking) for training.
 - **`data_validation.py`** — `DataQualityValidator` for detecting NaN/inf and distribution anomalies in training data.
 
 ### Training

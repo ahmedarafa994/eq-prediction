@@ -914,20 +914,15 @@ class MultiTypeEQParameterHead(nn.Module):
             + (20 if dsp_cascade is not None else 0)
             + (self.n_shape_features if n_mels > 0 else 0)
         )
-        self.type_head = nn.Sequential(
-            nn.Linear(type_input_dim, 128),
-            nn.ReLU(),
-            nn.Dropout(0.1),
-            nn.Linear(128, 64),
-            nn.ReLU(),
-            nn.Linear(64, num_filter_types),
-        )
+        # AUDIT FIX: Simplified type head — single linear layer ensures
+        # we can properly zero-initialize for uniform initial predictions.
+        # Multi-layer heads with ReLU/GELU create inherent positive bias even
+        # with small final weights, causing early type collapse to peaking.
+        self.type_head = nn.Linear(type_input_dim, num_filter_types)
         with torch.no_grad():
-            # AUDIT FIX: Initialize for truly uniform initial predictions.
-            # Zero bias + very small weights (gain=0.01) ensures all types
-            # start with nearly equal probability, preventing early collapse.
-            self.type_head[-1].bias.zero_()
-            nn.init.xavier_uniform_(self.type_head[-1].weight, gain=0.01)
+            # Zero weights AND bias → all logits = 0 → uniform softmax (1/N each)
+            self.type_head.weight.zero_()
+            self.type_head.bias.zero_()
 
         # Hierarchical two-stage type head (optional)
         if hierarchical_type_head:
@@ -1246,7 +1241,7 @@ class MultiTypeEQParameterHead(nn.Module):
         # ── Compute DC/Nyquist gain for shelf evidence (used by both paths) ──
         dc_gain = h_db_pred[:, :, 0]         # (B, N) gain at DC per band
         nyquist_gain = h_db_pred[:, :, -1]   # (B, N) gain at Nyquist per band
-        heuristic_scale = 0.1 if self.training else 1.0
+        heuristic_scale = 0.01 if self.training else 1.0
 
         # ── Type logits: hierarchical or flat ──
         hier_aux = None  # Will hold (broad_logits, pass_logits, shelf_logits) if hierarchical
@@ -1412,6 +1407,7 @@ class MultiTypeEQParameterHead(nn.Module):
                 "shelf_attention": shelf_attention,
                 "h_db_pred": h_db_pred,
                 "band_embedding": trunk_out,
+                "type_input": type_input,  # features before linear type_head — used for SupCon loss
                 "hier_aux": hier_aux,
             }
             return gain_db, freq, q, type_logits, type_probs, filter_type, aux
@@ -1521,18 +1517,11 @@ class TypeGroupedParameterHead(nn.Module):
             self.type_mel_proj = nn.Linear(n_mels, 32)
             type_input_dim += 32
 
-        self.type_classifier = nn.Sequential(
-            nn.Linear(type_input_dim, 128),
-            nn.LayerNorm(128),
-            nn.GELU(),
-            nn.Linear(128, 64),
-            nn.LayerNorm(64),
-            nn.GELU(),
-            nn.Linear(64, 32),
-            nn.LayerNorm(32),
-            nn.GELU(),
-            nn.Linear(32, num_filter_types)
-        )
+        # AUDIT FIX: Single linear layer, zero-initialized for uniform predictions
+        self.type_classifier = nn.Linear(type_input_dim, num_filter_types)
+        with torch.no_grad():
+            self.type_classifier.weight.zero_()
+            self.type_classifier.bias.zero_()
 
         # 2. Parameter Stage (Stage 2)
         # -----------------------------------------------------

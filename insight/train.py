@@ -113,7 +113,7 @@ def apply_stage_to_training_state(train_dataset, criterion, stage):
         apply_fn(stage)
 
     # Apply dynamic component loss weights from curriculum stage
-    for weight_name in ["lambda_gain", "lambda_freq", "lambda_q", "lambda_type", "lambda_spectral", "lambda_slope", "lambda_type_match",
+    for weight_name in ["lambda_gain", "lambda_freq", "lambda_q", "lambda_type", "lambda_spectral", "lambda_slope", "lambda_supcon", "lambda_type_match",
                         "matcher_lambda_gain", "matcher_lambda_freq", "matcher_lambda_q", "matcher_lambda_type_match"]:
         if weight_name in stage:
             setattr(criterion, weight_name, float(stage[weight_name]))
@@ -196,9 +196,9 @@ def validate_config(cfg):
             "`loss.lambda_spectral`, `loss.lambda_typed_spectral`, or "
             "`loss.lambda_hmag`, or `loss.lambda_multi_scale`."
         )
-    if type_loss_mode not in {"focal", "balanced_softmax"}:
+    if type_loss_mode not in {"focal", "balanced_softmax", "soft_kl"}:
         raise ValueError(
-            "`loss.type_loss_mode` must be one of {'focal', 'balanced_softmax'}."
+            "`loss.type_loss_mode` must be one of {'focal', 'balanced_softmax', 'soft_kl'}."
         )
     if encoder_backend == "wav2vec2_frozen":
         if data_cfg.get("precompute_mels", False):
@@ -607,11 +607,15 @@ class Trainer:
             lambda_gain_zero=loss_cfg.get("lambda_gain_zero", 1.0),
             label_smoothing=loss_cfg.get("label_smoothing", 0.02),
             focal_gamma=loss_cfg.get("focal_gamma", 2.0),
+            soft_label_temperature=loss_cfg.get("soft_label_temperature", 0.35),
             type_class_priors=data_cfg.get("type_weights", None),
             type_loss_mode=loss_cfg.get("type_loss_mode", "focal"),
             lambda_type_match=loss_cfg.get("lambda_type_match", 0.0),
             lambda_type_prior=loss_cfg.get("lambda_type_prior", 0.0),
             lambda_type_entropy=loss_cfg.get("lambda_type_entropy", 0.0),
+            lambda_supcon=loss_cfg.get("lambda_supcon", 0.0),
+            supcon_temperature=loss_cfg.get("supcon_temperature", 0.07),
+            supcon_max_samples=loss_cfg.get("supcon_max_samples", 256),
             lambda_embed_var=loss_cfg.get("lambda_embed_var", 0.5),
             lambda_contrastive=loss_cfg.get("lambda_contrastive", 0.0),
             embed_var_threshold=loss_cfg.get("embed_var_threshold", 0.1),
@@ -1197,7 +1201,7 @@ class Trainer:
         # C-06: Always apply curriculum to the loss criterion (type priors, lambda
         # weights, gumbel tau) even when dataset has precomputed cache.  Only skip
         # dataset-level overrides (apply_curriculum_stage on the dataset itself).
-        for weight_name in ["lambda_gain", "lambda_freq", "lambda_q", "lambda_type", "lambda_spectral", "lambda_slope", "lambda_type_match",
+        for weight_name in ["lambda_gain", "lambda_freq", "lambda_q", "lambda_type", "lambda_spectral", "lambda_slope", "lambda_supcon", "lambda_type_match",
                             "matcher_lambda_gain", "matcher_lambda_freq", "matcher_lambda_q", "matcher_lambda_type_match"]:
             if weight_name in stage:
                 setattr(self.criterion, weight_name, float(stage[weight_name]))
@@ -1234,7 +1238,8 @@ class Trainer:
                 f"L_freq={self.criterion.lambda_freq:.2f} | "
                 f"L_q={self.criterion.lambda_q:.2f} | "
                 f"L_spec={self.criterion.lambda_spectral:.2f} | "
-                f"L_slope={self.criterion.lambda_slope:.2f}"
+                f"L_slope={self.criterion.lambda_slope:.2f} | "
+                f"L_supcon={self.criterion.lambda_supcon:.2f}"
             )
             print(
                 f"  [curriculum] epoch={epoch} stage={stage_name} "
@@ -1262,6 +1267,7 @@ class Trainer:
                 lambda_q=self.criterion.lambda_q,
                 lambda_spectral=self.criterion.lambda_spectral,
                 lambda_slope=self.criterion.lambda_slope,
+                lambda_supcon=self.criterion.lambda_supcon,
                 one_band_probability=stage.get(
                     "one_band_probability",
                     getattr(self.train_dataset, "one_band_probability", None),
@@ -1445,6 +1451,7 @@ class Trainer:
                         target_ft,
                         target_H_mag,
                         embedding=output["embedding"],
+                        band_embedding=output.get("band_embedding"),
                         h_db_pred=h_db_pred,
                         h_db_target=h_db_target,
                         H_mag_typed=H_mag_typed,
@@ -1820,6 +1827,7 @@ class Trainer:
                     target_ft,
                     target_H_mag,
                     embedding=output_soft["embedding"],
+                    band_embedding=output_soft.get("band_embedding"),
                     h_db_pred=output_soft.get("h_db_pred"),
                     h_db_target=h_db_target,
                     H_mag_typed=H_mag_typed_soft,
@@ -1839,6 +1847,7 @@ class Trainer:
                     target_ft,
                     target_H_mag,
                     embedding=output_hard["embedding"],
+                    band_embedding=output_hard.get("band_embedding"),
                     h_db_pred=output_hard.get("h_db_pred"),
                     h_db_target=h_db_target,
                     H_mag_typed=H_mag_typed_hard,
